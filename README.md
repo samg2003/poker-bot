@@ -38,20 +38,22 @@ code-poker-bot/
 │   ├── action_space.py     # ✅ Hybrid action type + continuous sizing
 │   ├── stat_tracker.py     # ✅ ~30 HUD features per opponent
 │   ├── opponent_encoder.py # ✅ Causal Transformer (history → embedding)
-│   └── policy_network.py   # ✅ Cross-attention policy + value + sizing heads
+│   ├── policy_network.py   # ✅ Cross-attention policy + value + sizing heads
+│   └── nlhe_encoder.py     # ✅ GameState → model tensor bridge
 ├── search/                 # Lightweight search (Phase 4)
 │   ├── search.py
 │   └── range_estimator.py
 ├── training/               # Training system
 │   ├── cfr.py              # ✅ CFR solver (validated on Kuhn Poker)
 │   ├── self_play_trainer.py # ✅ PPO self-play on Leduc Hold'em
-│   ├── personality.py
-│   └── curriculum.py
-├── tests/                  # Test suite (89 tests)
+│   ├── personality.py      # ✅ Continuous personality perturbations + tilt
+│   └── curriculum.py       # ✅ Multi-stage curriculum trainer
+├── tests/                  # Test suite (114 tests)
 │   ├── test_engine.py
 │   ├── test_kuhn.py
 │   ├── test_model.py
-│   └── test_self_play.py
+│   ├── test_self_play.py
+│   └── test_personality.py
 ├── docs/                   # Architecture Decision Records
 │   └── adr/
 └── scripts/                # Training & evaluation scripts
@@ -92,8 +94,8 @@ See [docs/adr/](docs/adr/) for recorded architecture decisions and their rationa
 |---|---|---|
 | **1. Engine** | ✅ Complete | NLHE rules, hand evaluator, dealer, Kuhn + Leduc games |
 | **2. Architecture** | ✅ Complete | Opponent encoder, policy network, PPO self-play on Leduc |
-| **3. Perturbations** | 🔲 Next | Situational personality modifiers, NLHE curriculum |
-| **4. Search** | 🔲 | Lightweight real-time search (System 2) |
+| **3. Perturbations** | ✅ Complete | Personality system, NLHE encoder, curriculum training |
+| **4. Search** | 🔲 Next | Lightweight real-time search (System 2) |
 | **5. Evaluation** | 🔲 | Benchmarks, GTO verification |
 | **6. Deployment** | 🔲 | Inference optimization |
 
