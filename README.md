@@ -29,31 +29,29 @@ Game State ──→ Policy Network (cross-attention) ──→ System 1 (fast, 
 ```
 code-poker-bot/
 ├── engine/                 # Core poker engine
-│   ├── game_state.py       # NLHE game state (2-9 players, 1-350bb, side pots)
-│   ├── hand_evaluator.py   # 5-7 card hand ranking
-│   ├── dealer.py           # Game loop (shuffle, deal, streets, showdown)
-│   └── kuhn_poker.py       # Kuhn Poker (3-card game for validation)
-├── model/                  # Neural network components (Phase 2)
-│   ├── opponent_encoder.py
-│   ├── stat_tracker.py
-│   ├── policy_network.py
-│   └── action_space.py
+│   ├── game_state.py       # ✅ NLHE game state (2-9 players, 1-350bb, side pots)
+│   ├── hand_evaluator.py   # ✅ 5-7 card hand ranking
+│   ├── dealer.py           # ✅ Game loop (shuffle, deal, streets, showdown)
+│   ├── kuhn_poker.py       # ✅ Kuhn Poker (3-card, Nash validated)
+│   └── leduc_poker.py      # ✅ Leduc Hold'em (6-card, ~1000 info sets)
+├── model/                  # Neural network components
+│   ├── action_space.py     # ✅ Hybrid action type + continuous sizing
+│   ├── stat_tracker.py     # ✅ ~30 HUD features per opponent
+│   ├── opponent_encoder.py # ✅ Causal Transformer (history → embedding)
+│   └── policy_network.py   # ✅ Cross-attention policy + value + sizing heads
 ├── search/                 # Lightweight search (Phase 4)
 │   ├── search.py
 │   └── range_estimator.py
 ├── training/               # Training system
 │   ├── cfr.py              # ✅ CFR solver (validated on Kuhn Poker)
-│   ├── self_play_trainer.py
+│   ├── self_play_trainer.py # ✅ PPO self-play on Leduc Hold'em
 │   ├── personality.py
-│   ├── trainer.py
-│   ├── curriculum.py
-│   └── rewards.py
-├── agent/                  # Agent interface (Phase 2)
-│   ├── poker_agent.py
-│   └── config.py
-├── tests/                  # Test suite (53 tests)
+│   └── curriculum.py
+├── tests/                  # Test suite (89 tests)
 │   ├── test_engine.py
-│   └── test_kuhn.py
+│   ├── test_kuhn.py
+│   ├── test_model.py
+│   └── test_self_play.py
 ├── docs/                   # Architecture Decision Records
 │   └── adr/
 └── scripts/                # Training & evaluation scripts
@@ -92,9 +90,9 @@ See [docs/adr/](docs/adr/) for recorded architecture decisions and their rationa
 
 | Phase | Status | Description |
 |---|---|---|
-| **1. Engine** | ✅ Complete | NLHE rules, hand evaluator, dealer, Kuhn Poker + CFR validation |
-| **2. Architecture** | 🔲 Next | Opponent encoder, policy network, self-play |
-| **3. Perturbations** | 🔲 | Situational personality modifiers, NLHE training |
+| **1. Engine** | ✅ Complete | NLHE rules, hand evaluator, dealer, Kuhn + Leduc games |
+| **2. Architecture** | ✅ Complete | Opponent encoder, policy network, PPO self-play on Leduc |
+| **3. Perturbations** | 🔲 Next | Situational personality modifiers, NLHE curriculum |
 | **4. Search** | 🔲 | Lightweight real-time search (System 2) |
 | **5. Evaluation** | 🔲 | Benchmarks, GTO verification |
 | **6. Deployment** | 🔲 | Inference optimization |
