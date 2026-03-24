@@ -751,9 +751,7 @@ class NLHESelfPlayTrainer:
 
         print(f"Device: {self.device}")
         
-        # Use 'spawn' context to avoid PyTorch fork deadlocks on Linux
-        ctx = mp.get_context('spawn')
-        pool = ProcessPoolExecutor(max_workers=self.config.workers, mp_context=ctx) if self.config.workers > 1 else None
+        pool = ProcessPoolExecutor(max_workers=self.config.workers) if self.config.workers > 1 else None
 
         for epoch in range(num_epochs):
             self.current_epoch = epoch + 1
