@@ -1,0 +1,6 @@
+# Core
+pytest>=8.0
+
+# Phase 2+ (uncomment when needed)
+# torch>=2.0
+# numpy>=1.24
