@@ -10,10 +10,10 @@ class AgentConfig:
     """Configuration for the poker agent."""
 
     # Model architecture
-    embed_dim: int = 128
-    opponent_embed_dim: int = 128
-    num_heads: int = 4
-    num_layers: int = 3
+    embed_dim: int = 64
+    opponent_embed_dim: int = 64
+    num_heads: int = 2
+    num_layers: int = 2
 
     # Search (System 2)
     enable_search: bool = True

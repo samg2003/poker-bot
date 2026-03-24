@@ -14,6 +14,7 @@ Each hand randomly samples:
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -61,10 +62,10 @@ class Experience(NamedTuple):
 class NLHETrainingConfig:
     """Configuration for NLHE training."""
     # Architecture
-    embed_dim: int = 128
-    opponent_embed_dim: int = 128
-    num_heads: int = 4
-    num_layers: int = 3
+    embed_dim: int = 64
+    opponent_embed_dim: int = 64
+    num_heads: int = 2
+    num_layers: int = 2
 
     # Game setup — ranges for per-hand randomization
     min_players: int = 2
@@ -88,7 +89,7 @@ class NLHETrainingConfig:
     value_coef: float = 0.5
 
     # Self-play
-    hands_per_epoch: int = 256
+    hands_per_epoch: int = 128
 
     # Opponent modeling
     history_reset_interval: Tuple[int, int] = (300, 500)
@@ -102,6 +103,7 @@ class NLHETrainingConfig:
 
     # Logging
     log_interval: int = 10
+    verbose: bool = False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -405,13 +407,13 @@ class NLHESelfPlayTrainer:
             # Encode state
             encoded = self._encode_state(game_state, pid)
 
-            # Get REAL opponent embeddings from history
-            opp_embed = self._get_all_opponent_embeddings(pid, num_p)
-            opp_stats = self._get_opponent_stats(pid, num_p)
-            own_stats = self._to(self.stat_tracker.get_stats(pid).unsqueeze(0))
-
             # Forward pass
             with torch.no_grad():
+                # Get REAL opponent embeddings from history
+                opp_embed = self._get_all_opponent_embeddings(pid, num_p)
+                opp_stats = self._get_opponent_stats(pid, num_p)
+                own_stats = self._to(self.stat_tracker.get_stats(pid).unsqueeze(0))
+
                 output = self.policy(
                     hole_cards=encoded['hole_cards'],
                     community_cards=encoded['community_cards'],
@@ -540,14 +542,14 @@ class NLHESelfPlayTrainer:
     # PPO loss
     # ─────────────────────────────────────────────────────────
 
-    def _compute_ppo_loss(self, experiences: List[Experience]) -> torch.Tensor:
+    def _compute_ppo_loss(self, experiences: List[Experience]) -> float:
         """Compute PPO loss from collected experience."""
         if not experiences:
-            return torch.tensor(0.0, requires_grad=True, device=self.device)
+            return 0.0
 
         self.policy.train()
         self.opponent_encoder.train()
-        total_loss = torch.tensor(0.0, device=self.device)
+        total_loss = 0.0
 
         for exp in experiences:
             output = self.policy(
@@ -581,10 +583,12 @@ class NLHESelfPlayTrainer:
                 policy_loss
                 + self.config.value_coef * value_loss
                 - self.config.entropy_coef * entropy
-            )
-            total_loss = total_loss + loss
+            ) / len(experiences)
+            
+            loss.backward()
+            total_loss += loss.item()
 
-        return total_loss / len(experiences)
+        return total_loss
 
     # ─────────────────────────────────────────────────────────
     # Training loop
@@ -602,6 +606,7 @@ class NLHESelfPlayTrainer:
         for epoch in range(num_epochs):
             all_exp: List[Experience] = []
             epoch_reward = 0.0
+            epoch_start = time.time()
 
             for hand_i in range(self.config.hands_per_epoch):
                 # Decide whether to use search for this hand
@@ -616,27 +621,34 @@ class NLHESelfPlayTrainer:
                 if player_experiences[0]:
                     epoch_reward += player_experiences[0][0].reward
 
+                # Verbose progress tracking
+                if self.config.verbose and (hand_i + 1) % max(1, self.config.hands_per_epoch // 5) == 0:
+                    elapsed = time.time() - epoch_start
+                    print(f"  [Epoch {epoch+1:4d}] Hand {hand_i+1}/{self.config.hands_per_epoch}... ({elapsed:.1f}s)")
+
             avg_reward = epoch_reward / self.config.hands_per_epoch
 
             # PPO update
             total_loss = 0.0
             for _ in range(self.config.ppo_epochs):
                 self.optimizer.zero_grad()
-                loss = self._compute_ppo_loss(all_exp)
-                loss.backward()
+                loss_val = self._compute_ppo_loss(all_exp)
                 nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
                 nn.utils.clip_grad_norm_(self.opponent_encoder.parameters(), 1.0)
                 self.optimizer.step()
-                total_loss += loss.item()
+                total_loss += loss_val
 
             avg_loss = total_loss / self.config.ppo_epochs
 
             metrics['epoch_reward'].append(avg_reward)
             metrics['epoch_loss'].append(avg_loss)
 
-            if (epoch + 1) % self.config.log_interval == 0:
+            epoch_duration = time.time() - epoch_start
+            hands_per_sec = self.config.hands_per_epoch / epoch_duration
+
+            if self.config.verbose or (epoch + 1) % self.config.log_interval == 0:
                 print(
-                    f"Epoch {epoch + 1:4d} | "
+                    f"Epoch {epoch + 1:4d} ({epoch_duration:.1f}s, {hands_per_sec:.1f} hands/s) | "
                     f"Reward: {avg_reward:+.3f} bb | "
                     f"Loss: {avg_loss:.4f}"
                 )

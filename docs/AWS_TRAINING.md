@@ -3,18 +3,19 @@
 ## Overview
 
 Train locally on Leduc for quick validation, then scale to full NLHE on AWS GPU.
+The trainer auto-detects CUDA and uses real opponent tracking + optional search-guided expert iteration.
 
 ## Step 1: Quick Local Test (No GPU Needed)
 
 ```bash
 cd code-poker-bot
 source venv/bin/activate  # or python3 -m venv venv && source venv/bin/activate
-python3 -m pytest tests/ -v  # make sure 175 tests pass
+python3 -m pytest tests/ -v  # make sure 185 tests pass
 
 # Quick Leduc training (~5 min, CPU)
 python3 scripts/train.py --game leduc --epochs 200 --embed-dim 64 --num-heads 2 --num-layers 2
 
-# Quick NLHE smoke test (~10 min, CPU — slow but validates)
+# Quick NLHE smoke test (~10 min, CPU — slow but validates pipeline)
 python3 scripts/train.py --game nlhe --epochs 10 --hands 32 --embed-dim 64 --num-heads 2 --num-layers 2
 ```
 
@@ -22,11 +23,11 @@ python3 scripts/train.py --game nlhe --epochs 10 --hands 32 --embed-dim 64 --num
 
 ### Recommended Instances
 
-| Training Phase | Instance | GPU | Cost/hr |
+| Training Goal | Instance | GPU | Cost/hr |
 |---|---|---|---|
-| Validation (Leduc) | `g5.xlarge` | 1× A10G (24GB) | ~$1.00 |
-| NLHE Heads-up | `g5.2xlarge` | 1× A10G (24GB) | ~$1.21 |
-| NLHE 6-max | `g5.12xlarge` | 4× A10G (96GB) | ~$5.67 |
+| Validation | `g5.xlarge` | 1× A10G (24GB) | ~$1.00 |
+| Standard NLHE | `g5.2xlarge` | 1× A10G (24GB) | ~$1.21 |
+| Large-scale NLHE | `g5.12xlarge` | 4× A10G (96GB) | ~$5.67 |
 
 ### Launch Steps
 
@@ -56,21 +57,37 @@ bash scripts/aws_setup.sh
 tmux new -s train
 source venv/bin/activate
 
-# Validation: Leduc (~10 min)
+# ── Step A: Validate GPU works ──
+python3 -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')"
+
+# ── Step B: Quick Leduc validation (~10 min) ──
 python3 scripts/train.py --game leduc --epochs 200 --embed-dim 128
 
-# NLHE Heads-up, 100bb (~2-4 hours)
-python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 100
+# ── Step C: Full NLHE universal training (RECOMMENDED) ──
+# Randomizes players (2-6), stacks (20-200bb), tracks opponent history
+python3 scripts/train.py --game nlhe --epochs 500
 
-# NLHE 6-max, 100bb (~4-8 hours)
-python3 scripts/train.py --game nlhe --epochs 500 --num-players 6 --starting-bb 100
+# ── Step D: With search-guided expert iteration (~2x slower, higher quality) ──
+python3 scripts/train.py --game nlhe --epochs 500 --search-fraction 0.1
 
-# NLHE Short-stacked, 20bb (~1-2 hours)
-python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 20
+# ── Alternative: Fixed configurations ──
+# Heads-up specialist
+python3 scripts/train.py --game nlhe --epochs 500 --num-players 2
+
+# 6-max specialist
+python3 scripts/train.py --game nlhe --epochs 500 --num-players 6
 
 # Detach: Ctrl+B, then D
 # Reattach: tmux attach -t train
 ```
+
+### What happens during training
+
+- **Device**: Auto-detects CUDA GPU — all tensors + models move to GPU
+- **Opponent tracking**: Actions are recorded across hands, feeding real embeddings (not empty)
+- **HUD stats**: VPIP, PFR, WTSD, c-bet frequencies tracked per opponent
+- **History reset**: Every 300-500 hands, history clears (simulates new table)
+- **Search (if enabled)**: 10% of hands use CFR search for deeper action selection
 
 ## Step 4: Download Trained Model
 
@@ -84,8 +101,6 @@ scp -i your-key.pem -r ubuntu@<instance-ip>:/home/ubuntu/code-poker-bot/checkpoi
 ```bash
 # Evaluate the trained model
 python3 scripts/evaluate.py --checkpoint best --benchmark-latency
-
-# Use in code:
 ```
 
 ```python
@@ -117,9 +132,9 @@ print(f"Probs: fold={result.action_probs[0]:.2f} check={result.action_probs[1]:.
 | Phase | Instance | Duration | Cost |
 |---|---|---|---|
 | Validation (Leduc) | g5.xlarge | ~30 min | ~$0.50 |
-| Curriculum Stage 1-2 | g5.2xlarge | ~3-5 hrs | ~$5-6 |
-| Full Curriculum | g5.12xlarge | ~5-8 hrs | ~$30-45 |
-| **Total** | | | **~$35-50** |
+| NLHE universal | g5.2xlarge | ~3-5 hrs | ~$4-6 |
+| NLHE + search | g5.2xlarge | ~6-10 hrs | ~$8-12 |
+| **Total (recommended)** | | | **~$5-20** |
 
 > **Tip**: Start with `g5.xlarge` to validate everything works, then scale up. Don't forget to **stop the instance** when done!
 

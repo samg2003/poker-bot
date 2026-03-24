@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from datetime import datetime
 
+
 from training.curriculum import CurriculumTrainer, CurriculumConfig, CurriculumStage
 from training.self_play_trainer import LeducSelfPlayTrainer, TrainingConfig
 from training.nlhe_trainer import NLHESelfPlayTrainer, NLHETrainingConfig
@@ -149,6 +150,7 @@ def train_nlhe(args):
         max_bb=args.max_bb,
         device=args.device,
         search_fraction=args.search_fraction,
+        verbose=args.verbose,
     )
     trainer = NLHESelfPlayTrainer(config=config, seed=args.seed)
 
@@ -189,7 +191,7 @@ def main():
     # Training params
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of training epochs')
-    parser.add_argument('--hands', type=int, default=512,
+    parser.add_argument('--hands', type=int, default=128,
                         help='Hands per epoch')
     parser.add_argument('--lr', type=float, default=3e-4,
                         help='Learning rate')
@@ -197,11 +199,11 @@ def main():
                         help='Random seed')
 
     # Architecture
-    parser.add_argument('--embed-dim', type=int, default=128,
+    parser.add_argument('--embed-dim', type=int, default=64,
                         help='Embedding dimension')
-    parser.add_argument('--num-heads', type=int, default=4,
+    parser.add_argument('--num-heads', type=int, default=2,
                         help='Number of attention heads')
-    parser.add_argument('--num-layers', type=int, default=3,
+    parser.add_argument('--num-layers', type=int, default=2,
                         help='Number of Transformer layers')
 
     # NLHE-specific
@@ -219,8 +221,12 @@ def main():
                         help='Max stack depth in BB when randomizing (default: 200)')
 
     # Hardware & features
+    parser.add_argument('--threads', type=int, default=0,
+                        help='Number of CPU threads to use (0 = unconstrained, default: 0)')
     parser.add_argument('--device', type=str, default='auto',
                         help='Device: auto, cuda, mps, cpu (default: auto)')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Enable verbose output with timing and progress updates')
     parser.add_argument('--search-fraction', type=float, default=0.0,
                         help='Fraction of hands using search (0-1, default: 0 = off)')
 
@@ -235,6 +241,9 @@ def main():
                         help='Log every N epochs')
 
     args = parser.parse_args()
+
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
 
     if args.curriculum:
         train_curriculum(args)
