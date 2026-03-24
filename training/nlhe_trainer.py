@@ -120,7 +120,11 @@ import io
 from concurrent.futures import ProcessPoolExecutor
 
 def _mp_rollout_worker(args):
-    """Module-level worker function for parallel self-play to survive pickle."""
+    """Module-level worker function for parallel self-play.
+    
+    Each worker receives the model weights ONCE and plays MULTIPLE hands,
+    avoiding the massive IPC serialization bottleneck of sending weights per-hand.
+    """
     import sys, os
     # Suppress verbose PyTorch macOS Metal Performance Shaders (MPS) Graph permission warnings
     sys.stderr = open(os.devnull, 'w')
@@ -129,7 +133,7 @@ def _mp_rollout_worker(args):
     # Disable Xcode cache locks to allow multiple workers to successfully compile PyTorch C++ kernels identically
     os.environ['XCRUN_CACHE_DISABLE'] = '1'
     
-    config, seed, sd_policy, sd_opp, use_search = args
+    config, seed, sd_policy, sd_opp, num_hands = args
     # Recreate a lightweight CPU-only trainer for simulation
     config.device = "cpu"
     # macOS strictly forbids spawned child processes from invoking clang++ in /tmp directories, 
@@ -139,19 +143,22 @@ def _mp_rollout_worker(args):
         
     trainer = NLHESelfPlayTrainer(config, seed=seed)
     
-    # Load PyTorch state dicts seamlessly via numpy arrays
+    # Load PyTorch state dicts seamlessly via numpy arrays (ONCE per worker)
     sd_policy_t = {k: torch.from_numpy(v) for k, v in sd_policy.items()}
     sd_opp_t = {k: torch.from_numpy(v) for k, v in sd_opp.items()}
     
     trainer.policy.load_state_dict(sd_policy_t)
     trainer.opponent_encoder.load_state_dict(sd_opp_t)
     
-    # Run simulation
-    experiences = trainer._play_hand(use_search=use_search)
+    # Play MULTIPLE hands in this single worker process
+    all_results = []
+    for _ in range(num_hands):
+        experiences = trainer._play_hand(use_search=False)
+        all_results.append(experiences)
     
-    # Serialize to raw bytes to bypass PyTorch IPC shared_memory socket limits on Mac
+    # Serialize all hands to raw bytes to bypass PyTorch IPC shared_memory socket limits on Mac
     buf = io.BytesIO()
-    torch.save(experiences, buf)
+    torch.save(all_results, buf)
     return buf.getvalue()
 
 class NLHESelfPlayTrainer:
@@ -761,22 +768,28 @@ class NLHESelfPlayTrainer:
                 sd_policy = {k.replace('_orig_mod.', ''): v.cpu().numpy() for k, v in self.policy.state_dict().items()}
                 sd_opp = {k.replace('_orig_mod.', ''): v.cpu().numpy() for k, v in self.opponent_encoder.state_dict().items()}
                 
-                # Unique seeds for each hand so workers don't play identical games
+                # Distribute hands evenly across workers (send weights ONCE per worker, not per hand)
+                num_workers = self.config.workers
+                hands_per_worker = self.config.hands_per_epoch // num_workers
+                remainder = self.config.hands_per_epoch % num_workers
+                
                 base_seed = self.rng.randint(0, 1000000)
-                tasks = [
-                    (self.config, base_seed + i, sd_policy, sd_opp, use_search_list[i])
-                    for i in range(self.config.hands_per_epoch)
-                ]
+                tasks = []
+                for w in range(num_workers):
+                    w_hands = hands_per_worker + (1 if w < remainder else 0)
+                    if w_hands > 0:
+                        tasks.append((self.config, base_seed + w, sd_policy, sd_opp, w_hands))
                 
                 results_bytes = list(pool.map(_mp_rollout_worker, tasks))
                 
-                # Deserialize returned bytes
+                # Deserialize batched results from each worker
                 for b in results_bytes:
-                    player_experiences = torch.load(io.BytesIO(b), weights_only=False)
-                    for pexp in player_experiences:
-                        all_exp.extend(pexp)
-                    if player_experiences[0]:
-                        epoch_reward += player_experiences[0][0].reward
+                    worker_hands = torch.load(io.BytesIO(b), weights_only=False)
+                    for player_experiences in worker_hands:
+                        for pexp in player_experiences:
+                            all_exp.extend(pexp)
+                        if player_experiences[0]:
+                            epoch_reward += player_experiences[0][0].reward
                         
                 if self.config.verbose:
                     elapsed = time.time() - epoch_start
