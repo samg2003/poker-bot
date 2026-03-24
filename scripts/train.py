@@ -122,10 +122,14 @@ def train_nlhe(args):
     else:
         stacks_str = f"{args.starting_bb}bb (fixed)"
 
+    search_str = f"{args.search_fraction*100:.0f}% hands" if args.search_fraction > 0 else "off"
+
     print(f"\n{'='*50}")
     print(f"Training on NLHE")
     print(f"  Players: {players_str}")
     print(f"  Stacks:  {stacks_str}")
+    print(f"  Device:  {args.device}")
+    print(f"  Search:  {search_str}")
     print(f"  Epochs:  {args.epochs} | Hands/epoch: {args.hands}")
     print(f"{'='*50}\n")
 
@@ -143,6 +147,8 @@ def train_nlhe(args):
         max_players=args.max_players,
         min_bb=args.min_bb,
         max_bb=args.max_bb,
+        device=args.device,
+        search_fraction=args.search_fraction,
     )
     trainer = NLHESelfPlayTrainer(config=config, seed=args.seed)
 
@@ -211,6 +217,12 @@ def main():
                         help='Min stack depth in BB when randomizing (default: 20)')
     parser.add_argument('--max-bb', type=int, default=200,
                         help='Max stack depth in BB when randomizing (default: 200)')
+
+    # Hardware & features
+    parser.add_argument('--device', type=str, default='auto',
+                        help='Device: auto, cuda, mps, cpu (default: auto)')
+    parser.add_argument('--search-fraction', type=float, default=0.0,
+                        help='Fraction of hands using search (0-1, default: 0 = off)')
 
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',

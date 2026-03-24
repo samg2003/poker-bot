@@ -46,6 +46,7 @@ code-poker-bot/
 ├── training/               # Training system
 │   ├── cfr.py              # ✅ CFR solver (validated on Kuhn Poker)
 │   ├── self_play_trainer.py # ✅ PPO self-play on Leduc Hold'em
+│   ├── nlhe_trainer.py     # ✅ Full NLHE self-play (opponent tracking, GPU, search)
 │   ├── personality.py      # ✅ Continuous personality perturbations + tilt
 │   └── curriculum.py       # ✅ Multi-stage curriculum trainer
 ├── agent/                  # Agent interface
@@ -56,7 +57,7 @@ code-poker-bot/
 ├── deployment/             # Production deployment
 │   ├── checkpoint.py       # ✅ Model save/load/versioning
 │   └── inference.py        # ✅ Optimized inference + benchmarking
-├── tests/                  # Test suite (168 tests)
+├── tests/                  # Test suite (185 tests)
 │   ├── test_engine.py
 │   ├── test_kuhn.py
 │   ├── test_model.py
@@ -83,7 +84,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Run tests (175 tests)
+# Run tests (185 tests)
 python3 -m pytest tests/ -v
 ```
 
@@ -101,7 +102,11 @@ python3 scripts/train.py --curriculum --epochs 500
 ### No-Limit Hold'em (GPU recommended)
 ```bash
 # Universal training — randomizes players (2-6) & stacks (20-200bb) per hand
+# Auto-detects GPU (CUDA/MPS), tracks opponent history, trains one universal model
 python3 scripts/train.py --game nlhe --epochs 500
+
+# With search-guided expert iteration (10% of hands use System 2 CFR)
+python3 scripts/train.py --game nlhe --epochs 500 --search-fraction 0.1
 
 # Fixed heads-up, 100bb deep
 python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 100
@@ -125,6 +130,8 @@ python3 scripts/train.py --game nlhe --epochs 500 --min-players 2 --max-players 
 --max-players N         Max players when random (default: 6)
 --min-bb N              Min stack in BB when random (default: 20)
 --max-bb N              Max stack in BB when random (default: 200)
+--device STR            Device: auto, cuda, mps, cpu (default: auto)
+--search-fraction F     Fraction of hands using search (default: 0)
 --checkpoint-dir DIR    Where to save checkpoints (default: checkpoints/)
 --lr FLOAT              Learning rate (default: 3e-4)
 --seed N                Random seed (default: 42)
@@ -170,8 +177,10 @@ The agent uses a **dual-signal** system:
 
 ### Training Pipeline
 1. **Self-play** — model copies play each other → converge toward GTO
-2. **Perturbation** — apply personality modifiers (range_mult, aggression_mult, etc.)
-3. **Situational** — per-context overrides (e.g., "tight preflop, loose on wet boards")
+2. **Opponent tracking** — action history + HUD stats feed real embeddings during training
+3. **Perturbation** — personality modifiers create diverse opponents
+4. **Expert iteration** — optional search-guided training refines the policy
+5. **History reset** — periodic reset (300-500 hands) ensures model handles unknown opponents
 
 ### Action Space
 - **Action type**: `[fold, check, call, raise]` — 4-way classification
