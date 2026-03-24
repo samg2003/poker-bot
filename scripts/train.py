@@ -111,9 +111,22 @@ def train_curriculum(args):
 
 def train_nlhe(args):
     """Train on full No-Limit Hold'em."""
+    # Determine display string
+    if args.num_players == 0:
+        players_str = f"{args.min_players}-{args.max_players} players (random)"
+    else:
+        players_str = f"{args.num_players} players (fixed)"
+
+    if args.starting_bb == 0:
+        stacks_str = f"{args.min_bb}-{args.max_bb}bb (random per-player)"
+    else:
+        stacks_str = f"{args.starting_bb}bb (fixed)"
+
     print(f"\n{'='*50}")
-    print(f"Training on NLHE ({args.num_players} players, {args.starting_bb}bb)")
-    print(f"Epochs: {args.epochs} | Hands/epoch: {args.hands}")
+    print(f"Training on NLHE")
+    print(f"  Players: {players_str}")
+    print(f"  Stacks:  {stacks_str}")
+    print(f"  Epochs:  {args.epochs} | Hands/epoch: {args.hands}")
     print(f"{'='*50}\n")
 
     config = NLHETrainingConfig(
@@ -126,6 +139,10 @@ def train_nlhe(args):
         log_interval=args.log_interval,
         num_players=args.num_players,
         starting_bb=args.starting_bb,
+        min_players=args.min_players,
+        max_players=args.max_players,
+        min_bb=args.min_bb,
+        max_bb=args.max_bb,
     )
     trainer = NLHESelfPlayTrainer(config=config, seed=args.seed)
 
@@ -140,11 +157,11 @@ def train_nlhe(args):
         version=f"nlhe_v{args.epochs:04d}",
         created_at=datetime.now().isoformat(),
         epoch=args.epochs,
-        stage=f"NLHE {args.num_players}p {args.starting_bb}bb",
+        stage=f"NLHE {players_str} {stacks_str}",
         total_hands=args.epochs * args.hands,
         avg_reward=avg_reward,
         loss=avg_loss,
-        test_count=168,
+        test_count=175,
     )
     checkpoint_mgr.save(trainer.policy, trainer.opponent_encoder, trainer.optimizer, metadata)
     checkpoint_mgr.save_best(trainer.policy, trainer.opponent_encoder, trainer.optimizer, metadata)
@@ -182,10 +199,18 @@ def main():
                         help='Number of Transformer layers')
 
     # NLHE-specific
-    parser.add_argument('--num-players', type=int, default=2,
-                        help='Number of players (NLHE, 2-9)')
-    parser.add_argument('--starting-bb', type=int, default=100,
-                        help='Starting stack in big blinds')
+    parser.add_argument('--num-players', type=int, default=0,
+                        help='Fixed player count (0 = random 2-6)')
+    parser.add_argument('--starting-bb', type=int, default=0,
+                        help='Fixed stack depth in BB (0 = random 20-200)')
+    parser.add_argument('--min-players', type=int, default=2,
+                        help='Min players when randomizing (default: 2)')
+    parser.add_argument('--max-players', type=int, default=6,
+                        help='Max players when randomizing (default: 6)')
+    parser.add_argument('--min-bb', type=int, default=20,
+                        help='Min stack depth in BB when randomizing (default: 20)')
+    parser.add_argument('--max-bb', type=int, default=200,
+                        help='Max stack depth in BB when randomizing (default: 200)')
 
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',

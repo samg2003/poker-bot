@@ -4,6 +4,12 @@ NLHE Self-Play Trainer — full No-Limit Hold'em training loop.
 Uses the full game engine (engine/dealer.py) + NLHEEncoder to bridge
 GameState → model tensors. Same PPO training as the Leduc trainer,
 but on full 52-card NLHE with 2-9 players, side pots, etc.
+
+Each hand randomly samples:
+- Number of players (min_players to max_players)
+- Per-player stack depth (min_bb to max_bb, independently)
+
+This trains one universal model that handles any table configuration.
 """
 
 from __future__ import annotations
@@ -23,10 +29,6 @@ from model.opponent_encoder import OpponentEncoder
 from model.policy_network import PolicyNetwork
 from model.stat_tracker import StatTracker, NUM_STAT_FEATURES
 from model.nlhe_encoder import NLHEEncoder
-from training.personality import (
-    PersonalityModifier, SituationalPersonality, detect_situations,
-    sample_table_personalities,
-)
 
 
 class Experience(NamedTuple):
@@ -53,11 +55,18 @@ class NLHETrainingConfig:
     num_heads: int = 4
     num_layers: int = 3
 
-    # Game setup
-    num_players: int = 2
-    starting_bb: int = 100
+    # Game setup — ranges for per-hand randomization
+    min_players: int = 2         # minimum players at the table
+    max_players: int = 6         # maximum players at the table
+    min_bb: int = 20             # minimum stack depth (in BB)
+    max_bb: int = 200            # maximum stack depth (in BB)
     small_blind: float = 0.5
     big_blind: float = 1.0
+    uniform_stacks: bool = False # if False, each player gets independent random stack
+
+    # For backwards compatibility — if set, overrides ranges
+    num_players: int = 0         # 0 = use min/max range
+    starting_bb: int = 0         # 0 = use min/max range
 
     # Training
     lr: float = 3e-4
@@ -82,8 +91,11 @@ class NLHESelfPlayTrainer:
     """
     Self-play trainer on full NLHE.
 
-    Two copies of the policy play against each other using the
-    Dealer (with real cards, shuffling, side pots, etc.).
+    Each hand randomly samples:
+    - Number of players (min_players to max_players)
+    - Per-player stack depth (min_bb to max_bb, independently)
+
+    This trains one universal model that handles any table configuration.
     """
 
     def __init__(self, config: Optional[NLHETrainingConfig] = None, seed: int = 42):
@@ -108,11 +120,41 @@ class NLHESelfPlayTrainer:
         self.optimizer = torch.optim.Adam(all_params, lr=self.config.lr)
 
         self.encoder = NLHEEncoder()
-        self.stat_trackers = [StatTracker() for _ in range(self.config.num_players)]
 
         # Metrics
         self.epoch_rewards: List[float] = []
         self.epoch_losses: List[float] = []
+
+    def _sample_table(self) -> Tuple[int, List[float]]:
+        """
+        Sample a random table configuration for one hand.
+
+        Returns:
+            num_players: number of players (2-9)
+            stacks: per-player chip stacks
+        """
+        c = self.config
+
+        # Player count
+        if c.num_players > 0:
+            num_p = c.num_players
+        else:
+            num_p = self.rng.randint(c.min_players, c.max_players)
+
+        # Stack depths (in chips)
+        if c.starting_bb > 0:
+            stacks = [c.starting_bb * c.big_blind] * num_p
+        elif c.uniform_stacks:
+            bb_depth = self.rng.randint(c.min_bb, c.max_bb)
+            stacks = [bb_depth * c.big_blind] * num_p
+        else:
+            # Each player gets an independent random stack
+            stacks = [
+                self.rng.randint(c.min_bb, c.max_bb) * c.big_blind
+                for _ in range(num_p)
+            ]
+
+        return num_p, stacks
 
     def _encode_action_mask(self, game_state: GameState) -> torch.Tensor:
         """Encode legal actions for current player as (1, 4) bool tensor."""
@@ -206,11 +248,11 @@ class NLHESelfPlayTrainer:
         """
         Play one full hand of NLHE using self-play.
 
+        Randomly samples table config (player count, stack depths).
         Returns experience lists for each player.
         """
         self.policy.eval()
-        num_p = self.config.num_players
-        stacks = [self.config.starting_bb * self.config.big_blind] * num_p
+        num_p, stacks = self._sample_table()
 
         dealer = Dealer(
             num_players=num_p,

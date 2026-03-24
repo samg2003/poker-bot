@@ -100,14 +100,14 @@ python3 scripts/train.py --curriculum --epochs 500
 
 ### No-Limit Hold'em (GPU recommended)
 ```bash
-# Heads-up, 100bb deep
+# Universal training — randomizes players (2-6) & stacks (20-200bb) per hand
+python3 scripts/train.py --game nlhe --epochs 500
+
+# Fixed heads-up, 100bb deep
 python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 100
 
-# 6-max, 100bb deep
-python3 scripts/train.py --game nlhe --epochs 500 --num-players 6 --starting-bb 100
-
-# Short-stacked
-python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 20
+# Custom ranges
+python3 scripts/train.py --game nlhe --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300
 ```
 
 ### Full CLI Options
@@ -119,8 +119,12 @@ python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 
 --embed-dim N           Model embedding dimension (default: 128)
 --num-heads N           Attention heads (default: 4)
 --num-layers N          Transformer layers (default: 3)
---num-players N         Players at table, NLHE only (default: 2)
---starting-bb N         Starting stack in BB, NLHE only (default: 100)
+--num-players N         Fixed player count, 0=random (default: 0)
+--starting-bb N         Fixed stack in BB, 0=random (default: 0)
+--min-players N         Min players when random (default: 2)
+--max-players N         Max players when random (default: 6)
+--min-bb N              Min stack in BB when random (default: 20)
+--max-bb N              Max stack in BB when random (default: 200)
 --checkpoint-dir DIR    Where to save checkpoints (default: checkpoints/)
 --lr FLOAT              Learning rate (default: 3e-4)
 --seed N                Random seed (default: 42)
