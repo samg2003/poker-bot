@@ -37,6 +37,8 @@ def main():
     parser.add_argument('--embed-dim', type=int, default=128)
     parser.add_argument('--num-heads', type=int, default=4)
     parser.add_argument('--num-layers', type=int, default=3)
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
+                        help='Directory where checkpoints are stored')
     parser.add_argument('--seed', type=int, default=42)
 
     args = parser.parse_args()
@@ -56,7 +58,7 @@ def main():
 
     # Load checkpoint if specified
     if args.checkpoint:
-        mgr = CheckpointManager()
+        mgr = CheckpointManager(args.checkpoint_dir)
         metadata = mgr.load(policy, encoder, tag=args.checkpoint)
         print(f"Loaded checkpoint: {metadata.version} (epoch {metadata.epoch})")
         print()

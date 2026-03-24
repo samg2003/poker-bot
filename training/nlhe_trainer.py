@@ -33,6 +33,10 @@ from model.policy_network import PolicyNetwork
 from model.stat_tracker import StatTracker, HandRecord, NUM_STAT_FEATURES
 from model.nlhe_encoder import NLHEEncoder
 from search.search import SearchEngine, SearchConfig
+from training.personality import (
+    SituationalPersonality, PersonalityModifier,
+    sample_table_personalities, detect_situations,
+)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -100,6 +104,8 @@ class NLHETrainingConfig:
 
     # Device
     device: str = "auto"  # "auto", "cuda", "mps", "cpu"
+    workers: int = 1      # Number of parallel CPU workers
+    compile: bool = False # Use torch.compile to accelerate model mathematically
 
     # Logging
     log_interval: int = 10
@@ -109,6 +115,44 @@ class NLHETrainingConfig:
 # ─────────────────────────────────────────────────────────────
 # Trainer
 # ─────────────────────────────────────────────────────────────
+
+import io
+from concurrent.futures import ProcessPoolExecutor
+
+def _mp_rollout_worker(args):
+    """Module-level worker function for parallel self-play to survive pickle."""
+    import sys, os
+    # Suppress verbose PyTorch macOS Metal Performance Shaders (MPS) Graph permission warnings
+    sys.stderr = open(os.devnull, 'w')
+    sys.stdout = open(os.devnull, 'w')
+    
+    # Disable Xcode cache locks to allow multiple workers to successfully compile PyTorch C++ kernels identically
+    os.environ['XCRUN_CACHE_DISABLE'] = '1'
+    
+    config, seed, sd_policy, sd_opp, use_search = args
+    # Recreate a lightweight CPU-only trainer for simulation
+    config.device = "cpu"
+    # macOS strictly forbids spawned child processes from invoking clang++ in /tmp directories, 
+    # so we MUST disable torch.compile for the rollouts. (this works fine on AWS Linux though!)
+    if sys.platform == 'darwin':
+        config.compile = False
+        
+    trainer = NLHESelfPlayTrainer(config, seed=seed)
+    
+    # Load PyTorch state dicts seamlessly via numpy arrays
+    sd_policy_t = {k: torch.from_numpy(v) for k, v in sd_policy.items()}
+    sd_opp_t = {k: torch.from_numpy(v) for k, v in sd_opp.items()}
+    
+    trainer.policy.load_state_dict(sd_policy_t)
+    trainer.opponent_encoder.load_state_dict(sd_opp_t)
+    
+    # Run simulation
+    experiences = trainer._play_hand(use_search=use_search)
+    
+    # Serialize to raw bytes to bypass PyTorch IPC shared_memory socket limits on Mac
+    buf = io.BytesIO()
+    torch.save(experiences, buf)
+    return buf.getvalue()
 
 class NLHESelfPlayTrainer:
     """
@@ -140,6 +184,17 @@ class NLHESelfPlayTrainer:
             num_cross_attn_layers=self.config.num_layers,
         ).to(self.device)
 
+        if self.config.compile:
+            try:
+                # Compile networks down to C++ / triton loops to maximize speed on CPU layers
+                self.policy = torch.compile(self.policy)
+                self.opponent_encoder = torch.compile(self.opponent_encoder)
+                if self.config.verbose:
+                    print(f"✅ Successfully compiled Policy and Encoder networks on {self.device}")
+            except Exception as e:
+                import warnings
+                warnings.warn(f"torch.compile failed on {self.device}. Falling back to default: {e}")
+
         all_params = list(self.policy.parameters()) + list(self.opponent_encoder.parameters())
         self.optimizer = torch.optim.Adam(all_params, lr=self.config.lr)
 
@@ -149,6 +204,10 @@ class NLHESelfPlayTrainer:
         self.stat_tracker = StatTracker()
         self.hands_since_reset = 0
         self.next_reset_at = self.rng.randint(*self.config.history_reset_interval)
+
+        # Personality curriculum — initially no personalities (pure self-play GTO)
+        self.current_epoch = 0
+        self.table_personalities: List[SituationalPersonality] = []
 
         # ── Search engine ─────────────────────────────────────
         if self.config.search_fraction > 0:
@@ -260,14 +319,28 @@ class NLHESelfPlayTrainer:
 
         return torch.stack(stats).unsqueeze(0).to(self.device)  # (1, num_opp, stat_dim)
 
+    def _get_personality_gto_fraction(self) -> float:
+        """Graduated personality curriculum schedule."""
+        epoch = self.current_epoch
+        if epoch < 10:
+            return 1.0      # 0% personalities — pure GTO self-play foundation
+        elif epoch < 20:
+            return 0.875    # 12.5% (1/8) opponents get personalities
+        elif epoch < 30:
+            return 0.75     # 25% (1/4) opponents get personalities
+        else:
+            return 0.667    # 33% (1/3) opponents get personalities
+
     def _maybe_reset_histories(self):
-        """Periodically reset opponent histories (simulate new table)."""
+        """Periodically reset opponent histories and personalities (simulate new table)."""
         self.hands_since_reset += 1
         if self.hands_since_reset >= self.next_reset_at:
             self.action_histories.clear()
             self.stat_tracker.reset()
             self.hands_since_reset = 0
             self.next_reset_at = self.rng.randint(*self.config.history_reset_interval)
+            # Reshuffle personalities when we "sit down at a new table"
+            self.table_personalities = []
 
     # ─────────────────────────────────────────────────────────
     # State encoding
@@ -394,6 +467,13 @@ class NLHESelfPlayTrainer:
         game_state = dealer.start_hand()
         experiences: List[List[dict]] = [[] for _ in range(num_p)]
 
+        # Sample table personalities if not already set (or table size changed)
+        gto_frac = self._get_personality_gto_fraction()
+        if len(self.table_personalities) != num_p:
+            self.table_personalities = sample_table_personalities(
+                num_p, gto_fraction=gto_frac, rng=self.rng
+            )
+
         # Build hand records for stat tracking
         hand_records = [HandRecord() for _ in range(num_p)]
 
@@ -427,6 +507,21 @@ class NLHESelfPlayTrainer:
             probs = output.action_type_probs[0]
             value = output.value[0, 0].item()
             sizing = output.bet_sizing[0, 0].item()
+
+            # Apply personality perturbation for opponent seats
+            if pid < len(self.table_personalities):
+                personality = self.table_personalities[pid]
+                # Detect current game situations for situational overrides
+                street_map_sit = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
+                situations = detect_situations(
+                    street=street_map_sit.get(game_state.street, 0),
+                    board_cards=list(game_state.board) if game_state.board else None,
+                    stack_bb=p.stack / max(game_state.big_blind, 1),
+                )
+                probs = personality.apply(
+                    probs, situations,
+                    hand_strength=0.5,  # unknown during play, use neutral
+                )
 
             # Search-guided action selection (expert iteration)
             if use_search and self.search_engine is not None:
@@ -519,7 +614,7 @@ class NLHESelfPlayTrainer:
         all_experiences = []
         for pid in range(num_p):
             player_exp = []
-            reward = profits[pid] / self.config.big_blind
+            reward = (profits[pid] / self.config.big_blind) / 100.0
             for exp_dict in experiences[pid]:
                 player_exp.append(Experience(
                     hole_cards=exp_dict['hole_cards'],
@@ -551,11 +646,11 @@ class NLHESelfPlayTrainer:
         self.opponent_encoder.train()
         
         # 1. Stack scalar/fixed-size features
-        hole_cards = torch.cat([e.hole_cards for e in experiences], dim=0)
-        community = torch.cat([e.community_cards for e in experiences], dim=0)
-        numeric = torch.cat([e.numeric_features for e in experiences], dim=0)
-        own_stats = torch.cat([e.own_stats for e in experiences], dim=0)
-        action_masks = torch.cat([e.action_mask for e in experiences], dim=0)
+        hole_cards = torch.cat([e.hole_cards.to(self.device) for e in experiences], dim=0)
+        community = torch.cat([e.community_cards.to(self.device) for e in experiences], dim=0)
+        numeric = torch.cat([e.numeric_features.to(self.device) for e in experiences], dim=0)
+        own_stats = torch.cat([e.own_stats.to(self.device) for e in experiences], dim=0)
+        action_masks = torch.cat([e.action_mask.to(self.device) for e in experiences], dim=0)
         
         # 2. Pad opponent sequence arrays (shape is [1, num_opp, dim])
         max_opps = max([e.opponent_embeddings.shape[1] for e in experiences])
@@ -568,8 +663,8 @@ class NLHESelfPlayTrainer:
             curr_opps = e.opponent_embeddings.shape[1]
             pad_len = max_opps - curr_opps
             
-            emb = e.opponent_embeddings
-            stat = e.opponent_stats
+            emb = e.opponent_embeddings.to(self.device)
+            stat = e.opponent_stats.to(self.device)
             
             if pad_len > 0:
                 emb_pad = torch.zeros(1, pad_len, emb.shape[2], device=self.device)
@@ -647,31 +742,60 @@ class NLHESelfPlayTrainer:
         }
 
         print(f"Device: {self.device}")
+        
+        pool = ProcessPoolExecutor(max_workers=self.config.workers) if self.config.workers > 1 else None
 
         for epoch in range(num_epochs):
+            self.current_epoch = epoch + 1
             all_exp: List[Experience] = []
             epoch_reward = 0.0
             epoch_start = time.time()
+            
+            use_search_list = [
+                self.search_engine is not None and self.rng.random() < self.config.search_fraction
+                for _ in range(self.config.hands_per_epoch)
+            ]
 
-            for hand_i in range(self.config.hands_per_epoch):
-                # Decide whether to use search for this hand
-                use_search = (
-                    self.search_engine is not None and
-                    self.rng.random() < self.config.search_fraction
-                )
-
-                player_experiences = self._play_hand(use_search=use_search)
-                for pexp in player_experiences:
-                    all_exp.extend(pexp)
-                if player_experiences[0]:
-                    epoch_reward += player_experiences[0][0].reward
-
-                # Verbose progress tracking
-                if self.config.verbose and (hand_i + 1) % max(1, self.config.hands_per_epoch // 5) == 0:
+            if pool:
+                # Export weights as simple nested numpy matrices, stripping compiled `_orig_mod.` prefix
+                sd_policy = {k.replace('_orig_mod.', ''): v.cpu().numpy() for k, v in self.policy.state_dict().items()}
+                sd_opp = {k.replace('_orig_mod.', ''): v.cpu().numpy() for k, v in self.opponent_encoder.state_dict().items()}
+                
+                # Unique seeds for each hand so workers don't play identical games
+                base_seed = self.rng.randint(0, 1000000)
+                tasks = [
+                    (self.config, base_seed + i, sd_policy, sd_opp, use_search_list[i])
+                    for i in range(self.config.hands_per_epoch)
+                ]
+                
+                results_bytes = list(pool.map(_mp_rollout_worker, tasks))
+                
+                # Deserialize returned bytes
+                for b in results_bytes:
+                    player_experiences = torch.load(io.BytesIO(b), weights_only=False)
+                    for pexp in player_experiences:
+                        all_exp.extend(pexp)
+                    if player_experiences[0]:
+                        epoch_reward += player_experiences[0][0].reward
+                        
+                if self.config.verbose:
                     elapsed = time.time() - epoch_start
-                    print(f"  [Epoch {epoch+1:4d}] Hand {hand_i+1}/{self.config.hands_per_epoch}... ({elapsed:.1f}s)")
+                    print(f"  [Epoch {epoch+1:4d}] Collected {self.config.hands_per_epoch} hands concurrently... ({elapsed:.1f}s)")
 
-            avg_reward = epoch_reward / self.config.hands_per_epoch
+            else:
+                for hand_i in range(self.config.hands_per_epoch):
+                    player_experiences = self._play_hand(use_search=use_search_list[hand_i])
+                    for pexp in player_experiences:
+                        all_exp.extend(pexp)
+                    if player_experiences[0]:
+                        epoch_reward += player_experiences[0][0].reward
+
+                    # Verbose progress tracking
+                    if self.config.verbose and (hand_i + 1) % max(1, self.config.hands_per_epoch // 5) == 0:
+                        elapsed = time.time() - epoch_start
+                        print(f"  [Epoch {epoch+1:4d}] Hand {hand_i+1}/{self.config.hands_per_epoch}... ({elapsed:.1f}s)")
+
+            avg_reward = (epoch_reward / self.config.hands_per_epoch) * 100.0
 
             # PPO update
             total_loss = 0.0

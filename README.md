@@ -113,6 +113,8 @@ python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 
 
 # Custom ranges
 python3 scripts/train.py --game nlhe --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300
+
+python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 4 --hands 2048 --epochs 100 --workers 5 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --verbose 
 ```
 
 ### Full CLI Options
@@ -132,6 +134,8 @@ python3 scripts/train.py --game nlhe --epochs 500 --min-players 2 --max-players 
 --max-bb N              Max stack in BB when random (default: 200)
 --device STR            Device: auto, cuda, mps, cpu (default: auto)
 --threads N             Number of CPU threads to use; 0=all (default: 0)
+--workers N             Number of parallel CPU simulation workers (default: 1)
+--compile               Use torch.compile to aggressively optimize model math structure
 --verbose               Enable verbose output with timing and progress updates
 --search-fraction F     Fraction of hands using search (default: 0)
 --checkpoint-dir DIR    Where to save checkpoints (default: checkpoints/)
