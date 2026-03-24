@@ -53,17 +53,24 @@ code-poker-bot/
 │   └── config.py           # ✅ Central configuration
 ├── evaluation/             # Benchmarks
 │   └── evaluator.py        # ✅ 6 automated benchmarks
-├── tests/                  # Test suite (154 tests)
+├── deployment/             # Production deployment
+│   ├── checkpoint.py       # ✅ Model save/load/versioning
+│   └── inference.py        # ✅ Optimized inference + benchmarking
+├── tests/                  # Test suite (168 tests)
 │   ├── test_engine.py
 │   ├── test_kuhn.py
 │   ├── test_model.py
 │   ├── test_self_play.py
 │   ├── test_personality.py
 │   ├── test_search.py
-│   └── test_evaluation.py
+│   ├── test_evaluation.py
+│   └── test_deployment.py
+├── scripts/                # CLI scripts
+│   ├── train.py            # ✅ Training CLI (Leduc + curriculum)
+│   └── evaluate.py         # ✅ Evaluation CLI + latency benchmark
 ├── docs/                   # Architecture Decision Records
 │   └── adr/
-└── scripts/                # Training & evaluation scripts
+└── requirements.txt
 ```
 
 ## Quick Start
@@ -104,7 +111,7 @@ See [docs/adr/](docs/adr/) for recorded architecture decisions and their rationa
 | **3. Perturbations** | ✅ Complete | Personality system, NLHE encoder, curriculum training |
 | **4. Search** | ✅ Complete | Subtree CFR, range estimation, search triggering |
 | **5. Evaluation** | ✅ Complete | Agent interface, 6 automated benchmarks |
-| **6. Deployment** | 🔲 Next | Inference optimization, model checkpointing |
+| **6. Deployment** | ✅ Complete | Checkpointing, optimized inference, CLI scripts |
 
 ## Key Concepts
 
