@@ -543,52 +543,97 @@ class NLHESelfPlayTrainer:
     # ─────────────────────────────────────────────────────────
 
     def _compute_ppo_loss(self, experiences: List[Experience]) -> float:
-        """Compute PPO loss from collected experience."""
+        """Compute PPO loss from collected experience using batched operations."""
         if not experiences:
             return 0.0
 
         self.policy.train()
         self.opponent_encoder.train()
-        total_loss = 0.0
-
-        for exp in experiences:
-            output = self.policy(
-                hole_cards=exp.hole_cards,
-                community_cards=exp.community_cards,
-                numeric_features=exp.numeric_features,
-                opponent_embeddings=exp.opponent_embeddings,
-                opponent_stats=exp.opponent_stats,
-                own_stats=exp.own_stats,
-                action_mask=exp.action_mask,
-            )
-
-            probs = output.action_type_probs[0]
-            new_dist = Categorical(probs)
-            action_t = torch.tensor(exp.action_idx, device=self.device)
-            new_log_prob = new_dist.log_prob(action_t)
-
-            ratio = (new_log_prob - exp.log_prob).exp()
-            advantage = exp.reward - exp.value
-
-            surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * advantage
-            policy_loss = -torch.min(surr1, surr2)
-
-            value_pred = output.value[0, 0]
-            value_loss = (value_pred - exp.reward) ** 2
-
-            entropy = new_dist.entropy()
-
-            loss = (
-                policy_loss
-                + self.config.value_coef * value_loss
-                - self.config.entropy_coef * entropy
-            ) / len(experiences)
+        
+        # 1. Stack scalar/fixed-size features
+        hole_cards = torch.cat([e.hole_cards for e in experiences], dim=0)
+        community = torch.cat([e.community_cards for e in experiences], dim=0)
+        numeric = torch.cat([e.numeric_features for e in experiences], dim=0)
+        own_stats = torch.cat([e.own_stats for e in experiences], dim=0)
+        action_masks = torch.cat([e.action_mask for e in experiences], dim=0)
+        
+        # 2. Pad opponent sequence arrays (shape is [1, num_opp, dim])
+        max_opps = max([e.opponent_embeddings.shape[1] for e in experiences])
+        
+        opp_emb_list = []
+        opp_stat_list = []
+        opp_mask_list = []
+        
+        for e in experiences:
+            curr_opps = e.opponent_embeddings.shape[1]
+            pad_len = max_opps - curr_opps
             
-            loss.backward()
-            total_loss += loss.item()
-
-        return total_loss
+            emb = e.opponent_embeddings
+            stat = e.opponent_stats
+            
+            if pad_len > 0:
+                emb_pad = torch.zeros(1, pad_len, emb.shape[2], device=self.device)
+                stat_pad = torch.zeros(1, pad_len, stat.shape[2], device=self.device)
+                
+                emb = torch.cat([emb, emb_pad], dim=1)
+                stat = torch.cat([stat, stat_pad], dim=1)
+                
+                mask = torch.tensor([[False]*curr_opps + [True]*pad_len], device=self.device, dtype=torch.bool)
+            else:
+                mask = torch.tensor([[False]*curr_opps], device=self.device, dtype=torch.bool)
+                
+            opp_emb_list.append(emb)
+            opp_stat_list.append(stat)
+            opp_mask_list.append(mask)
+            
+        opp_embeds = torch.cat(opp_emb_list, dim=0)
+        opp_stats = torch.cat(opp_stat_list, dim=0)
+        opp_masks = torch.cat(opp_mask_list, dim=0)
+        
+        # 3. Stack targets
+        action_t = torch.tensor([e.action_idx for e in experiences], device=self.device, dtype=torch.long)
+        old_log_probs = torch.tensor([e.log_prob for e in experiences], device=self.device, dtype=torch.float32)
+        rewards = torch.tensor([e.reward for e in experiences], device=self.device, dtype=torch.float32)
+        old_values = torch.tensor([e.value for e in experiences], device=self.device, dtype=torch.float32)
+        
+        # 4. Batched forward pass
+        output = self.policy(
+            hole_cards=hole_cards,
+            community_cards=community,
+            numeric_features=numeric,
+            opponent_embeddings=opp_embeds,
+            opponent_stats=opp_stats,
+            own_stats=own_stats,
+            action_mask=action_masks,
+            opponent_mask=opp_masks,
+        )
+        
+        # 5. Compute PPO stats and loss
+        dist = Categorical(output.action_type_probs)
+        new_log_probs = dist.log_prob(action_t)
+        entropy = dist.entropy().mean()
+        
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        advantages = rewards - old_values
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * advantages
+        policy_loss = -torch.min(surr1, surr2).mean()
+        
+        value_pred = output.value.squeeze(-1)
+        value_loss = ((value_pred - rewards) ** 2).mean()
+        
+        loss = (
+            policy_loss
+            + self.config.value_coef * value_loss
+            - self.config.entropy_coef * entropy
+        )
+        
+        loss.backward()
+        
+        return loss.item()
 
     # ─────────────────────────────────────────────────────────
     # Training loop
