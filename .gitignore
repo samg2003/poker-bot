@@ -1,3 +1,6 @@
+# SSH keys
+*.pem
+
 # Python
 __pycache__/
 *.py[cod]
