@@ -31,7 +31,8 @@ code-poker-bot/
 ├── engine/                 # Core poker engine
 │   ├── game_state.py       # NLHE game state (2-9 players, 1-350bb, side pots)
 │   ├── hand_evaluator.py   # 5-7 card hand ranking
-│   └── dealer.py           # Game loop (shuffle, deal, streets, showdown)
+│   ├── dealer.py           # Game loop (shuffle, deal, streets, showdown)
+│   └── kuhn_poker.py       # Kuhn Poker (3-card game for validation)
 ├── model/                  # Neural network components (Phase 2)
 │   ├── opponent_encoder.py
 │   ├── stat_tracker.py
@@ -40,7 +41,8 @@ code-poker-bot/
 ├── search/                 # Lightweight search (Phase 4)
 │   ├── search.py
 │   └── range_estimator.py
-├── training/               # Training system (Phase 2-3)
+├── training/               # Training system
+│   ├── cfr.py              # ✅ CFR solver (validated on Kuhn Poker)
 │   ├── self_play_trainer.py
 │   ├── personality.py
 │   ├── trainer.py
@@ -49,8 +51,9 @@ code-poker-bot/
 ├── agent/                  # Agent interface (Phase 2)
 │   ├── poker_agent.py
 │   └── config.py
-├── tests/                  # Test suite
-│   └── test_engine.py
+├── tests/                  # Test suite (53 tests)
+│   ├── test_engine.py
+│   └── test_kuhn.py
 ├── docs/                   # Architecture Decision Records
 │   └── adr/
 └── scripts/                # Training & evaluation scripts
@@ -89,7 +92,7 @@ See [docs/adr/](docs/adr/) for recorded architecture decisions and their rationa
 
 | Phase | Status | Description |
 |---|---|---|
-| **1. Engine** | ✅ Complete | NLHE rules, hand evaluator, dealer |
+| **1. Engine** | ✅ Complete | NLHE rules, hand evaluator, dealer, Kuhn Poker + CFR validation |
 | **2. Architecture** | 🔲 Next | Opponent encoder, policy network, self-play |
 | **3. Perturbations** | 🔲 | Situational personality modifiers, NLHE training |
 | **4. Search** | 🔲 | Lightweight real-time search (System 2) |
