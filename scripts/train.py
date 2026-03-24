@@ -24,7 +24,8 @@ import torch
 from datetime import datetime
 
 from training.curriculum import CurriculumTrainer, CurriculumConfig, CurriculumStage
-from training.self_play_trainer import LeducSelfPlayTrainer
+from training.self_play_trainer import LeducSelfPlayTrainer, TrainingConfig
+from training.nlhe_trainer import NLHESelfPlayTrainer, NLHETrainingConfig
 from deployment.checkpoint import CheckpointManager, CheckpointMetadata
 from agent.config import AgentConfig
 
@@ -36,48 +37,48 @@ def train_leduc(args):
     print(f"Epochs: {args.epochs} | Hands/epoch: {args.hands}")
     print(f"{'='*50}\n")
 
-    trainer = LeducSelfPlayTrainer(
+    config = TrainingConfig(
         embed_dim=args.embed_dim,
         opponent_embed_dim=args.embed_dim,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         lr=args.lr,
         hands_per_epoch=args.hands,
+        log_interval=args.log_interval,
     )
+    trainer = LeducSelfPlayTrainer(config=config, seed=args.seed)
 
     checkpoint_mgr = CheckpointManager(args.checkpoint_dir)
 
-    best_reward = float('-inf')
-    for epoch in range(args.epochs):
-        avg_reward, avg_loss = trainer.train_epoch()
+    # Train
+    metrics = trainer.train(num_epochs=args.epochs)
 
-        if (epoch + 1) % args.log_interval == 0:
-            print(f"Epoch {epoch+1:4d} | Reward: {avg_reward:+.4f} | Loss: {avg_loss:.4f}")
+    # Save final checkpoint
+    avg_reward = metrics['epoch_reward'][-1] if metrics['epoch_reward'] else 0.0
+    avg_loss = metrics['epoch_loss'][-1] if metrics['epoch_loss'] else 0.0
 
-        if (epoch + 1) % args.save_interval == 0:
-            metadata = CheckpointMetadata(
-                version=f"leduc_v{epoch+1:04d}",
-                created_at=datetime.now().isoformat(),
-                epoch=epoch + 1,
-                stage="Leduc Self-Play",
-                total_hands=(epoch + 1) * args.hands,
-                avg_reward=avg_reward,
-                loss=avg_loss,
-                test_count=154,
-            )
-            checkpoint_mgr.save(
-                trainer.policy, trainer.opponent_encoder,
-                trainer.optimizer, metadata,
-            )
+    metadata = CheckpointMetadata(
+        version=f"leduc_v{args.epochs:04d}",
+        created_at=datetime.now().isoformat(),
+        epoch=args.epochs,
+        stage="Leduc Self-Play",
+        total_hands=args.epochs * args.hands,
+        avg_reward=avg_reward,
+        loss=avg_loss,
+        test_count=168,
+    )
+    checkpoint_mgr.save(
+        trainer.policy, trainer.opponent_encoder,
+        trainer.optimizer, metadata,
+    )
+    checkpoint_mgr.save_best(
+        trainer.policy, trainer.opponent_encoder,
+        trainer.optimizer, metadata,
+    )
 
-            if avg_reward > best_reward:
-                best_reward = avg_reward
-                checkpoint_mgr.save_best(
-                    trainer.policy, trainer.opponent_encoder,
-                    trainer.optimizer, metadata,
-                )
-
+    best_reward = max(metrics['epoch_reward']) if metrics['epoch_reward'] else 0.0
     print(f"\nTraining complete. Best reward: {best_reward:+.4f}")
+    print(f"Checkpoint saved to: {args.checkpoint_dir}/latest")
 
 
 def train_curriculum(args):
@@ -108,6 +109,51 @@ def train_curriculum(args):
         print(f"Final reward: {metrics.epoch_rewards[-1]:+.4f}")
 
 
+def train_nlhe(args):
+    """Train on full No-Limit Hold'em."""
+    print(f"\n{'='*50}")
+    print(f"Training on NLHE ({args.num_players} players, {args.starting_bb}bb)")
+    print(f"Epochs: {args.epochs} | Hands/epoch: {args.hands}")
+    print(f"{'='*50}\n")
+
+    config = NLHETrainingConfig(
+        embed_dim=args.embed_dim,
+        opponent_embed_dim=args.embed_dim,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        lr=args.lr,
+        hands_per_epoch=args.hands,
+        log_interval=args.log_interval,
+        num_players=args.num_players,
+        starting_bb=args.starting_bb,
+    )
+    trainer = NLHESelfPlayTrainer(config=config, seed=args.seed)
+
+    checkpoint_mgr = CheckpointManager(args.checkpoint_dir)
+    metrics = trainer.train(num_epochs=args.epochs)
+
+    # Save checkpoint
+    avg_reward = metrics['epoch_reward'][-1] if metrics['epoch_reward'] else 0.0
+    avg_loss = metrics['epoch_loss'][-1] if metrics['epoch_loss'] else 0.0
+
+    metadata = CheckpointMetadata(
+        version=f"nlhe_v{args.epochs:04d}",
+        created_at=datetime.now().isoformat(),
+        epoch=args.epochs,
+        stage=f"NLHE {args.num_players}p {args.starting_bb}bb",
+        total_hands=args.epochs * args.hands,
+        avg_reward=avg_reward,
+        loss=avg_loss,
+        test_count=168,
+    )
+    checkpoint_mgr.save(trainer.policy, trainer.opponent_encoder, trainer.optimizer, metadata)
+    checkpoint_mgr.save_best(trainer.policy, trainer.opponent_encoder, trainer.optimizer, metadata)
+
+    best_reward = max(metrics['epoch_reward']) if metrics['epoch_reward'] else 0.0
+    print(f"\nTraining complete. Best reward: {best_reward:+.4f} bb")
+    print(f"Checkpoint saved to: {args.checkpoint_dir}/latest")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train poker AI')
 
@@ -115,7 +161,7 @@ def main():
     parser.add_argument('--game', choices=['leduc', 'nlhe'], default='leduc',
                         help='Game to train on (default: leduc)')
     parser.add_argument('--curriculum', action='store_true',
-                        help='Use curriculum training')
+                        help='Use curriculum training (Leduc only)')
 
     # Training params
     parser.add_argument('--epochs', type=int, default=100,
@@ -135,6 +181,12 @@ def main():
     parser.add_argument('--num-layers', type=int, default=3,
                         help='Number of Transformer layers')
 
+    # NLHE-specific
+    parser.add_argument('--num-players', type=int, default=2,
+                        help='Number of players (NLHE, 2-9)')
+    parser.add_argument('--starting-bb', type=int, default=100,
+                        help='Starting stack in big blinds')
+
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
                         help='Checkpoint directory')
@@ -149,6 +201,8 @@ def main():
 
     if args.curriculum:
         train_curriculum(args)
+    elif args.game == 'nlhe':
+        train_nlhe(args)
     else:
         train_leduc(args)
 

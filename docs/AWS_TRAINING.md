@@ -9,10 +9,13 @@ Train locally on Leduc for quick validation, then scale to full NLHE on AWS GPU.
 ```bash
 cd code-poker-bot
 source venv/bin/activate  # or python3 -m venv venv && source venv/bin/activate
-python3 -m pytest tests/ -v  # make sure 168 tests pass
+python3 -m pytest tests/ -v  # make sure 175 tests pass
 
 # Quick Leduc training (~5 min, CPU)
-python3 scripts/train.py --game leduc --epochs 100 --embed-dim 64
+python3 scripts/train.py --game leduc --epochs 200 --embed-dim 64 --num-heads 2 --num-layers 2
+
+# Quick NLHE smoke test (~10 min, CPU — slow but validates)
+python3 scripts/train.py --game nlhe --epochs 10 --hands 32 --embed-dim 64 --num-heads 2 --num-layers 2
 ```
 
 ## Step 2: Launch AWS GPU Instance
@@ -22,15 +25,15 @@ python3 scripts/train.py --game leduc --epochs 100 --embed-dim 64
 | Training Phase | Instance | GPU | Cost/hr |
 |---|---|---|---|
 | Validation (Leduc) | `g5.xlarge` | 1× A10G (24GB) | ~$1.00 |
-| Curriculum Stage 1-2 | `g5.2xlarge` | 1× A10G (24GB) | ~$1.21 |
-| Full Training | `g5.12xlarge` | 4× A10G (96GB) | ~$5.67 |
+| NLHE Heads-up | `g5.2xlarge` | 1× A10G (24GB) | ~$1.21 |
+| NLHE 6-max | `g5.12xlarge` | 4× A10G (96GB) | ~$5.67 |
 
 ### Launch Steps
 
 ```bash
 # 1. Launch instance via AWS Console:
-#    - AMI: "Deep Learning AMI (Ubuntu 22.04)" — comes with CUDA pre-installed
-#    - Instance type: g5.2xlarge (start small)
+#    - AMI: "Deep Learning Base AMI with Single CUDA (Ubuntu 22.04)" — x86
+#    - Instance type: g5.xlarge (start small)
 #    - Storage: 100 GB
 #    - Security group: allow SSH (port 22)
 #    - Key pair: your .pem file
@@ -38,8 +41,7 @@ python3 scripts/train.py --game leduc --epochs 100 --embed-dim 64
 # 2. SSH in
 ssh -i your-key.pem ubuntu@<instance-ip>
 
-# 3. Upload your code
-# From your LOCAL machine:
+# 3. Upload your code (from LOCAL machine)
 scp -i your-key.pem -r code-poker-bot ubuntu@<instance-ip>:/home/ubuntu/
 ```
 
@@ -50,15 +52,21 @@ scp -i your-key.pem -r code-poker-bot ubuntu@<instance-ip>:/home/ubuntu/
 cd /home/ubuntu/code-poker-bot
 bash scripts/aws_setup.sh
 
-# Start training in tmux (so it survives SSH disconnect)
+# Start training in tmux (survives SSH disconnect)
 tmux new -s train
 source venv/bin/activate
 
-# Phase 1: Quick validation (~10 min)
+# Validation: Leduc (~10 min)
 python3 scripts/train.py --game leduc --epochs 200 --embed-dim 128
 
-# Phase 2: Full curriculum training (~2-8 hours depending on instance)
-python3 scripts/train.py --curriculum --epochs 500
+# NLHE Heads-up, 100bb (~2-4 hours)
+python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 100
+
+# NLHE 6-max, 100bb (~4-8 hours)
+python3 scripts/train.py --game nlhe --epochs 500 --num-players 6 --starting-bb 100
+
+# NLHE Short-stacked, 20bb (~1-2 hours)
+python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 20
 
 # Detach: Ctrl+B, then D
 # Reattach: tmux attach -t train

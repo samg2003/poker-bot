@@ -64,10 +64,12 @@ code-poker-bot/
 │   ├── test_personality.py
 │   ├── test_search.py
 │   ├── test_evaluation.py
-│   └── test_deployment.py
+│   ├── test_deployment.py
+│   └── test_nlhe_trainer.py
 ├── scripts/                # CLI scripts
-│   ├── train.py            # ✅ Training CLI (Leduc + curriculum)
-│   └── evaluate.py         # ✅ Evaluation CLI + latency benchmark
+│   ├── train.py            # ✅ Training CLI (Leduc + NLHE)
+│   ├── evaluate.py         # ✅ Evaluation CLI + latency benchmark
+│   └── aws_setup.sh        # ✅ AWS GPU instance setup
 ├── docs/                   # Architecture Decision Records
 │   └── adr/
 └── requirements.txt
@@ -81,22 +83,64 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Run tests
-python -m pytest tests/ -v
+# Run tests (175 tests)
+python3 -m pytest tests/ -v
+```
 
-# (Phase 2+) Train on Kuhn Poker
-python scripts/train.py --game kuhn --episodes 100000
+## Training
 
-# (Phase 3+) Train on NLHE
-python scripts/train.py --game nlhe --curriculum
+### Leduc Hold'em (local, no GPU needed)
+```bash
+# Quick validation (~5 min on CPU)
+python3 scripts/train.py --game leduc --epochs 200 --embed-dim 64 --num-heads 2 --num-layers 2
+
+# With curriculum (personality perturbations)
+python3 scripts/train.py --curriculum --epochs 500
+```
+
+### No-Limit Hold'em (GPU recommended)
+```bash
+# Heads-up, 100bb deep
+python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 100
+
+# 6-max, 100bb deep
+python3 scripts/train.py --game nlhe --epochs 500 --num-players 6 --starting-bb 100
+
+# Short-stacked
+python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 20
+```
+
+### Full CLI Options
+```
+--game {leduc,nlhe}     Game to train on (default: leduc)
+--curriculum            Use curriculum training (Leduc only)
+--epochs N              Number of epochs (default: 100)
+--hands N               Hands per epoch (default: 512)
+--embed-dim N           Model embedding dimension (default: 128)
+--num-heads N           Attention heads (default: 4)
+--num-layers N          Transformer layers (default: 3)
+--num-players N         Players at table, NLHE only (default: 2)
+--starting-bb N         Starting stack in BB, NLHE only (default: 100)
+--checkpoint-dir DIR    Where to save checkpoints (default: checkpoints/)
+--lr FLOAT              Learning rate (default: 3e-4)
+--seed N                Random seed (default: 42)
+```
+
+## Evaluation
+
+```bash
+# Run benchmarks (untrained model)
+python3 scripts/evaluate.py
+
+# With trained checkpoint + latency benchmark
+python3 scripts/evaluate.py --checkpoint best --benchmark-latency
 ```
 
 ## Development
 
 ### Running Tests
 ```bash
-source venv/bin/activate
-python -m pytest tests/ -v
+python3 -m pytest tests/ -v
 ```
 
 ### Architecture Decisions
