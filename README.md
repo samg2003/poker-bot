@@ -48,13 +48,19 @@ code-poker-bot/
 │   ├── self_play_trainer.py # ✅ PPO self-play on Leduc Hold'em
 │   ├── personality.py      # ✅ Continuous personality perturbations + tilt
 │   └── curriculum.py       # ✅ Multi-stage curriculum trainer
-├── tests/                  # Test suite (138 tests)
+├── agent/                  # Agent interface
+│   ├── poker_agent.py      # ✅ Unified System 1+2 inference
+│   └── config.py           # ✅ Central configuration
+├── evaluation/             # Benchmarks
+│   └── evaluator.py        # ✅ 6 automated benchmarks
+├── tests/                  # Test suite (154 tests)
 │   ├── test_engine.py
 │   ├── test_kuhn.py
 │   ├── test_model.py
 │   ├── test_self_play.py
 │   ├── test_personality.py
-│   └── test_search.py
+│   ├── test_search.py
+│   └── test_evaluation.py
 ├── docs/                   # Architecture Decision Records
 │   └── adr/
 └── scripts/                # Training & evaluation scripts
@@ -97,8 +103,8 @@ See [docs/adr/](docs/adr/) for recorded architecture decisions and their rationa
 | **2. Architecture** | ✅ Complete | Opponent encoder, policy network, PPO self-play on Leduc |
 | **3. Perturbations** | ✅ Complete | Personality system, NLHE encoder, curriculum training |
 | **4. Search** | ✅ Complete | Subtree CFR, range estimation, search triggering |
-| **5. Evaluation** | 🔲 Next | Benchmarks, GTO verification |
-| **6. Deployment** | 🔲 | Inference optimization |
+| **5. Evaluation** | ✅ Complete | Agent interface, 6 automated benchmarks |
+| **6. Deployment** | 🔲 Next | Inference optimization, model checkpointing |
 
 ## Key Concepts
 
