@@ -30,13 +30,14 @@ def _play_one_hand(trainer):
                 opponent_stats=state['opponent_stats'].to(trainer.device),
                 own_stats=state['own_stats'].to(trainer.device),
                 action_mask=state['action_mask'].to(trainer.device),
+                sizing_mask=state['sizing_mask'].to(trainer.device),
             )
         probs = output.action_type_probs[0].cpu()
         value = output.value[0, 0].item()
-        sizing = output.bet_sizing[0, 0].item()
+        sizing_probs = torch.softmax(output.bet_size_logits[0], dim=-1).cpu().tolist()
 
         try:
-            state = gen.send((probs, value, sizing))
+            state = gen.send((probs, value, sizing_probs))
         except StopIteration as e:
             return e.value  # (experiences, reward)
 

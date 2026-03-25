@@ -329,15 +329,18 @@ class Evaluator:
             opp_embed = self._get_all_opponent_embeddings(pid, num_players)
             opp_stats = self._get_opponent_stats(pid, num_players)
             own_stats = self.stat_tracker.get_stats(pid).unsqueeze(0)
+            
+            from model.action_space import get_sizing_mask
+            sizing_mask = get_sizing_mask(game_state).unsqueeze(0)
 
             with torch.no_grad():
                 out = self.policy(
                     hole, community, numeric, opp_embed, opp_stats, own_stats,
-                    action_mask=mask
+                    action_mask=mask, sizing_mask=sizing_mask
                 )
 
             probs = out.action_type_probs[0]
-            sizing = out.bet_sizing[0, 0].item()
+            sizing_probs = torch.softmax(out.bet_size_logits[0], dim=-1).tolist()
 
             personality = personalities[pid]
             if personality is not None:
@@ -357,6 +360,11 @@ class Evaluator:
             from torch.distributions import Categorical
             dist = Categorical(probs)
             a_idx = dist.sample().item()
+            
+            sizing_idx = 0
+            if a_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
+                s_dist = Categorical(torch.tensor(sizing_probs))
+                sizing_idx = s_dist.sample().item()
 
             if a_idx == ActionIndex.FOLD and ActionType.FOLD in legal_types:
                 act = Action(ActionType.FOLD)
@@ -365,10 +373,16 @@ class Evaluator:
             elif a_idx == ActionIndex.CALL and ActionType.CALL in legal_types:
                 act = Action(ActionType.CALL)
             elif a_idx == ActionIndex.RAISE and ActionType.RAISE in legal_types:
-                min_r = game_state.get_min_raise_to()
-                max_r = game_state.get_max_raise_to()
-                rt = min_r + sizing * (max_r - min_r)
-                act = Action(ActionType.RAISE, amount=max(min_r, min(rt, max_r)))
+                from model.action_space import POT_FRACTIONS
+                frac = POT_FRACTIONS[sizing_idx]
+                if frac < 0:
+                    rt = game_state.get_max_raise_to()
+                    act = Action(ActionType.ALL_IN, amount=rt)
+                else:
+                    min_r = game_state.get_min_raise_to()
+                    max_r = game_state.get_max_raise_to()
+                    rt = game_state.current_bet + frac * game_state.pot
+                    act = Action(ActionType.RAISE, amount=max(min_r, min(rt, max_r)))
             else:
                 if ActionType.CHECK in legal_types:
                     act = Action(ActionType.CHECK)

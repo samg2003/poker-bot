@@ -193,14 +193,18 @@ class GameManager:
         opp_embed = self._get_all_opponent_embeddings(pid, num_players)
         opp_stats = self._get_opponent_stats(pid, num_players)
         own_stats = self.stat_tracker.get_stats(pid).unsqueeze(0)
+        
+        from model.action_space import get_sizing_mask
+        sizing_mask = get_sizing_mask(self.game_state).unsqueeze(0)
 
         with torch.no_grad():
             out = self.policy(
-                hole, community, numeric, opp_embed, opp_stats, own_stats, action_mask=mask
+                hole, community, numeric, opp_embed, opp_stats, own_stats, action_mask=mask, sizing_mask=sizing_mask
             )
 
         probs = out.action_type_probs[0].tolist()
-        sizing = out.bet_sizing[0, 0].item()
+        sizing_logits = out.bet_size_logits[0]
+        sizing_probs = torch.softmax(sizing_logits, dim=-1).tolist()
         ev = out.value[0, 0].item()
 
         # Apply personality if it is a bot (for accurate visualization of what the bot will actually do)
@@ -212,7 +216,7 @@ class GameManager:
 
         return {
             'probs': probs,
-            'sizing': sizing,
+            'sizing': sizing_probs,
             'ev': ev,
             'legal_actions': [at.name for at in legal_types]
         }
@@ -264,13 +268,18 @@ class GameManager:
         # Get the God Mode evaluation we already calculated for this seat in the snapshot
         god_mode = self.timeline[-1].god_mode[pid]
         probs = god_mode['probs']
-        sizing = god_mode['sizing']
+        sizing_probs = god_mode['sizing']
         legal_types = self.game_state.get_legal_actions()
         
         # Sample action
         from torch.distributions import Categorical
         dist = Categorical(torch.tensor(probs))
         a_idx = dist.sample().item()
+        
+        sizing_idx = 0
+        if a_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
+            s_dist = Categorical(torch.tensor(sizing_probs))
+            sizing_idx = s_dist.sample().item()
 
         # Map to Engine Action
         if a_idx == ActionIndex.FOLD and ActionType.FOLD in legal_types:
@@ -280,10 +289,15 @@ class GameManager:
         elif a_idx == ActionIndex.CALL and ActionType.CALL in legal_types:
             act = Action(ActionType.CALL)
         elif a_idx == ActionIndex.RAISE and ActionType.RAISE in legal_types:
-            min_r = self.game_state.get_min_raise_to()
-            max_r = self.game_state.get_max_raise_to()
-            rt = min_r + sizing * (max_r - min_r)
-            act = Action(ActionType.RAISE, amount=max(min_r, min(rt, max_r)))
+            from model.action_space import POT_FRACTIONS
+            frac = POT_FRACTIONS[sizing_idx]
+            if frac < 0:
+                act = Action(ActionType.ALL_IN, amount=self.game_state.get_max_raise_to())
+            else:
+                min_r = self.game_state.get_min_raise_to()
+                max_r = self.game_state.get_max_raise_to()
+                rt = self.game_state.current_bet + frac * self.game_state.pot
+                act = Action(ActionType.RAISE, amount=max(min_r, min(rt, max_r)))
         else:
             if ActionType.CHECK in legal_types: act = Action(ActionType.CHECK)
             elif ActionType.CALL in legal_types: act = Action(ActionType.CALL)

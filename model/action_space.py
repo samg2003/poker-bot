@@ -28,11 +28,13 @@ class ActionIndex(IntEnum):
 NUM_ACTION_TYPES = 4
 
 
+POT_FRACTIONS = [0.1, 0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0, -1.0]
+
 class ActionOutput(NamedTuple):
     """Model output for a single decision."""
     action_type_logits: torch.Tensor   # (batch, 4)
     action_type_probs: torch.Tensor    # (batch, 4) — softmaxed
-    bet_sizing: torch.Tensor           # (batch, 1) — sigmoid, [0, 1]
+    bet_size_logits: torch.Tensor      # (batch, 10) — discrete unnormalized logits
     value: torch.Tensor                # (batch, 1) — expected value
 
 
@@ -63,6 +65,37 @@ def encode_action(
     ]
     return torch.tensor(features, dtype=torch.float32)
 
+
+def get_sizing_mask(game_state) -> torch.Tensor:
+    """
+    Evaluate which sizing buckets are legal given the current GameState.
+    Returns: (10,) boolean mask where True = legal.
+    """
+    from engine.game_state import ActionType
+    mask = torch.zeros(10, dtype=torch.bool)
+    
+    legal_actions = game_state.get_legal_actions()
+    if ActionType.RAISE not in legal_actions and ActionType.ALL_IN not in legal_actions:
+        return mask
+
+    pot = game_state.pot
+    current_bet = game_state.current_bet
+    min_raise = game_state.get_min_raise_to()
+    max_raise = game_state.get_max_raise_to()
+
+    for i, frac in enumerate(POT_FRACTIONS):
+        if frac < 0:
+            mask[i] = True  # All-in is always legal if raising is legal
+            continue
+            
+        target_size = current_bet + frac * pot
+        if target_size >= min_raise - 1e-5 and target_size <= max_raise + 1e-5:
+            mask[i] = True
+
+    if not mask.any():
+        mask[-1] = True  # Fallback to all-in
+
+    return mask
 
 # Dimension of one encoded action token
 ACTION_FEATURE_DIM = NUM_ACTION_TYPES + 3  # 4 + 3 = 7

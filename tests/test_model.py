@@ -199,18 +199,13 @@ class TestPolicyNetwork:
         batch = 4
         assert output.action_type_logits.shape == (batch, NUM_ACTION_TYPES)
         assert output.action_type_probs.shape == (batch, NUM_ACTION_TYPES)
-        assert output.bet_sizing.shape == (batch, 1)
+        assert output.bet_size_logits.shape == (batch, 10)
         assert output.value.shape == (batch, 1)
 
     def test_action_probs_sum_to_one(self, policy, batch_inputs):
         output = policy(**batch_inputs)
         sums = output.action_type_probs.sum(dim=-1)
         assert torch.allclose(sums, torch.ones(4), atol=1e-5)
-
-    def test_bet_sizing_in_range(self, policy, batch_inputs):
-        output = policy(**batch_inputs)
-        assert (output.bet_sizing >= 0).all()
-        assert (output.bet_sizing <= 1).all()
 
     def test_action_mask(self, policy, batch_inputs):
         # Only FOLD and CALL are legal
@@ -255,14 +250,14 @@ class TestPolicyNetwork:
     def test_gradient_flow_full_model(self, policy, batch_inputs):
         """Verify gradients flow through the entire network."""
         output = policy(**batch_inputs)
-        loss = output.value.mean() + output.action_type_logits.sum() + output.bet_sizing.sum()
+        loss = output.value.mean() + output.action_type_logits.sum() + output.bet_size_logits.sum()
         loss.backward()
 
         # Check key layers have gradients
         assert policy.state_encoder.card_embed.rank_embed.weight.grad is not None
         assert policy.opponent_proj.weight.grad is not None
         assert policy.action_head[-1].weight.grad is not None
-        assert policy.sizing_head[-2].weight.grad is not None
+        assert policy.sizing_head[-1].weight.grad is not None
         assert policy.value_head[-1].weight.grad is not None
 
     def test_param_count(self, policy):

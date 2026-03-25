@@ -132,7 +132,7 @@ class PolicyNetwork(nn.Module):
         1. Game state encoder → state embedding
         2. Cross-attention: state embedding queries opponent embeddings + stats
         3. Action head → action type distribution (4-way)
-        4. Sizing head → continuous bet size [0, 1]
+        4. Sizing head → bet size classification (10 discrete buckets)
         5. Value head → expected value
 
     Handles variable numbers of opponents (2-9 players) via attention masking.
@@ -206,12 +206,11 @@ class PolicyNetwork(nn.Module):
             nn.Linear(embed_dim, NUM_ACTION_TYPES),
         )
 
-        # Bet sizing head (continuous output [0, 1])
+        # Bet sizing head (10 discrete bucket logits)
         self.sizing_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, 1),
-            nn.Sigmoid(),
+            nn.Linear(embed_dim, 10),
         )
 
         # Value head (scalar expected value)
@@ -241,6 +240,7 @@ class PolicyNetwork(nn.Module):
         own_stats: torch.Tensor,              # (batch, NUM_STAT_FEATURES)
         opponent_mask: Optional[torch.Tensor] = None,  # (batch, num_opponents) True=masked
         action_mask: Optional[torch.Tensor] = None,    # (batch, 4) True=legal
+        sizing_mask: Optional[torch.Tensor] = None,    # (batch, 10) True=legal
     ) -> ActionOutput:
         """
         Full forward pass.
@@ -313,7 +313,11 @@ class PolicyNetwork(nn.Module):
         action_probs = F.softmax(action_logits, dim=-1)
 
         # 6. Bet sizing head
-        bet_sizing = self.sizing_head(features)  # (batch, 1)
+        bet_size_logits = self.sizing_head(features)  # (batch, 10)
+
+        # Apply sizing mask (set illegal buckets to -inf)
+        if sizing_mask is not None:
+            bet_size_logits = bet_size_logits.masked_fill(~sizing_mask, float('-inf'))
 
         # 7. Value head
         value = self.value_head(features)  # (batch, 1)
@@ -321,7 +325,7 @@ class PolicyNetwork(nn.Module):
         return ActionOutput(
             action_type_logits=action_logits,
             action_type_probs=action_probs,
-            bet_sizing=bet_sizing,
+            bet_size_logits=bet_size_logits,
             value=value,
         )
 

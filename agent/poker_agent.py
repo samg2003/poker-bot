@@ -203,7 +203,7 @@ class PokerAgent:
 
         action_probs = output.action_type_probs[0]
         value = output.value[0, 0].item()
-        bet_sizing = output.bet_sizing[0, 0].item()
+        sizing_probs = torch.softmax(output.bet_size_logits[0], dim=-1).tolist()
         used_search = False
 
         # System 2: search for complex spots
@@ -216,9 +216,17 @@ class PokerAgent:
         dist = Categorical(action_probs)
         action_idx = dist.sample().item()
 
+        sizing_idx = 0
+        if action_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
+            s_dist = Categorical(torch.tensor(sizing_probs))
+            sizing_idx = s_dist.sample().item()
+            
+        from model.action_space import POT_FRACTIONS
+        fraction = float(POT_FRACTIONS[sizing_idx])
+
         return ActionResult(
             action_type=action_idx,
-            bet_sizing=bet_sizing,
+            bet_sizing=fraction,
             action_probs=action_probs,
             value_estimate=value,
             used_search=used_search,

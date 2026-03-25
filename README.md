@@ -22,7 +22,7 @@ Game State ──→ Policy Network (cross-attention) ──→ System 1 (fast, 
 - **GTO emerges naturally** — after history resets, model has no reads → plays equilibrium
 - **Self-play → personality perturbations** — no scripted bots, realistic opponents
 - **System 1 + System 2** — fast policy for routine spots, search for hard spots
-- **Hybrid action space** — discrete action type + continuous bet sizing
+- **Hybrid action space** — discrete action type + hierarchical discrete bet sizing
 
 ## Project Structure
 
@@ -35,7 +35,7 @@ code-poker-bot/
 │   ├── kuhn_poker.py       # ✅ Kuhn Poker (3-card, Nash validated)
 │   └── leduc_poker.py      # ✅ Leduc Hold'em (6-card, ~1000 info sets)
 ├── model/                  # Neural network components
-│   ├── action_space.py     # ✅ Hybrid action type + continuous sizing
+│   ├── action_space.py     # ✅ Hybrid action type + hierarchical discrete sizing
 │   ├── stat_tracker.py     # ✅ ~30 HUD features per opponent
 │   ├── opponent_encoder.py # ✅ Causal Transformer (history → embedding)
 │   ├── policy_network.py   # ✅ Cross-attention policy + value + sizing heads
@@ -198,6 +198,6 @@ The agent uses a **dual-signal** system:
 4. **Expert iteration** — optional search-guided training refines the policy
 5. **History reset** — periodic reset (300-500 hands) ensures model handles unknown opponents
 
-### Action Space
-- **Action type**: `[fold, check, call, raise]` — 4-way classification
-- **Bet sizing**: continuous value `[min_raise, all_in]` as pot fraction (when raising)
+### Action Space (Hierarchical Discrete)
+- **Action type**: `[fold, check, call, raise]` — 4-way discrete classification head.
+- **Bet sizing**: 10-dimensional discrete categorical head representing fractional pot buckets (10%, 25%, 33%, 50%, 66%, 75%, 100%, 150%, 200%, All-In). Sizing is evaluated with a dynamic constraint mask to enforce strict game-rules limits.

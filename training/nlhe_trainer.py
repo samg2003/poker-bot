@@ -51,8 +51,11 @@ class Experience(NamedTuple):
     opponent_embeddings: torch.Tensor # (1, num_opp, embed_dim)
     opponent_stats: torch.Tensor      # (1, num_opp, stat_dim)
     own_stats: torch.Tensor           # (1, stat_dim)
+    own_stats: torch.Tensor           # (1, stat_dim)
     action_mask: torch.Tensor         # (1, 4)
+    sizing_mask: torch.Tensor         # (1, 10)
     action_idx: int                   # chosen action
+    sizing_idx: int                   # chosen sizing bucket (0 if not raise)
     log_prob: float                   # log prob of chosen action
     value: float                      # value estimate
     reward: float                     # final reward (set after hand ends)
@@ -367,15 +370,19 @@ class NLHESelfPlayTrainer:
         ]], dtype=torch.float32))
 
         action_mask = self._encode_action_mask(game_state)
+        
+        from model.action_space import get_sizing_mask
+        sizing_mask = self._to(get_sizing_mask(game_state).unsqueeze(0))
 
         return {
             'hole_cards': hole,
             'community_cards': community,
             'numeric_features': numeric,
             'action_mask': action_mask,
+            'sizing_mask': sizing_mask,
         }
 
-    def _decode_action(self, action_idx: int, bet_sizing: float,
+    def _decode_action(self, action_idx: int, sizing_idx: int,
                        game_state: GameState) -> Action:
         """Convert model output to engine Action."""
         legal = game_state.get_legal_actions()
@@ -387,9 +394,13 @@ class NLHESelfPlayTrainer:
         elif action_idx == ActionIndex.CALL and ActionType.CALL in legal:
             return Action(ActionType.CALL)
         elif action_idx == ActionIndex.RAISE and ActionType.RAISE in legal:
+            from model.action_space import POT_FRACTIONS
+            frac = POT_FRACTIONS[sizing_idx]
+            if frac < 0:
+                return Action(ActionType.ALL_IN, amount=game_state.get_max_raise_to())
             min_r = game_state.get_min_raise_to()
             max_r = game_state.get_max_raise_to()
-            raise_to = min_r + bet_sizing * (max_r - min_r)
+            raise_to = game_state.current_bet + frac * game_state.pot
             return Action(ActionType.RAISE, amount=max(min_r, min(raise_to, max_r)))
 
         # Fallback
@@ -472,7 +483,7 @@ class NLHESelfPlayTrainer:
                 )
 
             # YIELD — pause game, wait for batched GPU result
-            probs, value, sizing = yield {
+            probs, value, sizing_probs = yield {
                 'hole_cards': encoded['hole_cards'],
                 'community_cards': encoded['community_cards'],
                 'numeric_features': encoded['numeric_features'],
@@ -480,6 +491,7 @@ class NLHESelfPlayTrainer:
                 'opponent_stats': opp_stats,
                 'own_stats': own_stats,
                 'action_mask': encoded['action_mask'],
+                'sizing_mask': encoded['sizing_mask'],
                 # context for post-processing (not sent to GPU)
                 '_personality': personality,
                 '_situations': situations,
@@ -525,6 +537,12 @@ class NLHESelfPlayTrainer:
             action_idx = dist.sample().item()
             log_prob = dist.log_prob(torch.tensor(action_idx)).item()
 
+            sizing_idx = 0
+            if action_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
+                s_dist = Categorical(torch.tensor(sizing_probs))
+                sizing_idx = s_dist.sample().item()
+                log_prob += s_dist.log_prob(torch.tensor(sizing_idx)).item()
+
             # Store experience (detach to prevent double backward in PPO)
             experiences[pid].append({
                 'hole_cards': encoded['hole_cards'].detach(),
@@ -534,13 +552,15 @@ class NLHESelfPlayTrainer:
                 'opponent_stats': opp_stats.detach(),
                 'own_stats': own_stats.detach(),
                 'action_mask': encoded['action_mask'].detach(),
+                'sizing_mask': encoded['sizing_mask'].detach(),
                 'action_idx': action_idx,
+                'sizing_idx': sizing_idx,
                 'log_prob': log_prob,
                 'value': value,
             })
 
             # Decode and apply action
-            action = self._decode_action(action_idx, sizing, game_state)
+            action = self._decode_action(action_idx, sizing_idx, game_state)
             dealer.apply_action(action)
 
             # Record action in opponent history
@@ -592,7 +612,9 @@ class NLHESelfPlayTrainer:
                     opponent_stats=exp_dict['opponent_stats'],
                     own_stats=exp_dict['own_stats'],
                     action_mask=exp_dict['action_mask'],
+                    sizing_mask=exp_dict['sizing_mask'],
                     action_idx=exp_dict['action_idx'],
+                    sizing_idx=exp_dict['sizing_idx'],
                     log_prob=exp_dict['log_prob'],
                     value=exp_dict['value'],
                     reward=reward,
@@ -658,6 +680,7 @@ class NLHESelfPlayTrainer:
                 batch_comm = torch.cat([s['community_cards'] for s in states], dim=0)
                 batch_num = torch.cat([s['numeric_features'] for s in states], dim=0)
                 batch_mask = torch.cat([s['action_mask'] for s in states], dim=0)
+                batch_s_mask = torch.cat([s['sizing_mask'] for s in states], dim=0)
                 batch_own = torch.cat([s['own_stats'] for s in states], dim=0)
 
                 padded_opp_embeds = []
@@ -687,6 +710,7 @@ class NLHESelfPlayTrainer:
                 batch_comm = batch_comm.to(self.device)
                 batch_num = batch_num.to(self.device)
                 batch_mask = batch_mask.to(self.device)
+                batch_s_mask = batch_s_mask.to(self.device)
                 batch_own = batch_own.to(self.device)
                 batch_opp_embed = batch_opp_embed.to(self.device)
                 batch_opp_stats = batch_opp_stats.to(self.device)
@@ -702,6 +726,7 @@ class NLHESelfPlayTrainer:
                         opponent_stats=batch_opp_stats,
                         own_stats=batch_own,
                         action_mask=batch_mask,
+                        sizing_mask=batch_s_mask,
                         opponent_mask=batch_opp_mask,
                     )
 
@@ -711,7 +736,9 @@ class NLHESelfPlayTrainer:
 
                     probs = output.action_type_probs[batch_idx].cpu()
                     value = output.value[batch_idx, 0].item()
-                    sizing = output.bet_sizing[batch_idx, 0].item()
+                    
+                    sizing_logits = output.bet_size_logits[batch_idx]
+                    sizing_probs = torch.softmax(sizing_logits, dim=-1).cpu().tolist()
 
                     personality = state_dict['_personality']
                     situations = state_dict['_situations']
@@ -719,7 +746,7 @@ class NLHESelfPlayTrainer:
                         probs = personality.apply(probs, situations, hand_strength=0.5)
 
                     try:
-                        new_state = g.send((probs, value, sizing))
+                        new_state = g.send((probs, value, sizing_probs))
                         pending[game_idx] = (g, new_state)
                     except StopIteration as e:
                         exps, reward = e.value
@@ -758,6 +785,7 @@ class NLHESelfPlayTrainer:
         numeric = torch.cat([e.numeric_features.to(self.device) for e in experiences], dim=0)
         own_stats = torch.cat([e.own_stats.to(self.device) for e in experiences], dim=0)
         action_masks = torch.cat([e.action_mask.to(self.device) for e in experiences], dim=0)
+        sizing_masks = torch.cat([e.sizing_mask.to(self.device) for e in experiences], dim=0)
         
         # 2. Pad opponent sequence arrays (shape is [1, num_opp, dim])
         max_opps = max([e.opponent_embeddings.shape[1] for e in experiences])
@@ -794,6 +822,7 @@ class NLHESelfPlayTrainer:
         
         # 3. Stack targets
         action_t = torch.tensor([e.action_idx for e in experiences], device=self.device, dtype=torch.long)
+        sizing_t = torch.tensor([e.sizing_idx for e in experiences], device=self.device, dtype=torch.long)
         old_log_probs = torch.tensor([e.log_prob for e in experiences], device=self.device, dtype=torch.float32)
         rewards = torch.tensor([e.reward for e in experiences], device=self.device, dtype=torch.float32)
         old_values = torch.tensor([e.value for e in experiences], device=self.device, dtype=torch.float32)
@@ -807,13 +836,28 @@ class NLHESelfPlayTrainer:
             opponent_stats=opp_stats,
             own_stats=own_stats,
             action_mask=action_masks,
+            sizing_mask=sizing_masks,
             opponent_mask=opp_masks,
         )
         
         # 5. Compute PPO stats and loss
         dist = Categorical(output.action_type_probs)
-        new_log_probs = dist.log_prob(action_t)
-        entropy = dist.entropy().mean()
+        action_log_probs = dist.log_prob(action_t)
+        action_entropy = dist.entropy().mean()
+
+        # Compute sizing log probs only for RAISE actions
+        is_raise = (action_t == ActionIndex.RAISE)
+        
+        sizing_dist = Categorical(logits=output.bet_size_logits)
+        sizing_log_probs = sizing_dist.log_prob(sizing_t)
+        sizing_entropy = sizing_dist.entropy()
+
+        # Total log prob combines both if action was RAISE
+        new_log_probs = action_log_probs.clone()
+        if is_raise.any():
+            new_log_probs[is_raise] += sizing_log_probs[is_raise]
+            
+        entropy = action_entropy + (sizing_entropy * is_raise.float()).mean()
         
         ratio = torch.exp(new_log_probs - old_log_probs)
         advantages = rewards - old_values

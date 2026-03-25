@@ -1,5 +1,7 @@
 import React from 'react'
 
+const SIZING_LABELS = ['10%', '25%', '33%', '50%', '66%', '75%', '100%', '150%', '200%', 'ALL'];
+
 export default function GodModePanel({ gameState, selectedSeat }) {
   if (!gameState || !gameState.god_mode || !gameState.players[selectedSeat]) {
     return (
@@ -15,8 +17,9 @@ export default function GodModePanel({ gameState, selectedSeat }) {
   const p = gameState.players[selectedSeat]
   const evData = gameState.god_mode[selectedSeat]
   
-  let pf = 0, pc = 0, pr = 0, sizingHtml = '--'
+  let pf = 0, pc = 0, pr = 0
   let evText = '-- bb'
+  let sizingProbs = Array(10).fill(0)
 
   if (evData && !p.is_folded) {
     evText = `${evData.ev > 0 ? '+' : ''}${evData.ev.toFixed(2)} bb`
@@ -24,10 +27,10 @@ export default function GodModePanel({ gameState, selectedSeat }) {
     pc = (evData.probs[1] * 100 + evData.probs[2] * 100).toFixed(1)
     pr = (evData.probs[3] * 100).toFixed(1)
     
-    const minr = gameState.min_raise
-    const maxr = gameState.max_raise
-    const target = minr + evData.sizing * (maxr - minr)
-    sizingHtml = `${target.toFixed(2)} bb`
+    // sizing is now an array of size 10
+    if (evData.sizing && evData.sizing.length === 10) {
+      sizingProbs = evData.sizing
+    }
   }
 
   return (
@@ -68,8 +71,18 @@ export default function GodModePanel({ gameState, selectedSeat }) {
       </div>
 
       <div className="sizing-display">
-        <span className="ev-label">If Raising, Target Size:</span>
-        <span className="ev-amount">{sizingHtml}</span>
+        <span className="ev-label">Sizing Distribution (If Raising):</span>
+        <div className="sizing-histogram">
+          {SIZING_LABELS.map((label, idx) => {
+            const prob = sizingProbs[idx] * 100;
+            return (
+              <div key={idx} className="hist-bar-container" title={`${label}: ${prob.toFixed(1)}%`}>
+                <div className="hist-bar" style={{ height: `${prob}%` }}></div>
+                <span className="hist-label">{label}</span>
+              </div>
+            )
+          })}
+        </div>
       </div>
       
       <small className="disclaimer">These probabilities flow from the raw Policy Network evaluation, modified by the agent's baseline personality matrix.</small>

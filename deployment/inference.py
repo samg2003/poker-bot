@@ -192,7 +192,7 @@ class InferenceEngine:
             results.append(ActionOutput(
                 action_type_logits=output.action_type_logits[i:i+1],
                 action_type_probs=output.action_type_probs[i:i+1],
-                bet_sizing=output.bet_sizing[i:i+1],
+                bet_size_logits=output.bet_size_logits[i:i+1],
                 value=output.value[i:i+1],
             ))
 
