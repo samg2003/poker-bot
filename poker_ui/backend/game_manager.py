@@ -99,22 +99,27 @@ class GameManager:
 
     def _random_personality(self) -> tuple:
         roll = self.rng.random()
-        if roll < 0.80:
+        if roll < 0.30:
             base = PersonalityModifier.gto()
-            base.name = "GTO"
             return SituationalPersonality(base=base), "GTO"
-        elif roll < 0.867:
+        elif roll < 0.45:
+            base = PersonalityModifier.tag()
+            return SituationalPersonality(base=base), "TAG"
+        elif roll < 0.58:
             base = PersonalityModifier.nit()
-            base.name = "Nit"
             return SituationalPersonality(base=base), "Nit"
-        elif roll < 0.933:
-            base = PersonalityModifier.maniac()
-            base.name = "Maniac"
-            return SituationalPersonality(base=base), "Maniac"
-        else:
-            base = PersonalityModifier.gto()
-            base.name = "LAG"
+        elif roll < 0.70:
+            base = PersonalityModifier.lag()
             return SituationalPersonality(base=base), "LAG"
+        elif roll < 0.80:
+            base = PersonalityModifier.maniac()
+            return SituationalPersonality(base=base), "Maniac"
+        elif roll < 0.90:
+            base = PersonalityModifier.calling_station()
+            return SituationalPersonality(base=base), "Station"
+        else:
+            base = PersonalityModifier.fish()
+            return SituationalPersonality(base=base), "Fish"
 
     def _random_buyin(self) -> float:
         """Most players buy in at 100bb, some short-stack, rare deep-stack."""
@@ -387,9 +392,40 @@ class GameManager:
 
         # Apply personality for bots
         if seat_info.personality is not None:
-            situations = detect_situations(street=street_map.get(self.game_state.street, 0))
-            probs_tensor = seat_info.personality.apply(torch.tensor(probs), situations, hand_strength=0.5)
+            situations = detect_situations(
+                street=street_map.get(self.game_state.street, 0),
+                is_facing_raise=(self.game_state.current_bet > 0
+                                 and p.bet_this_street < self.game_state.current_bet),
+            )
+            # Approximate hand strength
+            c1, c2 = p.hole_cards
+            r1, r2 = c1 // 4, c2 // 4
+            if self.game_state.street == Street.PREFLOP:
+                if r1 == r2:
+                    hs = 0.55 + r1 * 0.035
+                elif max(r1, r2) >= 10:
+                    hs = 0.45 + max(r1, r2) * 0.02
+                elif (c1 % 4) == (c2 % 4):
+                    hs = 0.3
+                else:
+                    hs = 0.15 + max(r1, r2) * 0.01
+            else:
+                paired_board = any(r1 == (bc // 4) or r2 == (bc // 4)
+                                   for bc in self.game_state.board if bc >= 0)
+                if paired_board:
+                    hs = 0.65 + max(r1, r2) * 0.02
+                elif max(r1, r2) >= 10:
+                    hs = 0.4
+                else:
+                    hs = 0.2
+            probs_tensor = seat_info.personality.apply(
+                torch.tensor(probs), situations,
+                hand_strength=hs,
+                is_facing_raise=(self.game_state.current_bet > 0
+                                 and p.bet_this_street < self.game_state.current_bet),
+            )
             probs = probs_tensor.tolist()
+            sizing_probs = seat_info.personality.apply_sizing(sizing_probs, situations)
 
         return {
             'probs': probs,

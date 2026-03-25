@@ -32,28 +32,43 @@ class TestPersonalityModifier:
         assert nit.fold_pressure > 1.0
         assert nit.bluff_mult < 1.0
 
+    def test_tag_is_tight_aggressive(self):
+        tag = PersonalityModifier.tag()
+        assert tag.range_mult < 1.0       # tight range
+        assert tag.aggression_mult > 1.0  # aggressive
+        assert tag.sizing_mult > 1.0      # bets big
+
     def test_lag_is_loose_aggressive(self):
         lag = PersonalityModifier.lag()
         assert lag.range_mult > 1.0
         assert lag.aggression_mult > 1.0
 
-    def test_maniac_is_extreme(self):
+    def test_maniac_is_aggressive_but_realistic(self):
         maniac = PersonalityModifier.maniac()
-        assert maniac.range_mult >= 2.0
-        assert maniac.aggression_mult >= 2.0
+        assert maniac.range_mult > 1.0
+        assert maniac.aggression_mult > 1.0
+        # Key: values are now realistic, not alien-like extremes
+        assert maniac.aggression_mult <= 1.8
+        assert maniac.range_mult <= 1.8
 
     def test_calling_station_is_passive(self):
         cs = PersonalityModifier.calling_station()
         assert cs.aggression_mult < 0.5
         assert cs.fold_pressure < 0.5
 
+    def test_fish_is_loose_passive(self):
+        fish = PersonalityModifier.fish()
+        assert fish.range_mult > 1.0
+        assert fish.aggression_mult < 1.0
+        assert fish.cbet_mult < 0.5
+
     def test_random_in_range(self):
         rng = random.Random(42)
         for _ in range(20):
             mod = PersonalityModifier.random(rng)
-            assert 0.1 <= mod.range_mult <= 3.0
-            assert 0.1 <= mod.aggression_mult <= 3.0
-            assert 0.1 <= mod.fold_pressure <= 3.0
+            assert 0.4 <= mod.range_mult <= 1.7
+            assert 0.3 <= mod.aggression_mult <= 1.7
+            assert 0.3 <= mod.fold_pressure <= 1.6
 
     def test_blend(self):
         gto = PersonalityModifier.gto()
@@ -103,6 +118,18 @@ class TestSituationalPersonality:
         # Nit should fold more with weak hand
         assert nit_result[0] > gto_result[0]
 
+    def test_nit_folds_less_with_strong_hands(self):
+        """Nit with a strong hand should not fold much more than GTO."""
+        gto = SituationalPersonality(base=PersonalityModifier.gto())
+        nit = SituationalPersonality(base=PersonalityModifier.nit())
+        probs = torch.tensor([0.25, 0.25, 0.25, 0.25])
+
+        gto_result = gto.apply(probs, [], hand_strength=0.9)
+        nit_result = nit.apply(probs, [], hand_strength=0.9)
+
+        # With strong hand, nit fold prob should be close to GTO's
+        assert abs(nit_result[0].item() - gto_result[0].item()) < 0.1
+
     def test_lag_raises_more(self):
         gto = SituationalPersonality(base=PersonalityModifier.gto())
         lag = SituationalPersonality(base=PersonalityModifier.lag())
@@ -113,6 +140,56 @@ class TestSituationalPersonality:
 
         # LAG should raise more
         assert lag_result[3] > gto_result[3]
+
+    def test_apply_with_facing_raise(self):
+        """Nit facing a raise should fold significantly more."""
+        nit = SituationalPersonality(base=PersonalityModifier.nit())
+        probs = torch.tensor([0.25, 0.25, 0.25, 0.25])
+
+        no_raise = nit.apply(probs, [], hand_strength=0.3, is_facing_raise=False)
+        facing_raise = nit.apply(probs, [], hand_strength=0.3, is_facing_raise=True)
+
+        # Nit facing a raise folds more
+        assert facing_raise[0] > no_raise[0]
+
+    def test_apply_no_negative_probs(self):
+        """Even with extreme personalities, probs should never be negative."""
+        maniac = SituationalPersonality(base=PersonalityModifier.maniac())
+        probs = torch.tensor([0.1, 0.1, 0.7, 0.1])  # heavy call weight
+
+        result = maniac.apply(probs, [], hand_strength=0.5)
+        assert (result >= 0).all()
+        assert abs(result.sum().item() - 1.0) < 1e-5
+
+    def test_sizing_perturbation_shifts_distribution(self):
+        """apply_sizing with sizing_mult > 1 should shift weight to larger bets."""
+        maniac = SituationalPersonality(base=PersonalityModifier.maniac())
+        # Uniform sizing probs (10 buckets: 0.1x to all-in)
+        sizing = [0.1] * 10
+
+        adjusted = maniac.apply_sizing(sizing, [])
+        # Last bucket (all-in) should be weighted higher
+        assert adjusted[-1] > adjusted[0]
+        # Sum should still be ~1.0
+        assert abs(sum(adjusted) - 1.0) < 1e-5
+
+    def test_sizing_nit_prefers_small(self):
+        """Nit (sizing_mult < 1) should prefer smaller bet sizes."""
+        nit = SituationalPersonality(base=PersonalityModifier.nit())
+        sizing = [0.1] * 10
+
+        adjusted = nit.apply_sizing(sizing, [])
+        # First bucket (small bet) should be weighted higher
+        assert adjusted[0] > adjusted[-1]
+
+    def test_sizing_gto_unchanged(self):
+        """GTO (sizing_mult = 1.0) should not change sizing distribution."""
+        gto = SituationalPersonality(base=PersonalityModifier.gto())
+        sizing = [0.1] * 10
+
+        adjusted = gto.apply_sizing(sizing, [])
+        for orig, adj in zip(sizing, adjusted):
+            assert abs(orig - adj) < 1e-5
 
 
 # =============================================================================

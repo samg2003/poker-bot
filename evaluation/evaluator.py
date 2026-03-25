@@ -241,7 +241,9 @@ class Evaluator:
             if player == 1:
                 hand_strength = card[0] / 2.0
                 situations = detect_situations(street=state.round_idx)
-                probs = personality.apply(probs, situations, hand_strength=hand_strength)
+                facing_raise = any(a == RAISE for rh in state.round_histories for a in rh)
+                probs = personality.apply(probs, situations, hand_strength=hand_strength,
+                                         is_facing_raise=facing_raise)
 
             from torch.distributions import Categorical
             dist = Categorical(probs)
@@ -354,8 +356,16 @@ class Evaluator:
                     elif max(r1, r2) >= 10: hand_strength = 0.6
                     else: hand_strength = 0.2
 
-                situations = detect_situations(street=street_map.get(game_state.street, 0))
-                probs = personality.apply(probs, situations, hand_strength=hand_strength)
+                is_facing_raise = (game_state.current_bet > 0
+                                   and p.bet_this_street < game_state.current_bet)
+                situations = detect_situations(
+                    street=street_map.get(game_state.street, 0),
+                    is_facing_raise=is_facing_raise,
+                )
+                probs = personality.apply(probs, situations,
+                                         hand_strength=hand_strength,
+                                         is_facing_raise=is_facing_raise)
+                sizing_probs = personality.apply_sizing(sizing_probs, situations)
 
             from torch.distributions import Categorical
             dist = Categorical(probs)

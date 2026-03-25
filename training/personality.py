@@ -92,6 +92,9 @@ class PersonalityModifier:
         )
 
     # Pre-built archetypes (starting points for continuous sampling)
+    # Values calibrated against typical online poker stats (VPIP/PFR/AF).
+    # All multipliers stay in [0.3, 1.6] — the human-observable range.
+
     @classmethod
     def gto(cls) -> 'PersonalityModifier':
         """Unmodified base policy."""
@@ -99,39 +102,54 @@ class PersonalityModifier:
 
     @classmethod
     def nit(cls) -> 'PersonalityModifier':
-        """Tight-passive: plays few hands, folds to pressure."""
-        return cls(range_mult=0.5, aggression_mult=0.8, fold_pressure=1.5,
-                   bluff_mult=0.3, sizing_mult=0.8, cbet_mult=0.6)
+        """Tight-passive: plays few hands, folds to pressure. ~12/9 VPIP/PFR."""
+        return cls(range_mult=0.6, aggression_mult=0.85, fold_pressure=1.35,
+                   bluff_mult=0.35, sizing_mult=0.85, cbet_mult=0.6)
+
+    @classmethod
+    def tag(cls) -> 'PersonalityModifier':
+        """Tight-aggressive: selective range, bets big when in. ~20/17 VPIP/PFR."""
+        return cls(range_mult=0.75, aggression_mult=1.3, fold_pressure=0.8,
+                   bluff_mult=0.8, sizing_mult=1.15, cbet_mult=1.2)
 
     @classmethod
     def lag(cls) -> 'PersonalityModifier':
-        """Loose-aggressive: wide range, lots of raises."""
-        return cls(range_mult=1.6, aggression_mult=1.8, fold_pressure=0.6,
-                   bluff_mult=1.5, sizing_mult=1.3, cbet_mult=1.4)
+        """Loose-aggressive: wide range, lots of raises. ~28/22 VPIP/PFR."""
+        return cls(range_mult=1.25, aggression_mult=1.35, fold_pressure=0.7,
+                   bluff_mult=1.25, sizing_mult=1.15, cbet_mult=1.3)
 
     @classmethod
     def maniac(cls) -> 'PersonalityModifier':
-        """Hyper-aggressive: plays everything, bets huge."""
-        return cls(range_mult=2.0, aggression_mult=2.5, fold_pressure=0.4,
-                   bluff_mult=2.0, sizing_mult=1.8, cbet_mult=1.8)
+        """Hyper-aggressive: plays too many hands, raises too much. ~45/35 VPIP/PFR."""
+        return cls(range_mult=1.5, aggression_mult=1.6, fold_pressure=0.55,
+                   bluff_mult=1.5, sizing_mult=1.35, cbet_mult=1.5)
 
     @classmethod
     def calling_station(cls) -> 'PersonalityModifier':
-        """Loose-passive: calls everything, rarely raises or folds."""
-        return cls(range_mult=1.5, aggression_mult=0.3, fold_pressure=0.3,
-                   bluff_mult=0.5, sizing_mult=0.7, cbet_mult=0.4)
+        """Loose-passive: calls everything, rarely raises or folds. ~40/8 VPIP/PFR."""
+        return cls(range_mult=1.35, aggression_mult=0.4, fold_pressure=0.35,
+                   bluff_mult=0.3, sizing_mult=0.8, cbet_mult=0.45)
+
+    @classmethod
+    def fish(cls) -> 'PersonalityModifier':
+        """Recreational player: limps too much, calls too much pre. ~50/10 VPIP/PFR."""
+        return cls(range_mult=1.45, aggression_mult=0.5, fold_pressure=0.5,
+                   bluff_mult=0.4, sizing_mult=0.7, cbet_mult=0.35)
 
     @classmethod
     def random(cls, rng: Optional[random.Random] = None) -> 'PersonalityModifier':
-        """Sample a random personality from continuous distributions."""
+        """Sample a random personality from continuous distributions.
+
+        Ranges are narrowed to [0.5, 1.6] to stay within human-like behavior.
+        """
         rng = rng or random.Random()
         return cls(
-            range_mult=rng.uniform(0.3, 2.0),
-            aggression_mult=rng.uniform(0.2, 2.5),
-            fold_pressure=rng.uniform(0.3, 2.0),
-            bluff_mult=rng.uniform(0.2, 2.5),
-            sizing_mult=rng.uniform(0.5, 2.0),
-            cbet_mult=rng.uniform(0.3, 2.0),
+            range_mult=rng.uniform(0.5, 1.6),
+            aggression_mult=rng.uniform(0.35, 1.6),
+            fold_pressure=rng.uniform(0.35, 1.5),
+            bluff_mult=rng.uniform(0.25, 1.6),
+            sizing_mult=rng.uniform(0.6, 1.5),
+            cbet_mult=rng.uniform(0.35, 1.5),
         )
 
 
@@ -194,20 +212,21 @@ class SituationalPersonality:
         mod = self.get_modifier(active_situations)
         probs = action_probs.clone()
 
-        # --- Range adjustment ---
-        # Tighter player → increase fold prob for weak hands
-        if hand_strength < 0.4:
-            fold_adjust = 2.0 - mod.range_mult  # range_mult=0.5 → fold_adjust=1.5
-            probs[0] *= max(fold_adjust, 0.1)  # [fold]
-
-        # Looser player → decrease fold prob
-        if mod.range_mult > 1.0:
-            probs[0] *= 1.0 / mod.range_mult
+        # --- Range adjustment (smooth function of hand strength) ---
+        # Tight players fold more with weak hands; loose players fold less.
+        # fold_factor smoothly increases for weaker hands when range_mult < 1.
+        # At hand_strength=0 and range_mult=0.6: fold_factor ≈ 1.4
+        # At hand_strength=1: fold_factor ≈ 1.0 regardless of range_mult
+        weakness = max(0.0, 1.0 - hand_strength)  # 0 for nuts, 1 for air
+        fold_factor = 1.0 + weakness * (1.0 - mod.range_mult)  # range<1 → fold more
+        probs[0] *= max(fold_factor, 0.1)
 
         # --- Aggression adjustment ---
-        # Shift weight between call and raise
-        aggression_shift = (mod.aggression_mult - 1.0) * 0.3  # scaled
-        shift_amount = probs[2] * aggression_shift  # shift from call
+        # Shift weight between call and raise, clamped to prevent negatives.
+        aggression_shift = (mod.aggression_mult - 1.0) * 0.25  # scaled
+        max_shift = probs[2].item() * 0.8    # never shift more than 80% of call prob
+        shift_amount = min(probs[2].item() * aggression_shift, max_shift)
+        shift_amount = max(shift_amount, -probs[3].item() * 0.8)  # don't zero out raise
         probs[3] += shift_amount   # → to raise
         probs[2] -= shift_amount   # ← from call
 
@@ -215,16 +234,60 @@ class SituationalPersonality:
         if is_facing_raise:
             probs[0] *= mod.fold_pressure
 
-        # --- Bluff adjustment ---
-        # When hand is weak but we're raising → it's a bluff
-        if hand_strength < 0.3:
-            probs[3] *= mod.bluff_mult
+        # --- Bluff adjustment (smooth) ---
+        # Scales raise probability for weak hands.
+        # At hand_strength=0: full bluff_mult effect.
+        # At hand_strength=0.5: half effect. At 1.0: no effect.
+        bluff_scale = 1.0 + (mod.bluff_mult - 1.0) * max(0.0, 1.0 - hand_strength * 2.0)
+        probs[3] *= max(bluff_scale, 0.1)
 
         # --- Clamp and re-normalize ---
         probs = probs.clamp(min=1e-6)
         probs = probs / probs.sum()
 
         return probs
+
+    def apply_sizing(
+        self,
+        sizing_probs: List[float],
+        active_situations: List[Situation],
+    ) -> List[float]:
+        """
+        Apply personality to bet sizing distribution.
+
+        sizing_mult > 1 shifts weight towards larger bets.
+        sizing_mult < 1 shifts weight towards smaller bets.
+
+        Args:
+            sizing_probs: list of 10 floats (pot fraction buckets)
+            active_situations: current situation tags
+
+        Returns:
+            Modified sizing_probs list, re-normalized.
+        """
+        mod = self.get_modifier(active_situations)
+        n = len(sizing_probs)
+        if n == 0:
+            return sizing_probs
+
+        adjusted = list(sizing_probs)
+        sm = mod.sizing_mult
+
+        # Apply exponential weighting: later indices = bigger bets
+        # sizing_mult > 1 → weight larger sizes more; < 1 → weight smaller sizes
+        for i in range(n):
+            # Position weight: 0.0 for smallest, 1.0 for largest (all-in)
+            pos = i / max(n - 1, 1)
+            # Shift: sizing_mult=1.3 and pos=1.0 → factor ≈ 1.3
+            # sizing_mult=0.7 and pos=1.0 → factor ≈ 0.7
+            factor = 1.0 + (sm - 1.0) * (2.0 * pos - 1.0)
+            adjusted[i] *= max(factor, 0.05)
+
+        total = sum(adjusted)
+        if total > 0:
+            adjusted = [p / total for p in adjusted]
+
+        return adjusted
 
 
 # =============================================================================

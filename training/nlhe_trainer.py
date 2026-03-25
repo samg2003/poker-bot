@@ -473,6 +473,8 @@ class NLHESelfPlayTrainer:
             # Build personality context for post-processing
             personality = None
             situations = []
+            hand_strength = 0.5
+            is_facing_raise = game_state.current_bet > 0 and p.bet_this_street < game_state.current_bet
             if pid < len(self.table_personalities):
                 personality = self.table_personalities[pid]
                 street_map_sit = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
@@ -480,7 +482,30 @@ class NLHESelfPlayTrainer:
                     street=street_map_sit.get(game_state.street, 0),
                     board_cards=list(game_state.board) if game_state.board else None,
                     stack_bb=p.stack / max(game_state.big_blind, 1),
+                    is_facing_raise=is_facing_raise,
                 )
+                # Approximate hand strength (cheap heuristic)
+                c1, c2 = p.hole_cards
+                r1, r2 = c1 // 4, c2 // 4
+                if game_state.street == Street.PREFLOP:
+                    if r1 == r2:  # pocket pair
+                        hand_strength = 0.55 + r1 * 0.035  # 22=0.55, AA=0.97
+                    elif max(r1, r2) >= 10:  # broadway
+                        hand_strength = 0.45 + max(r1, r2) * 0.02
+                    elif (c1 % 4) == (c2 % 4):  # suited
+                        hand_strength = 0.3
+                    else:
+                        hand_strength = 0.15 + max(r1, r2) * 0.01
+                else:
+                    # Postflop: rough proxy — high cards + pair potential
+                    paired_board = any(r1 == (bc // 4) or r2 == (bc // 4)
+                                       for bc in game_state.board if bc >= 0)
+                    if paired_board:
+                        hand_strength = 0.65 + max(r1, r2) * 0.02
+                    elif max(r1, r2) >= 10:
+                        hand_strength = 0.4
+                    else:
+                        hand_strength = 0.2
 
             # YIELD — pause game, wait for batched GPU result
             probs, value, sizing_probs = yield {
@@ -495,6 +520,8 @@ class NLHESelfPlayTrainer:
                 # context for post-processing (not sent to GPU)
                 '_personality': personality,
                 '_situations': situations,
+                '_hand_strength': hand_strength,
+                '_is_facing_raise': is_facing_raise,
                 '_game_id': id(dealer),
             }
 
@@ -743,7 +770,14 @@ class NLHESelfPlayTrainer:
                     personality = state_dict['_personality']
                     situations = state_dict['_situations']
                     if personality is not None:
-                        probs = personality.apply(probs, situations, hand_strength=0.5)
+                        hand_strength = state_dict['_hand_strength']
+                        is_facing_raise = state_dict['_is_facing_raise']
+                        probs = personality.apply(
+                            probs, situations,
+                            hand_strength=hand_strength,
+                            is_facing_raise=is_facing_raise,
+                        )
+                        sizing_probs = personality.apply_sizing(sizing_probs, situations)
 
                     try:
                         new_state = g.send((probs, value, sizing_probs))
