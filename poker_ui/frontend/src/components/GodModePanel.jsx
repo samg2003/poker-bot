@@ -4,7 +4,9 @@ const SIZING_LABELS = ['10%', '25%', '33%', '50%', '66%', '75%', '100%', '150%',
 const POT_FRACTIONS = [0.1, 0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0, -1.0];
 
 export default function GodModePanel({ gameState, selectedSeat }) {
-  if (!gameState || !gameState.god_mode || !gameState.players[selectedSeat]) {
+  const p = gameState?.players?.find(pl => pl.id === selectedSeat)
+
+  if (!gameState || !gameState.god_mode || !p || !p.occupied) {
     return (
       <div className="god-mode-panel glass-panel">
         <div className="dashboard-header">
@@ -15,7 +17,6 @@ export default function GodModePanel({ gameState, selectedSeat }) {
     )
   }
 
-  const p = gameState.players[selectedSeat]
   const evData = gameState.god_mode[selectedSeat]
   
   let pf = 0, pc = 0, pr = 0
@@ -65,7 +66,7 @@ export default function GodModePanel({ gameState, selectedSeat }) {
       </div>
       
       <div className="selected-player-info">
-        <h3>Seat {selectedSeat} ({p.personality})</h3>
+        <h3>{p.is_human ? 'Hero' : `${p.name} (${p.personality})`}</h3>
         <span className="tag">Tracked Seat</span>
       </div>
 

@@ -49,33 +49,40 @@ export default function PokerTable({ gameState, selectedSeat, onSelectSeat }) {
 
       <div className="seats-container">
         {players.map((p, i) => {
-          const isTurn = current_player === i && !is_terminal
-          const isActiveSeat = selectedSeat === i
-          const isHero = i === 0
-          const isRevealed = revealedSeats.has(i)
+          // Skip empty seats - render a faded empty slot
+          if (!p.occupied) {
+            return (
+              <div key={i} className={`seat seat-${i} empty-seat`}>
+                <div className="seat-name">Empty</div>
+              </div>
+            )
+          }
+
+          const isTurn = current_player === p.id && !is_terminal
+          const isActiveSeat = selectedSeat === p.id
+          const isHero = p.is_human
+          const isRevealed = revealedSeats.has(p.id)
           
-          // Show cards for Hero always, for others only if revealed via double-click (or showdown)
           const showCards = isHero || isRevealed || street === 'SHOWDOWN'
-          // Show personality only if revealed
           const displayName = isHero 
             ? 'Hero' 
             : isRevealed 
-              ? `Seat ${i} (${p.personality})` 
-              : `Seat ${i}`
+              ? `${p.name} (${p.personality})` 
+              : p.name
 
           return (
             <div 
               key={i} 
               className={`seat seat-${i} ${isTurn ? 'turn-active' : ''} ${p.is_folded ? 'folded' : ''} ${isActiveSeat ? 'selected' : ''} ${isHero ? 'hero' : ''} ${isRevealed ? 'revealed' : ''}`}
-              onClick={() => onSelectSeat(i)}
-              onDoubleClick={() => handleDoubleClick(i)}
+              onClick={() => onSelectSeat(p.id)}
+              onDoubleClick={() => handleDoubleClick(p.id)}
             >
               <div className="seat-name">{displayName}</div>
               <div className="seat-stack">{p.stack.toFixed(2)} bb</div>
               {p.bet > 0 && <div className="seat-bet">{p.bet.toFixed(2)}</div>}
-              {dealer_button === i && <div className="dealer-btn">D</div>}
-              {small_blind === i && <div className="sb-btn">SB</div>}
-              {big_blind === i && <div className="bb-btn">BB</div>}
+              {dealer_button === p.id && <div className="dealer-btn">D</div>}
+              {small_blind === p.id && <div className="sb-btn">SB</div>}
+              {big_blind === p.id && <div className="bb-btn">BB</div>}
               
               <div className="seat-cards">
                 {showCards && p.hole_cards && p.hole_cards.length === 2 ? (

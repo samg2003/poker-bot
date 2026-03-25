@@ -21,7 +21,12 @@ export default function ActionBar({ gameState, isLive, onSubmitAction }) {
     }
   }, [minr])
 
-  if (!isLive || !gameState || gameState.is_terminal || gameState.players[0].personality !== "Human" || gameState.current_player !== 0) {
+  if (!isLive || !gameState || gameState.is_terminal) {
+    return <div className="player-action-bar glass-panel hidden"></div>
+  }
+
+  const heroPlayer = gameState.players.find(p => p.is_human)
+  if (!heroPlayer || gameState.current_player !== heroPlayer.id) {
     return <div className="player-action-bar glass-panel hidden"></div>
   }
 

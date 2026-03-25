@@ -153,8 +153,8 @@ body {
 /* Seats */
 .seats-container { position: absolute; width: 100%; height: 100%; top: 0; left: 0; pointer-events: none; }
 .seat {
-  position: absolute; width: 150px; background: rgba(10, 15, 20, 0.9);
-  border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 12px;
+  position: absolute; width: 130px; background: rgba(10, 15, 20, 0.9);
+  border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 10px;
   text-align: center; pointer-events: auto; cursor: pointer;
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   transform: translate(-50%, -50%);
@@ -164,13 +164,14 @@ body {
 .seat.selected { border-color: #58a6ff; box-shadow: 0 0 20px rgba(88, 166, 255, 0.4); }
 .seat.turn-active { border-color: #f2c94c; box-shadow: 0 0 20px rgba(242, 201, 76, 0.4); }
 .seat.folded { opacity: 0.3; filter: grayscale(1); }
+.seat.empty-seat { opacity: 0.15; cursor: default; pointer-events: none; border-style: dashed; }
 
-.seat-name { font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
-.seat-stack { font-size: 15px; font-weight: 800; color: #58a6ff; }
+.seat-name { font-size: 11px; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; }
+.seat-stack { font-size: 14px; font-weight: 800; color: #58a6ff; }
 .seat-bet { 
-  position: absolute; top: -35px; left: 50%; transform: translateX(-50%);
-  background: rgba(0,0,0,0.7); padding: 4px 10px; border-radius: 12px;
-  font-size: 13px; font-weight: 700; color: #f2c94c; border: 1px solid rgba(242,201,76,0.3);
+  position: absolute; top: -30px; left: 50%; transform: translateX(-50%);
+  background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 10px;
+  font-size: 12px; font-weight: 700; color: #f2c94c; border: 1px solid rgba(242,201,76,0.3);
 }
 
 .dealer-btn, .sb-btn, .bb-btn {
@@ -183,16 +184,16 @@ body {
 .sb-btn { top: 15px; background: #1f6b8b; color: white; border-color: #58a6ff; }
 .bb-btn { top: 45px; background: #d73a49; color: white; border-color: #f85149; }
 
-/* Seat Positions around oval */
-.seat-0 { top: 105%; left: 50%; } /* Hero */
-.seat-1 { top: 80%; left: 0%; }
-.seat-2 { top: 20%; left: 0%; }
-.seat-3 { top: -5%; left: 50%; }
-.seat-4 { top: 20%; left: 100%; }
-.seat-5 { top: 80%; left: 100%; }
-.seat-6 { top: 105%; left: 80%; }
-.seat-7 { top: 105%; left: 20%; }
-.seat-8 { top: -5%; left: 25%; }
+/* Seat Positions — 9 seats evenly distributed around oval */
+.seat-0 { top: 110%; left: 50%; }  /* Hero — bottom center */
+.seat-1 { top: 85%;  left: -2%; }  /* bottom-left */
+.seat-2 { top: 30%;  left: -5%; }  /* mid-left */
+.seat-3 { top: -12%; left: 22%; }  /* top-left */
+.seat-4 { top: -18%; left: 50%; }  /* top center */
+.seat-5 { top: -12%; left: 78%; }  /* top-right */
+.seat-6 { top: 30%;  left: 105%; } /* mid-right */
+.seat-7 { top: 85%;  left: 102%; } /* bottom-right */
+.seat-8 { top: 110%; left: 82%; }  /* bottom far-right */
 
 .seat-cards { display: flex; justify-content: center; gap: 6px; margin-top: 10px; }
 .seat-cards .card { width: 36px; height: 50px; font-size: 14px; box-shadow: 0 2px 4px rgba(0,0,0,0.3);}

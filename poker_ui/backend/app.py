@@ -37,7 +37,6 @@ def load_model():
     global game_manager
     print("Loading latest checkpoint...")
     
-    # Needs to match the trainer dimensions, we'll try to auto-detect or default to the user's running config
     embed_dim = 256
     num_heads = 4
     num_layers = 4
@@ -67,6 +66,7 @@ def load_model():
 
 def _serialize_snapshot(snap: TimelineSnapshot):
     gs = snap.game_state
+    seat_map = snap.seat_map
     
     # Map street to string
     street_str = "PREFLOP"
@@ -75,42 +75,83 @@ def _serialize_snapshot(snap: TimelineSnapshot):
     elif gs.street == Street.RIVER: street_str = "RIVER"
     elif gs.street == Street.SHOWDOWN: street_str = "SHOWDOWN"
 
-    return {
-        "pot": gs.pot,
-        "board": gs.board,
-        "street": street_str,
-        "current_player": gs.current_player_idx,
-        "is_terminal": game_manager.dealer.is_hand_over() if game_manager.dealer else False,
-        "dealer_button": gs.dealer_button,
-        "small_blind": gs._sb_idx(),
-        "big_blind": gs._bb_idx(),
-        "legal_actions": [a.name for a in gs.get_legal_actions()],
-        "min_raise": gs.get_min_raise_to(),
-        "max_raise": gs.get_max_raise_to(),
-        "current_bet": gs.current_bet,
-        "players": [
-            {
-                "id": pid,
+    # Build full 9-seat player array (with empty seats)
+    players = []
+    for table_seat in range(game_manager.MAX_SEATS):
+        seat_info = game_manager.seats[table_seat]
+        if table_seat in game_manager.engine_map:
+            eng_idx = game_manager.engine_map[table_seat]
+            p = gs.players[eng_idx]
+            players.append({
+                "id": table_seat,
+                "occupied": True,
+                "name": seat_info.name,
                 "stack": p.stack,
                 "bet": p.bet_this_street,
                 "is_active": p.is_active,
                 "is_all_in": p.is_all_in,
                 "is_folded": p.is_folded,
                 "hole_cards": list(p.hole_cards) if p.hole_cards else [],
-                "personality": getattr(game_manager.personalities[pid].base, 'name', 'Bot') if game_manager.personalities[pid] else "Human",
-            } for pid, p in enumerate(gs.players)
-        ],
-        "god_mode": snap.god_mode,
+                "personality": seat_info.personality_name,
+                "is_human": seat_info.is_human,
+            })
+        else:
+            players.append({
+                "id": table_seat,
+                "occupied": False,
+                "name": "",
+                "stack": 0,
+                "bet": 0,
+                "is_active": False,
+                "is_all_in": False,
+                "is_folded": True,
+                "hole_cards": [],
+                "personality": "",
+                "is_human": False,
+            })
+
+    # Map engine current_player back to table seat
+    current_table_seat = seat_map[gs.current_player_idx] if gs.current_player_idx < len(seat_map) else -1
+
+    # Map dealer/SB/BB from engine indices to table seats
+    dealer_table = seat_map[gs.dealer_button] if gs.dealer_button < len(seat_map) else -1
+    sb_table = seat_map[gs._sb_idx()] if gs._sb_idx() < len(seat_map) else -1
+    bb_table = seat_map[gs._bb_idx()] if gs._bb_idx() < len(seat_map) else -1
+
+    # Remap god_mode from engine indices to table seat indices
+    god_mode_remapped = {}
+    for eng_idx, data in snap.god_mode.items():
+        if eng_idx < len(seat_map):
+            god_mode_remapped[seat_map[eng_idx]] = data
+
+    return {
+        "pot": gs.pot,
+        "board": gs.board,
+        "street": street_str,
+        "current_player": current_table_seat,
+        "is_terminal": game_manager.dealer.is_hand_over() if game_manager.dealer else False,
+        "dealer_button": dealer_table,
+        "small_blind": sb_table,
+        "big_blind": bb_table,
+        "legal_actions": [a.name for a in gs.get_legal_actions()],
+        "min_raise": gs.get_min_raise_to(),
+        "max_raise": gs.get_max_raise_to(),
+        "current_bet": gs.current_bet,
+        "players": players,
+        "god_mode": god_mode_remapped,
         "last_action": {
             "type": snap.action.action_type.name,
             "amount": snap.action.amount
-        } if snap.action else None
+        } if snap.action else None,
+        "hand_count": game_manager.hand_count,
+        "total_buyin": game_manager.total_buyin,
+        "hero_stack": game_manager.seats[game_manager.human_seat].stack,
     }
 
 @app.get("/api/start")
-def start_game(num_players: int = 6):
+def start_game():
     global game_manager
-    game_manager.start_new_hand(num_players=num_players)
+    game_manager.start_new_hand()
     return {"status": "started", "timeline_length": len(game_manager.timeline)}
 
 @app.get("/api/state")
@@ -150,7 +191,13 @@ def human_action(req: ActionRequest):
     gs = game_manager.game_state
     
     terminal = game_manager.dealer.is_hand_over() if game_manager.dealer else True
-    if terminal or gs.current_player_idx != game_manager.human_seat:
+    if terminal:
+        raise HTTPException(status_code=400, detail="Hand is over")
+    
+    # Check it's the human's turn using seat map
+    eng_idx = gs.current_player_idx
+    table_seat = game_manager.seat_map[eng_idx]
+    if table_seat != game_manager.human_seat:
         raise HTTPException(status_code=400, detail="Not your turn")
         
     atype_map = {
@@ -168,11 +215,30 @@ def human_action(req: ActionRequest):
     amount = req.amount
     if atype == ActionType.RAISE:
         if amount < gs.get_min_raise_to() or amount > gs.get_max_raise_to():
-            # Auto-clamp instead of crashing
             amount = max(gs.get_min_raise_to(), min(amount, gs.get_max_raise_to()))
 
     game_manager.process_action(Action(atype, amount=amount))
     return get_state()
+
+@app.get("/api/table")
+def get_table():
+    """Returns info about all 9 seats."""
+    global game_manager
+    return {"seats": game_manager.get_table_info()}
+
+@app.get("/api/buyin")
+def buy_in():
+    """Top up hero stack to 100bb."""
+    global game_manager
+    added = game_manager.buy_in()
+    return {"added": added, "total_buyin": game_manager.total_buyin, "stack": game_manager.seats[game_manager.human_seat].stack}
+
+@app.get("/api/reset")
+def reset_session():
+    """Full reset — clear everything and start fresh."""
+    global game_manager
+    game_manager.reset_session()
+    return {"status": "reset"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

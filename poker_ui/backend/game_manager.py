@@ -2,6 +2,7 @@ import random
 import torch
 import copy
 from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
 
 from engine.dealer import Dealer
 from engine.game_state import GameState, Action, ActionType, Street
@@ -11,20 +12,45 @@ from model.stat_tracker import StatTracker, NUM_STAT_FEATURES, HandRecord
 from model.action_space import ActionIndex, NUM_ACTION_TYPES, encode_action
 from training.personality import SituationalPersonality, PersonalityModifier, detect_situations
 
+# ─── Bot name pool ───
+BOT_NAMES = [
+    "Ace", "Blitz", "Cobra", "Dice", "Edge", "Fox", "Ghost", "Hawk",
+    "Ice", "Joker", "King", "Luna", "Maverick", "Neon", "Onyx", "Phantom",
+    "Queen", "Raven", "Shadow", "Titan", "Viper", "Wolf", "Zen", "Storm",
+]
+
+@dataclass
+class SeatInfo:
+    """Persistent info about a player sitting at the table."""
+    occupied: bool = False
+    is_human: bool = False
+    name: str = ""
+    personality: Optional[SituationalPersonality] = None
+    personality_name: str = "Bot"
+    stack: float = 100.0
+    hands_remaining: int = 30      # How many more hands before leaving
+    uid: int = 0                    # Unique ID for stat tracking
+    sitting_out: bool = False       # Sat out this hand (just joined mid-hand)
+
+
 class TimelineSnapshot:
     def __init__(
         self,
         game_state: GameState,
         action: Optional[Action],
-        god_mode: Dict[int, Any],  # Dictionary mapping pid -> AI's predicted probabilities and EV
+        god_mode: Dict[int, Any],
+        seat_map: List[int],     # Maps engine player idx → table seat idx
     ):
-        # Deep copy game state
         self.game_state = copy.deepcopy(game_state)
         self.action = action
         self.god_mode = god_mode
+        self.seat_map = list(seat_map)
+
 
 class GameManager:
-    """Manages the interactive web poker game against the AI."""
+    """Manages an interactive web poker game with a persistent 9-seat table."""
+    MAX_SEATS = 9
+
     def __init__(self, policy: PolicyNetwork, encoder: OpponentEncoder, human_seat: int = 0):
         self.policy = policy
         self.opponent_encoder = encoder
@@ -33,18 +59,147 @@ class GameManager:
         
         self.dealer: Optional[Dealer] = None
         self.game_state: Optional[GameState] = None
-        self.personalities: List[Optional[SituationalPersonality]] = []
         self.hand_records: List[HandRecord] = []
-        
-        # Persistence across hands
+
+        # Persistent lobby state
+        self.seats: List[SeatInfo] = [SeatInfo() for _ in range(self.MAX_SEATS)]
+        self._next_uid = 1
+        self.hand_count = 0
+        self.dealer_button_seat = 0  # Tracks dealer across variable player counts
+        self.total_buyin = 100.0     # Track hero's total money invested
+
+        # Persistence across hands (keyed by uid)
         self.stat_tracker = StatTracker()
         self.action_histories: Dict[int, List[torch.Tensor]] = {}
+
+        # Current hand mapping
+        self.seat_map: List[int] = []       # engine idx → table seat idx
+        self.engine_map: Dict[int, int] = {}  # table seat idx → engine idx
         
         # Hand Timeline
         self.timeline: List[TimelineSnapshot] = []
 
+        # Initialize human seat
+        self._seat_human()
+
     # ─────────────────────────────────────────────────────────
-    # Evaluator Tracking Logic (Copied to avoid coupling)
+    # Lobby Management
+    # ─────────────────────────────────────────────────────────
+    def _seat_human(self):
+        s = self.seats[self.human_seat]
+        s.occupied = True
+        s.is_human = True
+        s.name = "Hero"
+        s.personality = None
+        s.personality_name = "Human"
+        s.stack = 100.0
+        s.hands_remaining = 999999
+        s.uid = 0
+        self.total_buyin = 100.0
+
+    def _random_personality(self) -> tuple:
+        roll = self.rng.random()
+        if roll < 0.80:
+            base = PersonalityModifier.gto()
+            base.name = "GTO"
+            return SituationalPersonality(base=base), "GTO"
+        elif roll < 0.867:
+            base = PersonalityModifier.nit()
+            base.name = "Nit"
+            return SituationalPersonality(base=base), "Nit"
+        elif roll < 0.933:
+            base = PersonalityModifier.maniac()
+            base.name = "Maniac"
+            return SituationalPersonality(base=base), "Maniac"
+        else:
+            base = PersonalityModifier.gto()
+            base.name = "LAG"
+            return SituationalPersonality(base=base), "LAG"
+
+    def _random_buyin(self) -> float:
+        """Most players buy in at 100bb, some short-stack, rare deep-stack."""
+        roll = self.rng.random()
+        if roll < 0.65:
+            return 100.0
+        elif roll < 0.80:
+            # Short stack: 30-60bb
+            return round(self.rng.uniform(30, 60), 1)
+        elif roll < 0.92:
+            # Medium: 60-100bb
+            return round(self.rng.uniform(60, 100), 1)
+        else:
+            # Deep stack: 150-250bb
+            return round(self.rng.uniform(150, 250), 1)
+
+    def _seat_bot(self, seat_idx: int):
+        """Seat a new bot at the given index."""
+        s = self.seats[seat_idx]
+        personality, pname = self._random_personality()
+        name = self.rng.choice(BOT_NAMES)
+        
+        s.occupied = True
+        s.is_human = False
+        s.name = name
+        s.personality = personality
+        s.personality_name = pname
+        s.stack = self._random_buyin()
+        s.hands_remaining = max(8, int(self.rng.gauss(30, 12)))
+        s.uid = self._next_uid
+        s.sitting_out = False
+        self._next_uid += 1
+
+    def _unseat(self, seat_idx: int):
+        """Remove a bot from the table."""
+        s = self.seats[seat_idx]
+        s.occupied = False
+        s.is_human = False
+        s.name = ""
+        s.personality = None
+        s.personality_name = ""
+        s.stack = 0
+        s.hands_remaining = 0
+        s.uid = 0
+        s.sitting_out = False
+
+    def _active_count(self) -> int:
+        return sum(1 for s in self.seats if s.occupied)
+
+    def _lobby_churn(self):
+        """Between hands: bots leave and join to simulate a real cash game."""
+        # --- Departures ---
+        for i, s in enumerate(self.seats):
+            if i == self.human_seat or not s.occupied:
+                continue
+            s.hands_remaining -= 1
+            # Leave if out of hands or busted
+            if s.hands_remaining <= 0 or s.stack < 1.0:
+                self._unseat(i)
+                continue
+            # Small random chance to leave early
+            if self._active_count() > 4 and self.rng.random() < 0.03:
+                self._unseat(i)
+
+        # --- Arrivals ---
+        target = self.rng.choices([5, 6, 7, 8], weights=[15, 45, 30, 10])[0]
+        empty_seats = [i for i in range(self.MAX_SEATS) if not self.seats[i].occupied]
+        self.rng.shuffle(empty_seats)
+
+        while self._active_count() < target and empty_seats:
+            seat_idx = empty_seats.pop()
+            self._seat_bot(seat_idx)
+
+        # Ensure at least 2 players (hero + 1 bot)
+        if self._active_count() < 2:
+            for i in empty_seats:
+                self._seat_bot(i)
+                break
+
+    def _build_seat_map(self) -> List[int]:
+        """Build mapping from engine player index to table seat index."""
+        return [i for i in range(self.MAX_SEATS) if self.seats[i].occupied]
+
+    # ─────────────────────────────────────────────────────────
+    # Evaluator Tracking Logic
     # ─────────────────────────────────────────────────────────
     def _action_to_type_idx(self, action: Action) -> int:
         mapping = {
@@ -56,40 +211,40 @@ class GameManager:
         }
         return mapping.get(action.action_type, ActionIndex.FOLD)
 
-    def _record_action(self, player_id: int, action_type: int,
+    def _record_action(self, uid: int, action_type: int,
                        bet_frac: float, pot: float, stack: float, street: int):
-        if player_id not in self.action_histories:
-            self.action_histories[player_id] = []
+        if uid not in self.action_histories:
+            self.action_histories[uid] = []
         token = encode_action(action_type, bet_frac, pot, stack, street)
-        self.action_histories[player_id].append(token)
-        if len(self.action_histories[player_id]) > 16:
-            self.action_histories[player_id] = self.action_histories[player_id][-16:]
+        self.action_histories[uid].append(token)
+        if len(self.action_histories[uid]) > 16:
+            self.action_histories[uid] = self.action_histories[uid][-16:]
 
-    def _get_opponent_embedding(self, player_id: int) -> torch.Tensor:
-        if hasattr(self, '_current_embed_cache') and player_id in self._current_embed_cache:
-            return self._current_embed_cache[player_id]
+    def _get_opponent_embedding(self, uid: int) -> torch.Tensor:
+        if hasattr(self, '_current_embed_cache') and uid in self._current_embed_cache:
+            return self._current_embed_cache[uid]
 
-        history = self.action_histories.get(player_id, [])
+        history = self.action_histories.get(uid, [])
         if not history:
             return self.opponent_encoder.encode_empty(1).detach()
         seq = torch.stack(history).unsqueeze(0)
         with torch.no_grad():
             return self.opponent_encoder(seq).detach()
 
-    def _get_all_opponent_embeddings(self, hero_id: int, num_players: int) -> torch.Tensor:
+    def _get_all_opponent_embeddings(self, hero_uid: int, active_uids: List[int]) -> torch.Tensor:
         opp_embeds = []
-        for pid in range(num_players):
-            if pid == hero_id: continue
-            opp_embeds.append(self._get_opponent_embedding(pid))
+        for uid in active_uids:
+            if uid == hero_uid: continue
+            opp_embeds.append(self._get_opponent_embedding(uid))
         if not opp_embeds:
             return self.opponent_encoder.encode_empty(1).unsqueeze(1).detach()
         return torch.cat(opp_embeds, dim=0).unsqueeze(0).detach()
 
-    def _get_opponent_stats(self, hero_id: int, num_players: int) -> torch.Tensor:
+    def _get_opponent_stats(self, hero_uid: int, active_uids: List[int]) -> torch.Tensor:
         stats = []
-        for pid in range(num_players):
-            if pid == hero_id: continue
-            stats.append(self.stat_tracker.get_stats(pid))
+        for uid in active_uids:
+            if uid == hero_uid: continue
+            stats.append(self.stat_tracker.get_stats(uid))
         if not stats:
             return torch.zeros(1, 1, NUM_STAT_FEATURES)
         return torch.stack(stats).unsqueeze(0)
@@ -97,67 +252,90 @@ class GameManager:
     # ─────────────────────────────────────────────────────────
     # API Methods
     # ─────────────────────────────────────────────────────────
-    def start_new_hand(self, num_players: int = 6):
-        """Initializes a new hand and generates bot personalities."""
-        self.personalities = []
-        for pid in range(num_players):
-            if pid == self.human_seat:
-                self.personalities.append(None)
-            else:
-                # Randomize personality to make it interesting
-                roll = self.rng.random()
-                if roll < 0.6:
-                    base = PersonalityModifier.gto()
-                    base.name = "GTO"
-                elif roll < 0.8:
-                    base = PersonalityModifier.nit()
-                    base.name = "Nit"
-                else:
-                    base = PersonalityModifier.maniac()
-                    base.name = "Maniac"
-                self.personalities.append(SituationalPersonality(base=base))
+    def start_new_hand(self):
+        """Run lobby churn, then deal a new hand to all seated players."""
+        self.hand_count += 1
+
+        # First hand: fill the table
+        if self.hand_count == 1:
+            for i in range(self.MAX_SEATS):
+                if i != self.human_seat and not self.seats[i].occupied:
+                    self._seat_bot(i)
+            # Trim to ~6
+            occupied = [i for i in range(self.MAX_SEATS) if self.seats[i].occupied and i != self.human_seat]
+            self.rng.shuffle(occupied)
+            while self._active_count() > 6 and occupied:
+                self._unseat(occupied.pop())
+        else:
+            self._lobby_churn()
+
+        # Build engine mappings
+        self.seat_map = self._build_seat_map()
+        self.engine_map = {seat: eng for eng, seat in enumerate(self.seat_map)}
+        num_engine_players = len(self.seat_map)
+
+        # Build stacks and personalities arrays for the engine
+        stacks = [self.seats[s].stack for s in self.seat_map]
+
+        # Advance dealer button to next occupied seat
+        self.dealer_button_seat = self._next_occupied_seat(self.dealer_button_seat)
+        dealer_engine_idx = self.engine_map[self.dealer_button_seat]
 
         self.dealer = Dealer(
-            num_players=num_players,
-            stacks=[100.0] * num_players,
+            num_players=num_engine_players,
+            stacks=stacks,
             small_blind=0.5,
             big_blind=1.0,
-            dealer_button=self.rng.randint(0, num_players - 1),
+            dealer_button=dealer_engine_idx,
             seed=self.rng.randint(0, 2**31)
         )
         self.game_state = self.dealer.start_hand()
-        self.hand_records = [HandRecord() for _ in range(num_players)]
+        self.hand_records = [HandRecord() for _ in range(num_engine_players)]
         self.timeline = []
-        
-        # Take AI snapshot before first action
+
+        # Sync stacks back (blinds have been posted)
+        for eng_idx, seat_idx in enumerate(self.seat_map):
+            self.seats[seat_idx].stack = self.game_state.players[eng_idx].stack
+
         self._take_snapshot(None)
+
+    def _next_occupied_seat(self, current_seat: int) -> int:
+        """Find the next occupied seat clockwise."""
+        for offset in range(1, self.MAX_SEATS + 1):
+            idx = (current_seat + offset) % self.MAX_SEATS
+            if self.seats[idx].occupied:
+                return idx
+        return current_seat
 
     def _take_snapshot(self, last_action: Optional[Action]):
         """Records the current game state and the AI's God Mode evaluations."""
         terminal = self.dealer.is_hand_over()
         if terminal:
-            self.timeline.append(TimelineSnapshot(self.game_state, last_action, {}))
+            self.timeline.append(TimelineSnapshot(self.game_state, last_action, {}, self.seat_map))
             return
 
-        # Precompute individual opponent embeddings to avoid O(N^2) encoder passes
         self._current_embed_cache = {}
-        for pid in range(len(self.game_state.players)):
-            self._current_embed_cache[pid] = self._get_opponent_embedding(pid)
+        active_uids = [self.seats[s].uid for s in self.seat_map]
+        for uid in active_uids:
+            self._current_embed_cache[uid] = self._get_opponent_embedding(uid)
 
-        # Calculate God Mode for all active players
         god_mode = {}
-        for pid, p in enumerate(self.game_state.players):
+        for eng_idx, seat_idx in enumerate(self.seat_map):
+            p = self.game_state.players[eng_idx]
             if p.is_active:
-                god_mode[pid] = self._evaluate_seat(pid)
-                
-        self.timeline.append(TimelineSnapshot(self.game_state, last_action, god_mode))
+                god_mode[eng_idx] = self._evaluate_seat(eng_idx)
+
+        self.timeline.append(TimelineSnapshot(self.game_state, last_action, god_mode, self.seat_map))
         self._current_embed_cache.clear()
 
-    def _evaluate_seat(self, pid: int) -> Dict[str, Any]:
-        """Runs the neural network exactly as if it was in the given seat."""
-        p = self.game_state.players[pid]
-        num_players = len(self.game_state.players)
-        
+    def _evaluate_seat(self, eng_idx: int) -> Dict[str, Any]:
+        """Runs the neural network as if it was in the given engine seat."""
+        p = self.game_state.players[eng_idx]
+        seat_idx = self.seat_map[eng_idx]
+        seat_info = self.seats[seat_idx]
+        num_engine_players = len(self.seat_map)
+        active_uids = [self.seats[s].uid for s in self.seat_map]
+
         hole = torch.tensor([list(p.hole_cards)], dtype=torch.long)
         board = list(self.game_state.board)
         while len(board) < 5: board.append(-1)
@@ -166,8 +344,8 @@ class GameManager:
         pot = self.game_state.pot / 100.0
         own_stack = p.stack / 100.0
         own_bet = p.bet_this_street / 100.0
-        rel_pos = (pid - self.game_state.dealer_button) % num_players
-        position = rel_pos / max(num_players - 1, 1)
+        rel_pos = (eng_idx - self.game_state.dealer_button) % num_engine_players
+        position = rel_pos / max(num_engine_players - 1, 1)
 
         street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
         street_val = street_map.get(self.game_state.street, 0) / 3.0
@@ -178,7 +356,7 @@ class GameManager:
 
         numeric = torch.tensor([[
             pot, own_stack, own_bet, position, street_val,
-            num_players / 9.0, num_active / 9.0,
+            num_engine_players / 9.0, num_active / 9.0,
             current_bet, min_raise,
         ]], dtype=torch.float32)
 
@@ -190,10 +368,10 @@ class GameManager:
             elif at == ActionType.CALL: mask[0, ActionIndex.CALL] = True
             elif at in (ActionType.RAISE, ActionType.ALL_IN): mask[0, ActionIndex.RAISE] = True
 
-        opp_embed = self._get_all_opponent_embeddings(pid, num_players)
-        opp_stats = self._get_opponent_stats(pid, num_players)
-        own_stats = self.stat_tracker.get_stats(pid).unsqueeze(0)
-        
+        opp_embed = self._get_all_opponent_embeddings(seat_info.uid, active_uids)
+        opp_stats = self._get_opponent_stats(seat_info.uid, active_uids)
+        own_stats = self.stat_tracker.get_stats(seat_info.uid).unsqueeze(0)
+
         from model.action_space import get_sizing_mask
         sizing_mask = get_sizing_mask(self.game_state).unsqueeze(0)
 
@@ -207,11 +385,10 @@ class GameManager:
         sizing_probs = torch.softmax(sizing_logits, dim=-1).tolist()
         ev = out.value[0, 0].item()
 
-        # Apply personality if it is a bot (for accurate visualization of what the bot will actually do)
-        personality = self.personalities[pid]
-        if personality is not None:
+        # Apply personality for bots
+        if seat_info.personality is not None:
             situations = detect_situations(street=street_map.get(self.game_state.street, 0))
-            probs_tensor = personality.apply(torch.tensor(probs), situations, hand_strength=0.5)
+            probs_tensor = seat_info.personality.apply(torch.tensor(probs), situations, hand_strength=0.5)
             probs = probs_tensor.tolist()
 
         return {
@@ -223,59 +400,66 @@ class GameManager:
 
     def process_action(self, action: Action):
         """Applies an action to the dealer and updates tracking."""
-        pid = self.game_state.current_player_idx
-        p = self.game_state.players[pid]
-        
+        eng_idx = self.game_state.current_player_idx
+        seat_idx = self.seat_map[eng_idx]
+        seat_info = self.seats[seat_idx]
+        p = self.game_state.players[eng_idx]
+
         street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
         street_integer = street_map.get(self.game_state.street, 0)
 
         self.dealer.apply_action(action)
 
-        # Record History
+        # Record History (keyed by uid)
         pot_base = self.game_state.pot
         bet_frac = action.amount / max(pot_base, 1.0) if action.amount > 0 else 0.0
-        self._record_action(pid, self._action_to_type_idx(action), bet_frac, pot_base, p.stack, street_integer)
-        
-        if action.action_type in (ActionType.CALL, ActionType.RAISE, ActionType.ALL_IN):
-            self.hand_records[pid].vpip = True
-        if action.action_type in (ActionType.RAISE, ActionType.ALL_IN):
-            self.hand_records[pid].pfr = True
+        self._record_action(seat_info.uid, self._action_to_type_idx(action), bet_frac, pot_base, p.stack, street_integer)
 
-        # Take Snapshot
+        if action.action_type in (ActionType.CALL, ActionType.RAISE, ActionType.ALL_IN):
+            self.hand_records[eng_idx].vpip = True
+        if action.action_type in (ActionType.RAISE, ActionType.ALL_IN):
+            self.hand_records[eng_idx].pfr = True
+
         self._take_snapshot(action)
 
-        # End of Hand
+        # End of Hand — sync stacks back to seats
         terminal = self.dealer.is_hand_over()
         if terminal:
             results = self.dealer.get_results()
-            for i in range(len(self.game_state.players)):
-                self.hand_records[i].result = results['profit'][i]
-                self.hand_records[i].went_to_showdown = (
-                    self.game_state.street == Street.SHOWDOWN and not self.game_state.players[i].is_folded
+            for eng_i in range(len(self.game_state.players)):
+                self.hand_records[eng_i].result = results['profit'][eng_i]
+                self.hand_records[eng_i].went_to_showdown = (
+                    self.game_state.street == Street.SHOWDOWN and not self.game_state.players[eng_i].is_folded
                 )
-                self.stat_tracker.record_hand(i, self.hand_records[i])
+                si = self.seats[self.seat_map[eng_i]]
+                self.stat_tracker.record_hand(si.uid, self.hand_records[eng_i])
+                # Update persistent stack
+                si.stack = self.game_state.players[eng_i].stack
 
     def step_ai(self) -> bool:
-        """Executes the next AI action if it's not the human's turn. Returns True if an action was taken."""
+        """Executes the next AI action if it's not the human's turn."""
         terminal = self.dealer.is_hand_over()
         if terminal:
             return False
-            
-        pid = self.game_state.current_player_idx
-        if pid == self.human_seat:
+
+        eng_idx = self.game_state.current_player_idx
+        seat_idx = self.seat_map[eng_idx]
+
+        if seat_idx == self.human_seat:
             return False
 
-        # Get the God Mode evaluation we already calculated for this seat in the snapshot
-        god_mode = self.timeline[-1].god_mode[pid]
+        god_mode = self.timeline[-1].god_mode.get(eng_idx)
+        if god_mode is None:
+            return False
+        
         probs = god_mode['probs']
         sizing_probs = god_mode['sizing']
         legal_types = self.game_state.get_legal_actions()
-        
-        # Sample action
+
         from torch.distributions import Categorical
         dist = Categorical(torch.tensor(probs))
         a_idx = dist.sample().item()
-        
+
         sizing_idx = 0
         if a_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
             s_dist = Categorical(torch.tensor(sizing_probs))
@@ -305,3 +489,44 @@ class GameManager:
 
         self.process_action(act)
         return True
+
+    def get_table_info(self) -> List[Dict[str, Any]]:
+        """Returns info about all 9 seats for the frontend."""
+        result = []
+        for i, s in enumerate(self.seats):
+            result.append({
+                'seat_idx': i,
+                'occupied': s.occupied,
+                'name': s.name,
+                'personality': s.personality_name,
+                'stack': s.stack,
+                'is_human': s.is_human,
+            })
+        return result
+
+    def buy_in(self) -> float:
+        """Top up the hero's stack to 100bb. Returns the amount added."""
+        s = self.seats[self.human_seat]
+        if s.stack >= 100.0:
+            return 0.0
+        added = 100.0 - s.stack
+        s.stack = 100.0
+        self.total_buyin += added
+        return added
+
+    def reset_session(self):
+        """Full reset — clear all players, stats, and start fresh."""
+        self.rng = random.Random()  # Reseed for new players
+        self.seats = [SeatInfo() for _ in range(self.MAX_SEATS)]
+        self._next_uid = 1
+        self.hand_count = 0
+        self.dealer_button_seat = 0
+        self.total_buyin = 100.0
+        self.stat_tracker = StatTracker()
+        self.action_histories = {}
+        self.seat_map = []
+        self.engine_map = {}
+        self.timeline = []
+        self.dealer = None
+        self.game_state = None
+        self._seat_human()

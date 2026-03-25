@@ -81,11 +81,17 @@ function App() {
   const stepTimeoutRef = useRef(null)
   const isSteppingRef = useRef(false)
 
+  const timelineIdxRef = useRef(timelineIdx)
+  const totalStepsRef = useRef(totalSteps)
+  useEffect(() => { timelineIdxRef.current = timelineIdx }, [timelineIdx])
+  useEffect(() => { totalStepsRef.current = totalSteps }, [totalSteps])
+
   const stepAI = async () => {
-    if (timelineIdx < totalSteps - 1) return
+    if (timelineIdxRef.current < totalStepsRef.current - 1) return
     if (!gameState || gameState.is_terminal) return
-    const cp = gameState.current_player
-    if (cp == null || !gameState.players[cp] || gameState.players[cp].personality === 'Human') return
+    const currentSeat = gameState.current_player
+    const currentPlayer = gameState.players.find(p => p.id === currentSeat)
+    if (!currentPlayer || currentPlayer.is_human) return
     if (isSteppingRef.current) return
     
     isSteppingRef.current = true
@@ -144,15 +150,18 @@ function App() {
         fetchTimeline(timelineIdx - 1)
       } else if (e.key === 'ArrowRight') {
         fetchTimeline(timelineIdx + 1)
+      } else if (e.key === 'Enter' && gameState?.is_terminal) {
+        startHand()
       }
     }
     
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [timelineIdx, totalSteps])
+  }, [timelineIdx, totalSteps, gameState])
 
   const submitAction = async (type, amount = 0) => {
-    if (!gameState || gameState.is_terminal || gameState.current_player !== 0) return
+    const heroPlayer = gameState?.players?.find(p => p.is_human)
+    if (!gameState || gameState.is_terminal || !heroPlayer || gameState.current_player !== heroPlayer.id) return
     if (timelineIdx < totalSteps - 1) {
       alert("You are viewing the past. Click 'Return to Live Action' to play.")
       return
@@ -179,8 +188,54 @@ function App() {
       {/* Left Sidebar */}
       <div className="sidebar glass-panel">
         <h2>Poker AI</h2>
+        {gameState && (
+          <div style={{fontSize: '12px', color: '#8b949e', marginBottom: '12px'}}>
+            Hand #{gameState.hand_count || 0} &middot; {gameState.players.filter(p => p.occupied).length} players
+          </div>
+        )}
         <button className="btn primary block" onClick={startHand}>Start New Hand</button>
+
+        {gameState && (
+          <div style={{background: 'rgba(0,0,0,0.4)', padding: '12px', borderRadius: '10px', marginTop: '12px', border: '1px solid rgba(255,255,255,0.05)'}}>
+            <div style={{fontSize: '11px', color: '#8b949e', textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '8px', fontWeight: 600}}>Session P&L</div>
+            <div style={{display: 'flex', justifyContent: 'space-between', fontSize: '12px', marginBottom: '4px'}}>
+              <span style={{color: '#8b949e'}}>Total Buy-in</span>
+              <span style={{color: '#f85149', fontWeight: 700}}>{(gameState.total_buyin || 100).toFixed(1)} bb</span>
+            </div>
+            <div style={{display: 'flex', justifyContent: 'space-between', fontSize: '12px', marginBottom: '4px'}}>
+              <span style={{color: '#8b949e'}}>Stack</span>
+              <span style={{color: '#58a6ff', fontWeight: 700}}>{(gameState.hero_stack || 0).toFixed(1)} bb</span>
+            </div>
+            <div style={{display: 'flex', justifyContent: 'space-between', fontSize: '13px', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '6px', marginTop: '6px'}}>
+              <span style={{color: '#fff', fontWeight: 700}}>Net P&L</span>
+              {(() => {
+                const pnl = (gameState.hero_stack || 0) - (gameState.total_buyin || 100)
+                return <span style={{color: pnl >= 0 ? '#2ea043' : '#f85149', fontWeight: 800}}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(1)} bb</span>
+              })()}
+            </div>
+            {gameState.is_terminal && (gameState.hero_stack || 0) < 100 && (
+              <button className="btn secondary block" style={{marginTop: '10px', fontSize: '12px'}} onClick={async () => {
+                await apiGet('/buyin')
+                await refreshState()
+                log('[Hero] bought in for 100bb')
+              }}>
+                Top Up to 100bb
+              </button>
+            )}
+          </div>
+        )}
         
+        <button className="btn text" style={{marginTop: '8px', fontSize: '11px', width: '100%', color: '#8b949e'}} onClick={async () => {
+          await apiGet('/reset')
+          setGameState(null)
+          setGameLog([])
+          setTimelineIdx(0)
+          setTotalSteps(0)
+          log('--- Session Reset ---')
+          await startHand()
+        }}>
+          Reset Session
+        </button>
         <TimelineScrubber 
           currentIndex={timelineIdx} 
           totalSteps={totalSteps}
