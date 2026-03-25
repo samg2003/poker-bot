@@ -3,8 +3,8 @@
 
 read -p "Path to PEM file: " PEM_PATH
 read -p "EC2 IP address: " IP_ADDR
-read -p "Username (default: ec2-user): " USERNAME
-USERNAME=${USERNAME:-ec2-user}
+read -p "Username (default: ubuntu): " USERNAME
+USERNAME=${USERNAME:-ubuntu}
 
 # Strip surrounding quotes if user added them
 PEM_PATH=$(echo "$PEM_PATH" | tr -d "'" | tr -d '"')
