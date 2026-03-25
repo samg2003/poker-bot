@@ -61,6 +61,7 @@ class Experience(NamedTuple):
     reward: float                     # final reward (set after hand ends)
     hand_id: int = 0                  # groups decisions into per-hand trajectories
     step_idx: int = 0                 # position within trajectory
+    hero_stack_bb: float = 0.0        # hero's starting stack in bb (for deep all-in tracking)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -229,18 +230,19 @@ class NLHESelfPlayTrainer:
         Save current live weights to opponent pool and load a random
         pool member into the frozen policy. Called every frozen_update_interval epochs.
         """
-        # Save current live weights
-        self.opponent_pool.append(copy.deepcopy(self.policy.state_dict()))
+        # Save current live weights (move to CPU to avoid MPS memory buildup)
+        cpu_state = {k: v.cpu() for k, v in self.policy.state_dict().items()}
+        self.opponent_pool.append(cpu_state)
         if len(self.opponent_pool) > self.config.max_opponent_pool_size:
             self.opponent_pool.pop(0)
 
-        # Load random pool member into frozen policy
+        # Load random pool member into frozen policy (already on CPU)
         snapshot = self.rng.choice(self.opponent_pool)
         self.frozen_policy.load_state_dict(snapshot)
 
-        # Also sync opponent encoder
-        frozen_enc_state = copy.deepcopy(self.opponent_encoder.state_dict())
-        self.frozen_opponent_encoder.load_state_dict(frozen_enc_state)
+        # Also sync opponent encoder (move to CPU)
+        cpu_enc_state = {k: v.cpu() for k, v in self.opponent_encoder.state_dict().items()}
+        self.frozen_opponent_encoder.load_state_dict(cpu_enc_state)
 
     def _get_exploration_floor(self) -> float:
         """Get the annealed exploration floor for the current epoch."""
@@ -406,9 +408,9 @@ class NLHESelfPlayTrainer:
     def _get_personality_gto_fraction(self) -> float:
         """Graduated personality curriculum schedule."""
         epoch = self.current_epoch
-        if epoch < 80:
-            return 1.0  # 100% GTO until epoch 80
-        return 0.8      # 80% GTO / 20% Personalities after epoch 80
+        if epoch < 20:
+            return 1.0  # 100% GTO until epoch 20
+        return 0.6      # 60% GTO / 40% Personalities after epoch 20
 
     def _maybe_reset_histories(self):
         """Periodically reset opponent histories and personalities (simulate new table)."""
@@ -553,8 +555,7 @@ class NLHESelfPlayTrainer:
         num_p, stacks = self._sample_table()
         self._opp_embed_cache = {}  # Clear cache for new hand
 
-        # Effective stack for reward normalization
-        effective_stack = min(stacks[0], max(stacks[1:])) if num_p > 1 else stacks[0]
+        # No effective stack normalization — reward in bb/100 units
 
         # Unique hand ID for GAE grouping
         hand_id = self._hand_counter
@@ -672,13 +673,15 @@ class NLHESelfPlayTrainer:
                     sizing_tensor = torch.tensor(sizing_probs, dtype=torch.float32)
                     raw_sizing = sizing_tensor.clone()
 
-                    # Apply floor to 3 representative sizing buckets
+                    # Apply floor to 3 representative sizing buckets (exclude all-in)
                     sizing_mask_1d = encoded['sizing_mask'].squeeze(0).cpu()  # (10,)
-                    legal = [i for i, m in enumerate(sizing_mask_1d) if m]
-                    if len(legal) >= 3:
-                        explore = [legal[0], legal[len(legal)//2], legal[-1]]
+                    allin_bucket = len(sizing_probs) - 1
+                    legal_non_allin = [i for i, m in enumerate(sizing_mask_1d) if m and i != allin_bucket]
+                    if len(legal_non_allin) >= 4:
+                        n = len(legal_non_allin)
+                        explore = [legal_non_allin[0], legal_non_allin[n//3], legal_non_allin[2*n//3], legal_non_allin[-1]]
                     else:
-                        explore = legal
+                        explore = legal_non_allin
                     for idx in explore:
                         sizing_tensor[idx] = max(sizing_tensor[idx].item(), floor)
                     sizing_tensor = sizing_tensor / sizing_tensor.sum()
@@ -812,8 +815,8 @@ class NLHESelfPlayTrainer:
 
         self._maybe_reset_histories()
 
-        # ── Hero-only experience conversion with effective stack normalization ──
-        hero_reward = profits[0] / max(effective_stack, 1e-6)
+        # ── Hero-only experience: reward in bb/100 ──
+        hero_reward = profits[0] / 100.0
 
         hero_exp_list = []
         for exp_dict in hero_experiences:
@@ -833,6 +836,7 @@ class NLHESelfPlayTrainer:
                 reward=hero_reward,  # same reward for all steps — GAE distributes credit
                 hand_id=hand_id,
                 step_idx=exp_dict['step_idx'],
+                hero_stack_bb=stacks[0] / self.config.big_blind,
             ))
 
         # Return as [[hero_exps]] with empty lists for opponents (backward compat)
@@ -981,6 +985,49 @@ class NLHESelfPlayTrainer:
 
         return all_exp, total_reward
 
+    def _count_action_distribution(self, experiences: List[Experience]) -> Dict[str, float]:
+        """Compute action choice rates WHEN each action was legal (conditional %)."""
+        from model.action_space import POT_FRACTIONS
+        allin_idx = len(POT_FRACTIONS) - 1
+
+        # chosen[action] = times chosen, legal[action] = times it was legal
+        chosen = {'fold': 0, 'check': 0, 'call': 0, 'raise': 0, 'allin': 0}
+        legal = {'fold': 0, 'check': 0, 'call': 0, 'raise': 0, 'allin': 0}
+        deep_allin_count = 0
+
+        for e in experiences:
+            mask = e.action_mask.squeeze(0)  # (4,)
+            if mask[ActionIndex.FOLD]:
+                legal['fold'] += 1
+            if mask[ActionIndex.CHECK]:
+                legal['check'] += 1
+            if mask[ActionIndex.CALL]:
+                legal['call'] += 1
+            if mask[ActionIndex.RAISE]:
+                legal['raise'] += 1
+                legal['allin'] += 1  # all-in is a subset of raise legality
+
+            if e.action_idx == ActionIndex.FOLD:
+                chosen['fold'] += 1
+            elif e.action_idx == ActionIndex.CHECK:
+                chosen['check'] += 1
+            elif e.action_idx == ActionIndex.CALL:
+                chosen['call'] += 1
+            elif e.action_idx == ActionIndex.RAISE:
+                if e.sizing_idx == allin_idx:
+                    chosen['allin'] += 1
+                    if e.hero_stack_bb > 50:
+                        deep_allin_count += 1
+                else:
+                    chosen['raise'] += 1
+
+        # Return conditional % (chosen / legal) + deep all-in %
+        rates = {}
+        for k in chosen:
+            rates[k] = (chosen[k] / legal[k] * 100) if legal[k] > 0 else 0.0
+        rates['deep_ai'] = (deep_allin_count / max(chosen['allin'], 1)) * 100
+        return rates
+
     # ─────────────────────────────────────────────────────────
     # PPO loss
     # ─────────────────────────────────────────────────────────
@@ -1062,9 +1109,8 @@ class NLHESelfPlayTrainer:
                 gae_advantages[global_idx] = advantages[local_idx]
                 gae_returns[global_idx] = returns[local_idx]
 
-        # Normalize advantages
-        if len(gae_advantages) > 1:
-            gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
+        # No advantage normalization — V(s) already serves as the adaptive baseline.
+        # Gradient clipping at 1.0 prevents explosions.
 
         # 4. Batched forward pass
         output = self.policy(
@@ -1105,7 +1151,7 @@ class NLHESelfPlayTrainer:
         
         # Value head trained on GAE returns (not flat terminal reward)
         value_pred = output.value.squeeze(-1)
-        value_loss = ((value_pred - gae_returns) ** 2).mean()
+        value_loss = torch.nn.functional.smooth_l1_loss(value_pred, gae_returns)
         
         # Use annealed entropy coefficient
         entropy_coef = self._get_entropy_coef()
@@ -1123,12 +1169,13 @@ class NLHESelfPlayTrainer:
     # Training loop
     # ─────────────────────────────────────────────────────────
 
-    def train(self, num_epochs: int = 100, epoch_callback=None) -> Dict[str, List[float]]:
+    def train(self, num_epochs: int = 100, epoch_callback=None, start_epoch: int = 0) -> Dict[str, List[float]]:
         """Run balanced self-play training with batched GPU inference.
         
         Args:
             num_epochs: Number of epochs to train.
             epoch_callback: Optional function(trainer, epoch, metrics) called after each epoch.
+            start_epoch: Epoch to start from (for resumed training).
         """
         self.total_epochs = num_epochs  # for annealing schedules
 
@@ -1142,8 +1189,10 @@ class NLHESelfPlayTrainer:
         print(f"GAE: gamma={self.config.gamma}, lambda={self.config.gae_lambda}")
         print(f"Entropy: {self.config.entropy_coef} -> {self.config.entropy_coef_end}")
         print(f"Exploration floor: {self.config.exploration_floor} -> {self.config.exploration_floor_end}")
+        if start_epoch > 0:
+            print(f"Resuming from epoch {start_epoch}")
 
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             self.current_epoch = epoch + 1
             epoch_start = time.time()
 
@@ -1157,6 +1206,9 @@ class NLHESelfPlayTrainer:
             all_exp, total_reward = self._run_batched_epoch()
 
             avg_reward = (total_reward / self.config.hands_per_epoch) * 100.0
+
+            # Action distribution (conditional: % chosen when legal)
+            action_pcts = self._count_action_distribution(all_exp)
 
             # PPO update (fully batched on GPU)
             total_loss = 0.0
@@ -1184,10 +1236,13 @@ class NLHESelfPlayTrainer:
             hands_per_sec = self.config.hands_per_epoch / epoch_duration
 
             if self.config.verbose or (epoch + 1) % self.config.log_interval == 0:
+                deep_ai = action_pcts.get('deep_ai', 0)
                 print(
                     f"Epoch {epoch + 1:4d} ({epoch_duration:.1f}s, {hands_per_sec:.1f} hands/s) | "
                     f"Reward: {avg_reward:+.3f} bb | "
-                    f"Loss: {avg_loss:.4f}"
+                    f"Loss: {avg_loss:.4f} | "
+                    f"F/Ch/Ca/R/AI: {action_pcts['fold']:.0f}/{action_pcts['check']:.0f}/{action_pcts['call']:.0f}/{action_pcts['raise']:.0f}/{action_pcts['allin']:.0f}% "
+                    f"DAI:{deep_ai:.0f}%"
                 )
 
             if epoch_callback:

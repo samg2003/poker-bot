@@ -157,6 +157,23 @@ def train_nlhe(args):
 
     checkpoint_mgr = CheckpointManager(args.checkpoint_dir)
 
+    # Resume from checkpoint if requested
+    start_epoch = 0
+    if args.resume:
+        tag = args.resume
+        try:
+            meta = checkpoint_mgr.load(
+                trainer.policy, trainer.opponent_encoder,
+                trainer.optimizer, tag=tag,
+                device=str(trainer.device),
+            )
+            start_epoch = meta.epoch
+            # Re-sync frozen policy with loaded weights
+            trainer._sync_frozen()
+            print(f"\n✓ Resumed from checkpoint '{tag}' (epoch {start_epoch}, reward={meta.avg_reward:+.3f})")
+        except FileNotFoundError:
+            print(f"\n✗ Checkpoint '{tag}' not found, training from scratch")
+
     def _make_metadata(epoch, metrics):
         avg_reward = metrics['epoch_reward'][-1] if metrics['epoch_reward'] else 0.0
         avg_loss = metrics['epoch_loss'][-1] if metrics['epoch_loss'] else 0.0
@@ -183,7 +200,7 @@ def train_nlhe(args):
             checkpoint_mgr.save(trainer.policy, trainer.opponent_encoder, trainer.optimizer, meta)
             print(f"    ✓ Checkpoint saved at epoch {epoch}")
 
-    metrics = trainer.train(num_epochs=args.epochs, epoch_callback=_on_epoch)
+    metrics = trainer.train(num_epochs=args.epochs, epoch_callback=_on_epoch, start_epoch=start_epoch)
 
     # Final save
     meta = _make_metadata(args.epochs, metrics)

@@ -46,7 +46,7 @@ code-poker-bot/
 ├── training/               # Training system
 │   ├── cfr.py              # ✅ CFR solver (validated on Kuhn Poker)
 │   ├── self_play_trainer.py # ✅ PPO self-play on Leduc Hold'em
-│   ├── nlhe_trainer.py     # ✅ Full NLHE self-play (batched GPU inference, opponent tracking)
+│   ├── nlhe_trainer.py     # ✅ Balanced self-play (hero-only, frozen opponents, GAE, exploration floor)
 │   ├── personality.py      # ✅ Continuous personality perturbations + tilt
 │   └── curriculum.py       # ✅ Multi-stage curriculum trainer
 ├── agent/                  # Agent interface
@@ -57,7 +57,7 @@ code-poker-bot/
 ├── deployment/             # Production deployment
 │   ├── checkpoint.py       # ✅ Model save/load/versioning
 │   └── inference.py        # ✅ Optimized inference + benchmarking
-├── tests/                  # Test suite (185 tests)
+├── tests/                  # Test suite (197 tests)
 │   ├── test_engine.py
 │   ├── test_kuhn.py
 │   ├── test_model.py
@@ -85,7 +85,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Run tests (185 tests)
+# Run tests (197 tests)
 python3 -m pytest tests/ -v
 ```
 
@@ -115,9 +115,14 @@ python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 
 # Full config for GPU instance (e.g., g5.xlarge with CUDA)
 python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 4 --hands 2048 --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --device cuda --verbose --save-interval 50
 
-python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 4 --hands 2048 --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --verbose --save-interval 50
+# Resume training from last checkpoint
+python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 4 --hands 500 --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --verbose --save-interval 20 --resume latest
+```
 
-python3 scripts/train.py --game nlhe --embed-dim 512 --num-layers 8 --num-heads 8 --hands 3000 --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --verbose --save-interval 50 --batch-chunk-size 2000
+### Training Output
+Each epoch logs reward, loss, and action distribution:
+```
+Epoch   5 (21.7s, 23.0 hands/s) | Reward: +7.681 bb | Loss: 0.8669 | F/Ch/Ca/R/AI: 12/8/35/38/7%
 ```
 
 ### Full CLI Options
@@ -192,11 +197,14 @@ The agent uses a **dual-signal** system:
 - **Explicit HUD stats** — ~30 interpretable features (VPIP, PFR, fold-to-cbet, etc.)
 
 ### Training Pipeline
-1. **Self-play** — model copies play each other → converge toward GTO
-2. **Opponent tracking** — action history + HUD stats feed real embeddings during training
-3. **Perturbation** — personality modifiers create diverse opponents
-4. **Expert iteration** — optional search-guided training refines the policy
-5. **History reset** — periodic reset (300-500 hands) ensures model handles unknown opponents
+1. **Balanced self-play** — hero trains against a pool of frozen past versions (breaks self-reinforcement loops)
+2. **Hero-only training** — only hero's experiences used for PPO updates (no zero-sum gradient cancellation)
+3. **Per-hand GAE** — Generalized Advantage Estimation (γ=0.99, λ=0.95) for accurate credit assignment
+4. **Effective stack normalization** — rewards normalized by `profit / min(hero, max(opponents))`
+5. **Exploration floor** — annealed probability floor (0.05→0.01) on action types and sizing prevents local minima
+6. **Perturbation** — personality modifiers create diverse opponents (applied to frozen policy only)
+7. **Expert iteration** — optional search-guided training refines the policy
+8. **History reset** — periodic reset (300-500 hands) ensures model handles unknown opponents
 
 ### Action Space (Hierarchical Discrete)
 - **Action type**: `[fold, check, call, raise]` — 4-way discrete classification head.

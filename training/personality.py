@@ -380,14 +380,18 @@ def sample_table_personalities(
             # GTO player (no modification)
             personalities.append(SituationalPersonality())
         else:
-            # Sample a pure archetype to provide clean learning signal
+            # Sample archetype — weight nit/TAG higher to punish over-aggression
             archetypes = [
+                PersonalityModifier.nit,             # 3x weight
                 PersonalityModifier.nit,
+                PersonalityModifier.nit,
+                PersonalityModifier.tag,             # 3x weight
                 PersonalityModifier.tag,
-                PersonalityModifier.lag,
-                PersonalityModifier.maniac,
-                PersonalityModifier.calling_station,
-                PersonalityModifier.fish,
+                PersonalityModifier.tag,
+                PersonalityModifier.lag,             # 1x weight
+                PersonalityModifier.maniac,          # 1x weight
+                PersonalityModifier.calling_station,  # 1x weight
+                PersonalityModifier.fish,            # 1x weight
             ]
             base = rng.choice(archetypes)()
             personalities.append(SituationalPersonality(base=base))
