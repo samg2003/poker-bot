@@ -36,6 +36,7 @@ wandb/
 # Node / Vite (Poker UI Frontend)
 poker_ui/frontend/node_modules/
 poker_ui/frontend/dist/
+poker_ui/frontend/.vite/
 node_modules/
 dist/
 dist-ssr/
