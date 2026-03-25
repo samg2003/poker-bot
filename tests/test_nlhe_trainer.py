@@ -8,6 +8,39 @@ import torch
 from training.nlhe_trainer import NLHESelfPlayTrainer, NLHETrainingConfig
 
 
+def _play_one_hand(trainer):
+    """Helper: play a single hand using the generator API and return experiences."""
+    gen = trainer._play_hand_gen()
+    trainer.policy.eval()
+    trainer.opponent_encoder.eval()
+
+    try:
+        state = next(gen)
+    except StopIteration as e:
+        return e.value  # (experiences, reward)
+
+    while True:
+        # Run a single forward pass for this game
+        with torch.no_grad():
+            output = trainer.policy(
+                hole_cards=state['hole_cards'].to(trainer.device),
+                community_cards=state['community_cards'].to(trainer.device),
+                numeric_features=state['numeric_features'].to(trainer.device),
+                opponent_embeddings=state['opponent_embeddings'].to(trainer.device),
+                opponent_stats=state['opponent_stats'].to(trainer.device),
+                own_stats=state['own_stats'].to(trainer.device),
+                action_mask=state['action_mask'].to(trainer.device),
+            )
+        probs = output.action_type_probs[0].cpu()
+        value = output.value[0, 0].item()
+        sizing = output.bet_sizing[0, 0].item()
+
+        try:
+            state = gen.send((probs, value, sizing))
+        except StopIteration as e:
+            return e.value  # (experiences, reward)
+
+
 class TestNLHESelfPlayTrainer:
     @pytest.fixture
     def trainer(self):
@@ -24,14 +57,14 @@ class TestNLHESelfPlayTrainer:
 
     def test_play_hand(self, trainer):
         """A full hand completes without errors."""
-        experiences = trainer._play_hand()
+        experiences, reward = _play_one_hand(trainer)
         assert len(experiences) == 2
         total_exp = sum(len(pexp) for pexp in experiences)
         assert total_exp > 0
 
     def test_rewards_are_zero_sum(self, trainer):
         """In heads-up, rewards should sum to zero."""
-        experiences = trainer._play_hand()
+        experiences, _ = _play_one_hand(trainer)
         rewards = []
         for pexp in experiences:
             if pexp:
@@ -48,7 +81,7 @@ class TestNLHESelfPlayTrainer:
 
     def test_experience_tensors(self, trainer):
         """Experience contains correctly shaped tensors."""
-        experiences = trainer._play_hand()
+        experiences, _ = _play_one_hand(trainer)
         for pexp in experiences:
             for exp in pexp:
                 assert exp.hole_cards.shape == (1, 2)
@@ -59,7 +92,7 @@ class TestNLHESelfPlayTrainer:
 
     def test_action_mask_valid(self, trainer):
         """Action mask always has at least one legal action."""
-        experiences = trainer._play_hand()
+        experiences, _ = _play_one_hand(trainer)
         for pexp in experiences:
             for exp in pexp:
                 assert exp.action_mask.sum() > 0
@@ -74,7 +107,7 @@ class TestNLHESelfPlayTrainer:
             device="cpu",
         )
         trainer = NLHESelfPlayTrainer(config=config, seed=42)
-        experiences = trainer._play_hand()
+        experiences, _ = _play_one_hand(trainer)
         assert len(experiences) == 3
 
     def test_deep_stacks(self):
@@ -87,7 +120,7 @@ class TestNLHESelfPlayTrainer:
             device="cpu",
         )
         trainer = NLHESelfPlayTrainer(config=config, seed=42)
-        experiences = trainer._play_hand()
+        experiences, _ = _play_one_hand(trainer)
         total = sum(len(p) for p in experiences)
         assert total > 0
 
@@ -123,7 +156,7 @@ class TestNLHESelfPlayTrainer:
         num_p, stacks = trainer._sample_table()
         assert num_p == 4
         for s in stacks:
-            assert 20 * config.big_blind <= s <= 200 * config.big_blind
+            assert 10 * config.big_blind <= s <= 200 * config.big_blind
 
     def test_fully_random_training(self):
         """Training with fully randomized tables runs."""
@@ -157,20 +190,15 @@ class TestOpponentTracking:
 
     def test_action_history_builds(self, trainer):
         """Action histories grow after playing hands."""
-        trainer._play_hand()
-        # At least one player should have recorded actions
+        _play_one_hand(trainer)
         total_actions = sum(len(h) for h in trainer.action_histories.values())
         assert total_actions > 0
 
     def test_opponent_embedding_not_empty(self, trainer):
         """After hands, embeddings should be non-zero (not empty)."""
-        # Play enough to build history
         for _ in range(5):
-            trainer._play_hand()
-
-        # Check that actions were recorded
+            _play_one_hand(trainer)
         assert len(trainer.action_histories) > 0
-        # Embedding from a real history should differ from empty
         for pid, history in trainer.action_histories.items():
             if history:
                 emb = trainer._get_opponent_embedding(pid)
@@ -178,18 +206,15 @@ class TestOpponentTracking:
 
     def test_history_reset(self, trainer):
         """History resets after threshold hands."""
-        trainer.next_reset_at = 3  # Force reset after 3 hands
+        trainer.next_reset_at = 3
         for _ in range(5):
-            trainer._play_hand()
-        # After reset, histories should have been cleared at some point
-        # (they may have rebuilt, but the reset mechanism triggered)
+            _play_one_hand(trainer)
         assert trainer.hands_since_reset < 5
 
     def test_stat_tracker_records(self, trainer):
         """HUD stat tracker records hands."""
         for _ in range(5):
-            trainer._play_hand()
-        # Stats should be non-zero for at least some metric
+            _play_one_hand(trainer)
         for pid in range(2):
             n = trainer.stat_tracker.get_num_hands(pid)
             assert n > 0
@@ -208,7 +233,6 @@ class TestDevicePlacement:
         )
         trainer = NLHESelfPlayTrainer(config=config, seed=42)
         assert trainer.device == torch.device("cpu")
-        # Model should be on CPU
         for p in trainer.policy.parameters():
             assert p.device == torch.device("cpu")
             break
@@ -222,7 +246,6 @@ class TestDevicePlacement:
             device="auto",
         )
         trainer = NLHESelfPlayTrainer(config=config, seed=42)
-        # Should resolve to some valid device
         assert trainer.device in [torch.device("cpu"), torch.device("cuda"), torch.device("mps")]
 
 

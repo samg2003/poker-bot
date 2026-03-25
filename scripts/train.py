@@ -170,6 +170,12 @@ def train_nlhe(args):
         avg_reward=avg_reward,
         loss=avg_loss,
         test_count=175,
+        config={
+            'embed_dim': args.embed_dim,
+            'num_heads': args.num_heads,
+            'num_layers': args.num_layers,
+            'game': 'nlhe',
+        },
     )
     checkpoint_mgr.save(trainer.policy, trainer.opponent_encoder, trainer.optimizer, metadata)
     checkpoint_mgr.save_best(trainer.policy, trainer.opponent_encoder, trainer.optimizer, metadata)

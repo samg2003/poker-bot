@@ -46,7 +46,7 @@ code-poker-bot/
 ├── training/               # Training system
 │   ├── cfr.py              # ✅ CFR solver (validated on Kuhn Poker)
 │   ├── self_play_trainer.py # ✅ PPO self-play on Leduc Hold'em
-│   ├── nlhe_trainer.py     # ✅ Full NLHE self-play (opponent tracking, GPU, search)
+│   ├── nlhe_trainer.py     # ✅ Full NLHE self-play (batched GPU inference, opponent tracking)
 │   ├── personality.py      # ✅ Continuous personality perturbations + tilt
 │   └── curriculum.py       # ✅ Multi-stage curriculum trainer
 ├── agent/                  # Agent interface
@@ -70,6 +70,7 @@ code-poker-bot/
 ├── scripts/                # CLI scripts
 │   ├── train.py            # ✅ Training CLI (Leduc + NLHE)
 │   ├── evaluate.py         # ✅ Evaluation CLI + latency benchmark
+│   ├── connect-ec2.sh      # ✅ Interactive SSH connection to EC2
 │   └── aws_setup.sh        # ✅ AWS GPU instance setup
 ├── docs/                   # Architecture Decision Records
 │   └── adr/
@@ -112,7 +113,9 @@ python3 scripts/train.py --game nlhe --epochs 500 --search-fraction 0.1
 python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 100
 
 # Full config for GPU instance (e.g., g5.xlarge with CUDA)
-python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 4 --hands 2048 --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --device cuda --verbose
+python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 4 --hands 2048 --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --device cuda --verbose --save-interval 50
+
+python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 4 --hands 2048 --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --verbose --save-interval 50
 ```
 
 ### Full CLI Options
@@ -134,6 +137,8 @@ python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 
 --threads N             Number of CPU threads to use; 0=all (default: 0)
 --verbose               Enable verbose output with timing and progress updates
 --search-fraction F     Fraction of hands using search (default: 0)
+--save-interval N       Save checkpoint every N epochs (default: 0 = end only)
+--resume TAG            Resume training from checkpoint tag
 --checkpoint-dir DIR    Where to save checkpoints (default: checkpoints/)
 --lr FLOAT              Learning rate (default: 3e-4)
 --seed N                Random seed (default: 42)
@@ -142,10 +147,10 @@ python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 
 ## Evaluation
 
 ```bash
-# Run benchmarks (untrained model)
-python3 scripts/evaluate.py
+# With trained checkpoint — architecture auto-loaded from checkpoint metadata
+python3 scripts/evaluate.py --checkpoint latest
 
-# With trained checkpoint + latency benchmark
+# With latency benchmark
 python3 scripts/evaluate.py --checkpoint best --benchmark-latency
 ```
 

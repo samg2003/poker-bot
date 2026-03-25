@@ -189,17 +189,36 @@ class NLHESelfPlayTrainer:
     # ─────────────────────────────────────────────────────────
 
     def _sample_table(self) -> Tuple[int, List[float]]:
-        """Sample random player count + per-player stacks."""
+        """Sample random player count + per-player stacks with realistic distributions."""
         c = self.config
-        num_p = c.num_players if c.num_players > 0 else self.rng.randint(c.min_players, c.max_players)
 
+        # Player count: 90% common sizes (2, 6, 9), 10% uniform random
+        if c.num_players > 0:
+            num_p = c.num_players
+        elif self.rng.random() < 0.9:
+            num_p = self.rng.choice([2, 6, 9])
+            num_p = max(c.min_players, min(num_p, c.max_players))
+        else:
+            num_p = self.rng.randint(c.min_players, c.max_players)
+
+        # Stack depth: 70% → 100bb, 20% → random in range, 10% → short (10-50bb)
         if c.starting_bb > 0:
             stacks = [c.starting_bb * c.big_blind] * num_p
-        elif c.uniform_stacks:
-            bb = self.rng.randint(c.min_bb, c.max_bb)
-            stacks = [bb * c.big_blind] * num_p
         else:
-            stacks = [self.rng.randint(c.min_bb, c.max_bb) * c.big_blind for _ in range(num_p)]
+            def _sample_bb():
+                roll = self.rng.random()
+                if roll < 0.70:
+                    return 100  # Standard 100BB
+                elif roll < 0.90:
+                    return self.rng.randint(c.min_bb, c.max_bb)
+                else:
+                    return self.rng.randint(max(c.min_bb, 10), min(c.max_bb, 50))
+
+            if c.uniform_stacks:
+                bb = _sample_bb()
+                stacks = [bb * c.big_blind] * num_p
+            else:
+                stacks = [_sample_bb() * c.big_blind for _ in range(num_p)]
 
         return num_p, stacks
 
@@ -388,17 +407,14 @@ class NLHESelfPlayTrainer:
         }
         return mapping.get(action.action_type, ActionIndex.FOLD)
 
-    def _play_hand(self, use_search: bool = False) -> Tuple[List[Experience], ...]:
+    def _play_hand_gen(self) -> Generator[dict, Tuple[torch.Tensor, float, float], Tuple[List[List[Experience]], float]]:
         """
-        Play one full hand of NLHE using self-play.
-
-        Args:
-            use_search: if True, use System 2 search for action selection
-
-        Returns experience lists for each player.
+        Generator version of _play_hand for batched GPU inference.
+        
+        Yields a dict of encoded tensors when needing a policy decision.
+        Receives (probs, value, sizing) via .send().
+        Returns (experiences, reward) via StopIteration.value.
         """
-        self.policy.eval()
-        self.opponent_encoder.eval()
         num_p, stacks = self._sample_table()
 
         dealer = Dealer(
@@ -413,14 +429,13 @@ class NLHESelfPlayTrainer:
         game_state = dealer.start_hand()
         experiences: List[List[dict]] = [[] for _ in range(num_p)]
 
-        # Sample table personalities if not already set (or table size changed)
+        # Sample table personalities
         gto_frac = self._get_personality_gto_fraction()
         if len(self.table_personalities) != num_p:
             self.table_personalities = sample_table_personalities(
                 num_p, gto_fraction=gto_frac, rng=self.rng
             )
 
-        # Build hand records for stat tracking
         hand_records = [HandRecord() for _ in range(num_p)]
 
         while not dealer.is_hand_over():
@@ -430,47 +445,43 @@ class NLHESelfPlayTrainer:
             if not p.is_active:
                 break
 
-            # Encode state
+            # Encode state (on CPU — device placement happens in batch)
             encoded = self._encode_state(game_state, pid)
+            opp_embed = self._get_all_opponent_embeddings(pid, num_p)
+            opp_stats = self._get_opponent_stats(pid, num_p)
+            own_stats = self._to(self.stat_tracker.get_stats(pid).unsqueeze(0))
 
-            # Forward pass
-            with torch.no_grad():
-                # Get REAL opponent embeddings from history
-                opp_embed = self._get_all_opponent_embeddings(pid, num_p)
-                opp_stats = self._get_opponent_stats(pid, num_p)
-                own_stats = self._to(self.stat_tracker.get_stats(pid).unsqueeze(0))
-
-                output = self.policy(
-                    hole_cards=encoded['hole_cards'],
-                    community_cards=encoded['community_cards'],
-                    numeric_features=encoded['numeric_features'],
-                    opponent_embeddings=opp_embed,
-                    opponent_stats=opp_stats,
-                    own_stats=own_stats,
-                    action_mask=encoded['action_mask'],
-                )
-
-            probs = output.action_type_probs[0]
-            value = output.value[0, 0].item()
-            sizing = output.bet_sizing[0, 0].item()
-
-            # Apply personality perturbation for opponent seats
+            # Build personality context for post-processing
+            personality = None
+            situations = []
             if pid < len(self.table_personalities):
                 personality = self.table_personalities[pid]
-                # Detect current game situations for situational overrides
                 street_map_sit = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
                 situations = detect_situations(
                     street=street_map_sit.get(game_state.street, 0),
                     board_cards=list(game_state.board) if game_state.board else None,
                     stack_bb=p.stack / max(game_state.big_blind, 1),
                 )
-                probs = personality.apply(
-                    probs, situations,
-                    hand_strength=0.5,  # unknown during play, use neutral
-                )
+
+            # YIELD — pause game, wait for batched GPU result
+            probs, value, sizing = yield {
+                'hole_cards': encoded['hole_cards'],
+                'community_cards': encoded['community_cards'],
+                'numeric_features': encoded['numeric_features'],
+                'opponent_embeddings': opp_embed,
+                'opponent_stats': opp_stats,
+                'own_stats': own_stats,
+                'action_mask': encoded['action_mask'],
+                # context for post-processing (not sent to GPU)
+                '_personality': personality,
+                '_situations': situations,
+                '_game_id': id(dealer),
+            }
+
+            # Note: personality perturbation is applied by _run_batched_epoch before .send()
 
             # Search-guided action selection (expert iteration)
-            if use_search and self.search_engine is not None:
+            if self.search_engine is not None and self.rng.random() < self.config.search_fraction:
                 street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
                 cur_street = street_map.get(game_state.street, 0)
                 pot_bb = game_state.pot / game_state.big_blind
@@ -499,22 +510,22 @@ class NLHESelfPlayTrainer:
                     # Blend: 70% search, 30% policy (smooth transition)
                     if refined.sum() > 0:
                         refined = refined / refined.sum()
-                        probs = 0.7 * refined + 0.3 * probs
+                        probs = 0.7 * refined + 0.3 * probs.to(self.device) # Ensure probs is on device for blending
 
-            # Sample action
+            # Sample action (probs is on CPU from orchestrator)
             dist = Categorical(probs)
             action_idx = dist.sample().item()
-            log_prob = dist.log_prob(torch.tensor(action_idx, device=self.device)).item()
+            log_prob = dist.log_prob(torch.tensor(action_idx)).item()
 
-            # Store experience
+            # Store experience (detach to prevent double backward in PPO)
             experiences[pid].append({
-                'hole_cards': encoded['hole_cards'],
-                'community_cards': encoded['community_cards'],
-                'numeric_features': encoded['numeric_features'],
-                'opponent_embeddings': opp_embed,
-                'opponent_stats': opp_stats,
-                'own_stats': own_stats,
-                'action_mask': encoded['action_mask'],
+                'hole_cards': encoded['hole_cards'].detach(),
+                'community_cards': encoded['community_cards'].detach(),
+                'numeric_features': encoded['numeric_features'].detach(),
+                'opponent_embeddings': opp_embed.detach(),
+                'opponent_stats': opp_stats.detach(),
+                'own_stats': own_stats.detach(),
+                'action_mask': encoded['action_mask'].detach(),
                 'action_idx': action_idx,
                 'log_prob': log_prob,
                 'value': value,
@@ -524,7 +535,7 @@ class NLHESelfPlayTrainer:
             action = self._decode_action(action_idx, sizing, game_state)
             dealer.apply_action(action)
 
-            # Record action in opponent history for future hands
+            # Record action in opponent history
             pot_for_record = game_state.pot
             bet_frac = action.amount / max(pot_for_record, 1.0) if action.amount > 0 else 0.0
             street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
@@ -537,13 +548,13 @@ class NLHESelfPlayTrainer:
                 street=street_map.get(game_state.street, 0),
             )
 
-            # Track for HUD-style stats
+            # Track HUD stats
             if action.action_type in (ActionType.CALL, ActionType.RAISE, ActionType.ALL_IN):
                 hand_records[pid].vpip = True
             if action.action_type in (ActionType.RAISE, ActionType.ALL_IN):
                 hand_records[pid].pfr = True
 
-        # Record hand results for stat tracker
+        # Record hand results
         results = dealer.get_results()
         profits = results['profit']
         for pid in range(num_p):
@@ -556,11 +567,14 @@ class NLHESelfPlayTrainer:
 
         self._maybe_reset_histories()
 
-        # Convert to Experience with rewards
+        # Convert to Experience objects
         all_experiences = []
+        hero_reward = 0.0
         for pid in range(num_p):
             player_exp = []
             reward = (profits[pid] / self.config.big_blind) / 100.0
+            if pid == 0:
+                hero_reward = reward
             for exp_dict in experiences[pid]:
                 player_exp.append(Experience(
                     hole_cards=exp_dict['hole_cards'],
@@ -577,7 +591,140 @@ class NLHESelfPlayTrainer:
                 ))
             all_experiences.append(player_exp)
 
-        return tuple(all_experiences)
+        return all_experiences, hero_reward
+
+    def _run_batched_epoch(self) -> Tuple[List[Experience], float]:
+        """
+        Run all hands for one epoch with batched GPU inference.
+        
+        Instead of 16,000 individual GPU calls, this batches all pending
+        game decisions into ~40 large GPU forward passes.
+        """
+        self.policy.eval()
+        self.opponent_encoder.eval()
+
+        num_hands = self.config.hands_per_epoch
+        all_exp: List[Experience] = []
+        total_reward = 0.0
+
+        # Start all games as generators
+        games = [self._play_hand_gen() for _ in range(num_hands)]
+        
+        # Prime each generator — advance to first yield
+        pending = {}
+        finished = 0
+        for i, g in enumerate(games):
+            try:
+                state = next(g)
+                pending[i] = (g, state)
+            except StopIteration as e:
+                # Game ended immediately (e.g., everyone folds preflop)
+                exps, reward = e.value
+                for pexp in exps:
+                    all_exp.extend(pexp)
+                total_reward += reward
+                finished += 1
+
+        batch_count = 0
+        while pending:
+            batch_count += 1
+            game_indices = list(pending.keys())
+            states = [pending[i][1] for i in game_indices]
+
+            # ── Pad opponent tensors to same shape for batching ──
+            max_opps = max(s['opponent_embeddings'].shape[1] for s in states)
+            embed_dim = states[0]['opponent_embeddings'].shape[2]
+            stat_dim = states[0]['opponent_stats'].shape[2]
+
+            # Collate into batched tensors
+            batch_hole = torch.cat([s['hole_cards'] for s in states], dim=0)
+            batch_comm = torch.cat([s['community_cards'] for s in states], dim=0)
+            batch_num = torch.cat([s['numeric_features'] for s in states], dim=0)
+            batch_mask = torch.cat([s['action_mask'] for s in states], dim=0)
+            batch_own = torch.cat([s['own_stats'] for s in states], dim=0)
+
+            # Pad opponent embeddings/stats to uniform shape
+            padded_opp_embeds = []
+            padded_opp_stats = []
+            opp_masks = []
+            for s in states:
+                oe = s['opponent_embeddings']  # (1, num_opp, embed_dim)
+                os_t = s['opponent_stats']      # (1, num_opp, stat_dim)
+                n_opp = oe.shape[1]
+                
+                if n_opp < max_opps:
+                    pad_e = torch.zeros(1, max_opps - n_opp, embed_dim, device=oe.device)
+                    oe = torch.cat([oe, pad_e], dim=1)
+                    pad_s = torch.zeros(1, max_opps - n_opp, stat_dim, device=os_t.device)
+                    os_t = torch.cat([os_t, pad_s], dim=1)
+                
+                padded_opp_embeds.append(oe)
+                padded_opp_stats.append(os_t)
+                
+                # Build mask: True for real opponents, False for padding
+                m = torch.zeros(1, max_opps, dtype=torch.bool, device=oe.device)
+                m[0, :n_opp] = True
+                opp_masks.append(m)
+
+            batch_opp_embed = torch.cat(padded_opp_embeds, dim=0)
+            batch_opp_stats = torch.cat(padded_opp_stats, dim=0)
+            batch_opp_mask = torch.cat(opp_masks, dim=0)
+
+            # Move entire batch to GPU in one shot
+            batch_hole = batch_hole.to(self.device)
+            batch_comm = batch_comm.to(self.device)
+            batch_num = batch_num.to(self.device)
+            batch_mask = batch_mask.to(self.device)
+            batch_own = batch_own.to(self.device)
+            batch_opp_embed = batch_opp_embed.to(self.device)
+            batch_opp_stats = batch_opp_stats.to(self.device)
+            batch_opp_mask = batch_opp_mask.to(self.device)
+
+            # ONE batched GPU forward pass for ALL pending games
+            with torch.no_grad():
+                output = self.policy(
+                    hole_cards=batch_hole,
+                    community_cards=batch_comm,
+                    numeric_features=batch_num,
+                    opponent_embeddings=batch_opp_embed,
+                    opponent_stats=batch_opp_stats,
+                    own_stats=batch_own,
+                    action_mask=batch_mask,
+                    opponent_mask=batch_opp_mask,
+                )
+
+            # Distribute results back to each game
+            for batch_idx, game_idx in enumerate(game_indices):
+                g, state_dict = pending[game_idx]
+
+                probs = output.action_type_probs[batch_idx].cpu()
+                value = output.value[batch_idx, 0].item()
+                sizing = output.bet_sizing[batch_idx, 0].item()
+
+                # Apply personality perturbation for opponent seats
+                personality = state_dict['_personality']
+                situations = state_dict['_situations']
+                if personality is not None:
+                    probs = personality.apply(probs, situations, hand_strength=0.5)
+
+                try:
+                    new_state = g.send((probs, value, sizing))
+                    pending[game_idx] = (g, new_state)
+                except StopIteration as e:
+                    exps, reward = e.value
+                    for pexp in exps:
+                        all_exp.extend(pexp)
+                    total_reward += reward
+                    del pending[game_idx]
+                    finished += 1
+
+            # Verbose progress
+            if self.config.verbose and batch_count % 5 == 0:
+                import time as _t
+                elapsed = _t.time() - _t.time() if not hasattr(self, '_epoch_start') else _t.time() - self._epoch_start
+                print(f"    Batch {batch_count}: {finished}/{num_hands} hands done, {len(pending)} active")
+
+        return all_exp, total_reward
 
     # ─────────────────────────────────────────────────────────
     # PPO loss
@@ -681,40 +828,24 @@ class NLHESelfPlayTrainer:
     # ─────────────────────────────────────────────────────────
 
     def train(self, num_epochs: int = 100) -> Dict[str, List[float]]:
-        """Run NLHE self-play training."""
+        """Run NLHE self-play training with batched GPU inference."""
         metrics = {
             'epoch_reward': [],
             'epoch_loss': [],
         }
 
-
+        print(f"Device: {self.device}")
 
         for epoch in range(num_epochs):
             self.current_epoch = epoch + 1
-            all_exp: List[Experience] = []
-            epoch_reward = 0.0
             epoch_start = time.time()
             
-            use_search_list = [
-                self.search_engine is not None and self.rng.random() < self.config.search_fraction
-                for _ in range(self.config.hands_per_epoch)
-            ]
+            # Batched simulation: all hands run as generators with batched GPU calls
+            all_exp, total_reward = self._run_batched_epoch()
 
-            for hand_i in range(self.config.hands_per_epoch):
-                player_experiences = self._play_hand(use_search=use_search_list[hand_i])
-                for pexp in player_experiences:
-                    all_exp.extend(pexp)
-                if player_experiences[0]:
-                    epoch_reward += player_experiences[0][0].reward
+            avg_reward = (total_reward / self.config.hands_per_epoch) * 100.0
 
-                # Verbose progress tracking
-                if self.config.verbose and (hand_i + 1) % max(1, self.config.hands_per_epoch // 5) == 0:
-                    elapsed = time.time() - epoch_start
-                    print(f"  [Epoch {epoch+1:4d}] Hand {hand_i+1}/{self.config.hands_per_epoch}... ({elapsed:.1f}s)")
-
-            avg_reward = (epoch_reward / self.config.hands_per_epoch) * 100.0
-
-            # PPO update
+            # PPO update (fully batched on GPU)
             total_loss = 0.0
             for _ in range(self.config.ppo_epochs):
                 self.optimizer.zero_grad()
@@ -740,3 +871,4 @@ class NLHESelfPlayTrainer:
                 )
 
         return metrics
+
