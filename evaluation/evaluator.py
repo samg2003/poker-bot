@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from model.action_space import ActionIndex, NUM_ACTION_TYPES
-from model.stat_tracker import StatTracker, NUM_STAT_FEATURES
+from model.stat_tracker import StatTracker, NUM_STAT_FEATURES, HandRecord
 from model.opponent_encoder import OpponentEncoder
 from model.policy_network import PolicyNetwork
 from training.personality import (
@@ -32,6 +32,7 @@ from training.personality import (
 from engine.leduc_poker import LeducState, deal_leduc, CHECK, BET, FOLD, CALL, RAISE
 from engine.dealer import Dealer
 from engine.game_state import ActionType, Action, Street
+from model.action_space import encode_action
 from agent.config import AgentConfig
 
 
@@ -97,24 +98,87 @@ class Evaluator:
         seed: int = 42,
         num_hands: int = 500,
         game: str = 'leduc',
+        verbose: bool = False,
     ):
         self.policy = policy
         self.opponent_encoder = opponent_encoder
         self.rng = random.Random(seed)
         self.num_hands = num_hands
         self.game = game
+        self.verbose = verbose
         self.stat_tracker = StatTracker()
+        self.action_histories: Dict[int, List[torch.Tensor]] = {}
+        self._opp_embed_cache: Dict[int, torch.Tensor] = {}
+
+    def reset_tracking(self):
+        """Clear histories and stats for a fresh session."""
+        self.action_histories.clear()
+        self.stat_tracker.reset()
+        self._opp_embed_cache.clear()
+
+    # ─────────────────────────────────────────────────────────
+    # Helper Methods for Tracking Opponents
+    # ─────────────────────────────────────────────────────────
+    def _action_to_type_idx(self, action: Action) -> int:
+        mapping = {
+            ActionType.FOLD: ActionIndex.FOLD,
+            ActionType.CHECK: ActionIndex.CHECK,
+            ActionType.CALL: ActionIndex.CALL,
+            ActionType.RAISE: ActionIndex.RAISE,
+            ActionType.ALL_IN: ActionIndex.RAISE,
+        }
+        return mapping.get(action.action_type, ActionIndex.FOLD)
+
+    def _record_action(self, player_id: int, action_type: int,
+                       bet_frac: float, pot: float, stack: float, street: int):
+        if player_id not in self.action_histories:
+            self.action_histories[player_id] = []
+        token = encode_action(action_type, bet_frac, pot, stack, street)
+        self.action_histories[player_id].append(token)
+        if len(self.action_histories[player_id]) > 16:
+            self.action_histories[player_id] = self.action_histories[player_id][-16:]
+
+    def _get_opponent_embedding(self, player_id: int) -> torch.Tensor:
+        if player_id in self._opp_embed_cache:
+            return self._opp_embed_cache[player_id]
+        history = self.action_histories.get(player_id, [])
+        if not history:
+            emb = self.opponent_encoder.encode_empty(1)
+        else:
+            seq = torch.stack(history).unsqueeze(0)
+            with torch.no_grad():
+                emb = self.opponent_encoder(seq)
+        
+        self._opp_embed_cache[player_id] = emb.detach()
+        return emb
+
+    def _get_all_opponent_embeddings(self, hero_id: int, num_players: int) -> torch.Tensor:
+        opp_embeds = []
+        for pid in range(num_players):
+            if pid == hero_id: continue
+            opp_embeds.append(self._get_opponent_embedding(pid))
+        
+        if not opp_embeds:
+            return self.opponent_encoder.encode_empty(1).unsqueeze(1)
+        return torch.cat(opp_embeds, dim=0).unsqueeze(0)
+
+    def _get_opponent_stats(self, hero_id: int, num_players: int) -> torch.Tensor:
+        stats = []
+        for pid in range(num_players):
+            if pid == hero_id: continue
+            stats.append(self.stat_tracker.get_stats(pid))
+        
+        if not stats:
+            return torch.zeros(1, 1, NUM_STAT_FEATURES)
+        return torch.stack(stats).unsqueeze(0)
 
     def _play_eval_hand(
         self,
         personality: SituationalPersonality,
     ) -> float:
-        """
-        Play one hand: model (player 0) vs personality-modified opponent (player 1).
-        Returns reward for player 0.
-        """
+        """ Backward compatibility for Leduc wrapper. Plays heads-up vs 1 personality. """
         if self.game == 'nlhe':
-            return self._play_eval_hand_nlhe(personality)
+            return self._play_eval_hand_nlhe([None, personality], num_players=2, stacks=[100.0, 100.0])
         
         self.policy.eval()
 
@@ -198,19 +262,28 @@ class Evaluator:
             return state.get_payoff(0)
         return 0.0
 
-    def _play_eval_hand_nlhe(self, personality: SituationalPersonality) -> float:
+    def _play_eval_hand_nlhe(
+        self, 
+        personalities: List[Optional[SituationalPersonality]],
+        num_players: int = 2,
+        stacks: List[float] = None
+    ) -> float:
         self.policy.eval()
+        self._opp_embed_cache.clear() # clear per hand
+
+        if stacks is None:
+            stacks = [100.0] * num_players
 
         dealer = Dealer(
-            num_players=2,
-            stacks=[100.0, 100.0],
+            num_players=num_players,
+            stacks=stacks,
             small_blind=0.5,
             big_blind=1.0,
-            dealer_button=self.rng.randint(0, 1),
+            dealer_button=self.rng.randint(0, num_players - 1),
             seed=self.rng.randint(0, 2**31)
         )
         game_state = dealer.start_hand()
-        # player 0 is model, player 1 is opponent
+        hand_records = [HandRecord() for _ in range(num_players)]
 
         while not dealer.is_hand_over():
             pid = game_state.current_player_idx
@@ -225,8 +298,8 @@ class Evaluator:
             pot = game_state.pot / 100.0
             own_stack = p.stack / 100.0
             own_bet = p.bet_this_street / 100.0
-            rel_pos = (pid - game_state.dealer_button) % 2
-            position = rel_pos / 1.0
+            rel_pos = (pid - game_state.dealer_button) % num_players
+            position = rel_pos / max(num_players - 1, 1)
 
             street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
             street_val = street_map.get(game_state.street, 0) / 3.0
@@ -237,7 +310,7 @@ class Evaluator:
 
             numeric = torch.tensor([[
                 pot, own_stack, own_bet, position, street_val,
-                2.0 / 9.0, num_active / 9.0,
+                num_players / 9.0, num_active / 9.0,
                 current_bet, min_raise,
             ]], dtype=torch.float32)
 
@@ -253,9 +326,9 @@ class Evaluator:
                 elif at in (ActionType.RAISE, ActionType.ALL_IN):
                     mask[0, ActionIndex.RAISE] = True
 
-            opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)
-            opp_stats = torch.zeros(1, 1, NUM_STAT_FEATURES)
-            own_stats = torch.zeros(1, NUM_STAT_FEATURES)
+            opp_embed = self._get_all_opponent_embeddings(pid, num_players)
+            opp_stats = self._get_opponent_stats(pid, num_players)
+            own_stats = self.stat_tracker.get_stats(pid).unsqueeze(0)
 
             with torch.no_grad():
                 out = self.policy(
@@ -266,7 +339,8 @@ class Evaluator:
             probs = out.action_type_probs[0]
             sizing = out.bet_sizing[0, 0].item()
 
-            if pid == 1:
+            personality = personalities[pid]
+            if personality is not None:
                 # Calculate simple hand strength proxy for opponent personality
                 hand_strength = 0.5
                 if game_state.street == Street.PREFLOP:
@@ -305,8 +379,34 @@ class Evaluator:
 
             dealer.apply_action(act)
 
-        # Player 0 profit in big blinds (from 100bb start)
-        return game_state.players[0].stack - 100.0
+            # Record for history/stats
+            pot_for_record = game_state.pot
+            bet_frac = act.amount / max(pot_for_record, 1.0) if act.amount > 0 else 0.0
+            self._record_action(
+                player_id=pid,
+                action_type=self._action_to_type_idx(act),
+                bet_frac=bet_frac,
+                pot=pot_for_record,
+                stack=p.stack,
+                street=street_map.get(game_state.street, 0),
+            )
+            
+            if act.action_type in (ActionType.CALL, ActionType.RAISE, ActionType.ALL_IN):
+                hand_records[pid].vpip = True
+            if act.action_type in (ActionType.RAISE, ActionType.ALL_IN):
+                hand_records[pid].pfr = True
+
+        # End of Hand: Track Stats
+        results = dealer.get_results()
+        for pid in range(num_players):
+            hand_records[pid].result = results['profit'][pid]
+            hand_records[pid].went_to_showdown = (
+                game_state.street == Street.SHOWDOWN and not game_state.players[pid].is_folded
+            )
+            self.stat_tracker.record_hand(pid, hand_records[pid])
+
+        # Player 0 profit in big blinds (from starting stack)
+        return game_state.players[0].stack - stacks[0]
 
     def benchmark_exploitation(self) -> BenchmarkResult:
         """
@@ -459,15 +559,148 @@ class Evaluator:
             threshold=1.0,
         )
 
+    def benchmark_multi_way_gto(self) -> BenchmarkResult:
+        """6-max GTO Symmetry. Model vs 5 GTO opponents."""
+        self.reset_tracking()
+        personalities = [None] + [SituationalPersonality(base=PersonalityModifier.gto()) for _ in range(5)]
+        total_reward = 0.0
+        for _ in range(self.num_hands):
+            total_reward += self._play_eval_hand_nlhe(personalities, num_players=6)
+            
+        avg_reward = total_reward / self.num_hands
+        threshold = 3.0
+        return BenchmarkResult(
+            name="Multi-Way GTO (6-max)",
+            passed=abs(avg_reward) < threshold,
+            metric_name="abs(avg_bb/hand)",
+            metric_value=abs(avg_reward),
+            threshold=threshold,
+        )
+
+    def benchmark_multi_way_exploit(self) -> BenchmarkResult:
+        """6-max Mixed Exploit. Model vs 3 Nits and 2 Calling Stations."""
+        self.reset_tracking()
+        personalities = [None]
+        for _ in range(3): personalities.append(SituationalPersonality(base=PersonalityModifier.nit()))
+        for _ in range(2): personalities.append(SituationalPersonality(base=PersonalityModifier.calling_station()))
+        
+        total_reward = 0.0
+        for _ in range(self.num_hands):
+            # Shuffle positions of opponents
+            opps = personalities[1:]
+            self.rng.shuffle(opps)
+            shuffled_personalities = [None] + opps
+            total_reward += self._play_eval_hand_nlhe(shuffled_personalities, num_players=6)
+            
+        avg_reward = total_reward / self.num_hands
+        threshold = 0.0  # Should beat a table of weak exploitable players
+        return BenchmarkResult(
+            name="Multi-Way Exploit (6-max Mixed)",
+            passed=avg_reward > threshold,
+            metric_name="avg_bb/hand",
+            metric_value=avg_reward,
+            threshold=threshold,
+        )
+
+    def benchmark_short_stack(self) -> BenchmarkResult:
+        """15bb 6-max Push/Fold."""
+        self.reset_tracking()
+        personalities = [None] + [SituationalPersonality(base=PersonalityModifier.gto()) for _ in range(5)]
+        total_reward = 0.0
+        for _ in range(self.num_hands):
+            total_reward += self._play_eval_hand_nlhe(personalities, num_players=6, stacks=[15.0]*6)
+            
+        avg_reward = total_reward / self.num_hands
+        threshold = -0.5 # Losing a little variance is fine in push/fold, just don't hemorrhage
+        return BenchmarkResult(
+            name="Short Stack Push/Fold (15bb)",
+            passed=avg_reward > threshold,
+            metric_name="avg_bb/hand",
+            metric_value=avg_reward,
+            threshold=threshold,
+        )
+
+    def benchmark_deep_stack(self) -> BenchmarkResult:
+        """300bb Heads-Up warfare."""
+        self.reset_tracking()
+        personalities = [None, SituationalPersonality(base=PersonalityModifier.gto())]
+        total_reward = 0.0
+        for _ in range(self.num_hands):
+            total_reward += self._play_eval_hand_nlhe(personalities, num_players=2, stacks=[300.0, 300.0])
+            
+        avg_reward = total_reward / self.num_hands
+        threshold = 3.0
+        return BenchmarkResult(
+            name="Deep Stack Tactics (300bb)",
+            passed=abs(avg_reward) < threshold,
+            metric_name="abs(avg_bb/hand)",
+            metric_value=abs(avg_reward),
+            threshold=threshold,
+        )
+
+    def benchmark_adaptive_shift(self) -> BenchmarkResult:
+        """Spies benchmark: Opponent flips from Nit to Maniac. Does agent recover?"""
+        self.reset_tracking()
+        
+        # Phase 1: Nit
+        p_nit = SituationalPersonality(base=PersonalityModifier.nit())
+        personalities = [None, p_nit]
+        for _ in range(100):
+            self._play_eval_hand_nlhe(personalities, num_players=2)
+            
+        # Phase 2: Maniac
+        p_maniac = SituationalPersonality(base=PersonalityModifier.maniac())
+        personalities = [None, p_maniac]
+        post_shift_reward = 0.0
+        
+        for _ in range(100):
+            post_shift_reward += self._play_eval_hand_nlhe(personalities, num_players=2)
+            
+        avg_reward = post_shift_reward / 100.0
+        threshold = -2.0 # Standard loss to maniac is -3 to -5 bb without adjustment. -2 implies some adjustment.
+        return BenchmarkResult(
+            name="Adaptation: Nit -> Maniac Shift",
+            passed=avg_reward > threshold,
+            metric_name="post_shift_bb/hand",
+            metric_value=avg_reward,
+            threshold=threshold,
+            details="Played 100 hands vs Nit, then 100 vs Maniac. Measured Maniac winrate."
+        )
+
+    def _run_benchmark(self, func) -> BenchmarkResult:
+        if self.verbose:
+            import sys
+            name = func.__doc__.strip().split('.')[0] if func.__doc__ else func.__name__
+            # remove extra newlines in name
+            name = ' '.join(name.split())
+            sys.stdout.write(f"Running {name} ({self.num_hands} hands)... ")
+            sys.stdout.flush()
+            
+        res = func()
+        
+        if self.verbose:
+            status = "✅" if res.passed else "❌"
+            print(f"{status} | {res.metric_value:.4f} {res.metric_name}")
+            
+        return res
+
     def run_all_benchmarks(self) -> EvalResults:
         """Run all benchmarks and return aggregated results."""
         results = EvalResults()
 
-        results.benchmarks.append(self.benchmark_model_consistency())
-        results.benchmarks.append(self.benchmark_value_head())
-        results.benchmarks.append(self.benchmark_gto_symmetry())
-        results.benchmarks.append(self.benchmark_exploitation())
-        results.benchmarks.append(self.benchmark_nit_exploitation())
-        results.benchmarks.append(self.benchmark_maniac_exploitation())
+        results.benchmarks.append(self._run_benchmark(self.benchmark_model_consistency))
+        results.benchmarks.append(self._run_benchmark(self.benchmark_value_head))
+        
+        results.benchmarks.append(self._run_benchmark(self.benchmark_gto_symmetry))
+        results.benchmarks.append(self._run_benchmark(self.benchmark_exploitation))
+        results.benchmarks.append(self._run_benchmark(self.benchmark_nit_exploitation))
+        results.benchmarks.append(self._run_benchmark(self.benchmark_maniac_exploitation))
+
+        if self.game == 'nlhe':
+            results.benchmarks.append(self._run_benchmark(self.benchmark_multi_way_gto))
+            results.benchmarks.append(self._run_benchmark(self.benchmark_multi_way_exploit))
+            results.benchmarks.append(self._run_benchmark(self.benchmark_short_stack))
+            results.benchmarks.append(self._run_benchmark(self.benchmark_deep_stack))
+            results.benchmarks.append(self._run_benchmark(self.benchmark_adaptive_shift))
 
         return results

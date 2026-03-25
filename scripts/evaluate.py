@@ -42,6 +42,8 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--game', type=str, choices=['leduc', 'nlhe'], default='leduc',
                         help='Game to evaluate (default: leduc)')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Show progress as benchmarks run')
 
     args = parser.parse_args()
 
@@ -89,7 +91,10 @@ def main():
     print(f"Running evaluation benchmarks for {args.game.upper()}...")
     print()
 
-    evaluator = Evaluator(policy, encoder, seed=args.seed, num_hands=args.num_hands, game=args.game)
+    evaluator = Evaluator(
+        policy, encoder, seed=args.seed, num_hands=args.num_hands, 
+        game=args.game, verbose=args.verbose
+    )
     results = evaluator.run_all_benchmarks()
     print(results.summary())
 
