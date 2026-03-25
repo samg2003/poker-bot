@@ -312,10 +312,13 @@ class GameState:
                 return False
 
         # Everyone has had a chance to act since the last raise
-        # Count how many active players still need to act
         if self.last_raiser == -1:
-            # No raises — street over when everyone has acted
-            return self.num_actions_this_street >= self._count_active()
+            # No raises — street over when everyone currently active has acted at least once
+            players_acted = {a.player_idx for a in self.street_actions}
+            for i, p in enumerate(self.players):
+                if p.is_active and i not in players_acted:
+                    return False
+            return True
         else:
             # Action must have gone around to the last raiser
             return self._all_have_acted_since_last_raise()

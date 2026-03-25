@@ -154,6 +154,8 @@ class NLHESelfPlayTrainer:
         self.stat_tracker = StatTracker()
         self.hands_since_reset = 0
         self.next_reset_at = self.rng.randint(*self.config.history_reset_interval)
+        self.hands_since_personality_reset = 0
+        self.next_personality_reset_at = 50  # Soft reset every 50 hands
 
         # Personality curriculum — initially no personalities (pure self-play GTO)
         self.current_epoch = 0
@@ -297,18 +299,16 @@ class NLHESelfPlayTrainer:
     def _get_personality_gto_fraction(self) -> float:
         """Graduated personality curriculum schedule."""
         epoch = self.current_epoch
-        if epoch < 10:
-            return 1.0      # 0% personalities — pure GTO self-play foundation
-        elif epoch < 20:
-            return 0.875    # 12.5% (1/8) opponents get personalities
-        elif epoch < 30:
-            return 0.75     # 25% (1/4) opponents get personalities
-        else:
-            return 0.667    # 33% (1/3) opponents get personalities
+        if epoch < 80:
+            return 1.0  # 100% GTO until epoch 80
+        return 0.8      # 80% GTO / 20% Personalities after epoch 80
 
     def _maybe_reset_histories(self):
         """Periodically reset opponent histories and personalities (simulate new table)."""
         self.hands_since_reset += 1
+        self.hands_since_personality_reset += 1
+
+        # Hard reset: total flush of histories and stats (e.g. 300-500 hands)
         if self.hands_since_reset >= self.next_reset_at:
             self.action_histories.clear()
             self.stat_tracker.reset()
@@ -316,6 +316,12 @@ class NLHESelfPlayTrainer:
             self.next_reset_at = self.rng.randint(*self.config.history_reset_interval)
             # Reshuffle personalities when we "sit down at a new table"
             self.table_personalities = []
+            self.hands_since_personality_reset = 0
+
+        # Soft reset: flush personalities only (keep histories for OpponentEncoder to adapt)
+        elif self.hands_since_personality_reset >= self.next_personality_reset_at:
+            self.table_personalities = []
+            self.hands_since_personality_reset = 0
 
     # ─────────────────────────────────────────────────────────
     # State encoding

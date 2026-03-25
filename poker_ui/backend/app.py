@@ -124,12 +124,24 @@ def _serialize_snapshot(snap: TimelineSnapshot):
         if eng_idx < len(seat_map):
             god_mode_remapped[seat_map[eng_idx]] = data
 
+    terminal = game_manager.dealer.is_hand_over() if game_manager.dealer else False
+    results = None
+    if terminal and game_manager.dealer:
+        eng_results = game_manager.dealer.get_results()
+        winners = [seat_map[i] for i in eng_results['winners'] if i < len(seat_map)]
+        profits = {seat_map[i]: eng_results['profit'][i] for i in range(len(eng_results['profit'])) if i < len(seat_map)}
+        results = {
+            "winners": winners,
+            "profits": profits
+        }
+
     return {
         "pot": gs.pot,
         "board": gs.board,
         "street": street_str,
         "current_player": current_table_seat,
-        "is_terminal": game_manager.dealer.is_hand_over() if game_manager.dealer else False,
+        "is_terminal": terminal,
+        "results": results,
         "dealer_button": dealer_table,
         "small_blind": sb_table,
         "big_blind": bb_table,

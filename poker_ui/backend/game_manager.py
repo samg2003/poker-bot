@@ -279,6 +279,10 @@ class GameManager:
         self.engine_map = {seat: eng for eng, seat in enumerate(self.seat_map)}
         num_engine_players = len(self.seat_map)
 
+        # Auto top-up hero if busted to avoid engine crash
+        if self.seats[self.human_seat].stack < 1.0:
+            self.buy_in()
+
         # Build stacks and personalities arrays for the engine
         stacks = [self.seats[s].stack for s in self.seat_map]
 

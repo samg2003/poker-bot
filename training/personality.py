@@ -380,18 +380,17 @@ def sample_table_personalities(
             # GTO player (no modification)
             personalities.append(SituationalPersonality())
         else:
-            # Sample a random base personality
-            base = PersonalityModifier.random(rng)
-
-            # Optionally add 1-3 situational overrides
-            overrides = {}
-            num_overrides = rng.randint(0, 3)
-            possible_situations = list(Situation)
-            for _ in range(num_overrides):
-                sit = rng.choice(possible_situations)
-                overrides[sit] = PersonalityModifier.random(rng)
-
-            personalities.append(SituationalPersonality(base=base, overrides=overrides))
+            # Sample a pure archetype to provide clean learning signal
+            archetypes = [
+                PersonalityModifier.nit,
+                PersonalityModifier.tag,
+                PersonalityModifier.lag,
+                PersonalityModifier.maniac,
+                PersonalityModifier.calling_station,
+                PersonalityModifier.fish,
+            ]
+            base = rng.choice(archetypes)()
+            personalities.append(SituationalPersonality(base=base))
 
     return personalities
 

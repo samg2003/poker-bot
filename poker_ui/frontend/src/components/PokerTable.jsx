@@ -63,6 +63,9 @@ export default function PokerTable({ gameState, selectedSeat, onSelectSeat }) {
           const isHero = p.is_human
           const isRevealed = revealedSeats.has(p.id)
           
+          const isWinner = is_terminal && gameState.results?.winners?.includes(p.id)
+          const profit = gameState.results?.profits?.[p.id] || 0
+          
           const showCards = isHero || isRevealed || street === 'SHOWDOWN'
           const displayName = isHero 
             ? 'Hero' 
@@ -73,10 +76,13 @@ export default function PokerTable({ gameState, selectedSeat, onSelectSeat }) {
           return (
             <div 
               key={i} 
-              className={`seat seat-${i} ${isTurn ? 'turn-active' : ''} ${p.is_folded ? 'folded' : ''} ${isActiveSeat ? 'selected' : ''} ${isHero ? 'hero' : ''} ${isRevealed ? 'revealed' : ''}`}
+              className={`seat seat-${i} ${isTurn ? 'turn-active' : ''} ${p.is_folded ? 'folded' : ''} ${isActiveSeat ? 'selected' : ''} ${isHero ? 'hero' : ''} ${isRevealed ? 'revealed' : ''} ${isWinner ? 'winner' : ''}`}
               onClick={() => onSelectSeat(p.id)}
               onDoubleClick={() => handleDoubleClick(p.id)}
             >
+              {isWinner && profit > 0 && (
+                <div className="profit-flyout">+{profit.toFixed(1)} bb</div>
+              )}
               <div className="seat-name">{displayName}</div>
               <div className="seat-stack">{p.stack.toFixed(2)} bb</div>
               {p.bet > 0 && <div className="seat-bet">{p.bet.toFixed(2)}</div>}
