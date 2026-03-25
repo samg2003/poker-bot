@@ -3,6 +3,8 @@
 
 read -p "Path to PEM file: " PEM_PATH
 read -p "EC2 IP address: " IP_ADDR
+read -p "Username (default: ec2-user): " USERNAME
+USERNAME=${USERNAME:-ec2-user}
 
 # Strip surrounding quotes if user added them
 PEM_PATH=$(echo "$PEM_PATH" | tr -d "'" | tr -d '"')
@@ -11,5 +13,5 @@ IP_ADDR=$(echo "$IP_ADDR" | tr -d "'" | tr -d '"')
 # Fix permissions
 chmod 400 "$PEM_PATH"
 
-echo "Connecting to ubuntu@$IP_ADDR..."
-ssh -i "$PEM_PATH" ubuntu@"$IP_ADDR"
+echo "Connecting to $USERNAME@$IP_ADDR..."
+ssh -i "$PEM_PATH" "$USERNAME@$IP_ADDR"
