@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import PokerTable from './components/PokerTable'
 import ActionBar from './components/ActionBar'
 import GodModePanel from './components/GodModePanel'
 import TimelineScrubber from './components/TimelineScrubber'
+import { playActionSound, playNewHandSound, playNavigateSound } from './sounds'
 import './index.css'
 
 const API_URL = 'http://127.0.0.1:8000/api'
@@ -57,6 +58,7 @@ function App() {
   const startHand = async () => {
     setLoading(true)
     log("--- New Hand Started ---")
+    playNewHandSound()
     const data = await apiGet('/start')
     if (data) await refreshState()
     setLoading(false)
@@ -64,29 +66,40 @@ function App() {
 
   const fetchTimeline = async (idx) => {
     if (idx < 0 || idx >= totalSteps) return
+    playNavigateSound()
     const data = await apiGet(`/timeline/${idx}`)
     if (data && data.snapshot) {
       setGameState(data.snapshot)
       setTimelineIdx(data.timeline_index)
       setTotalSteps(data.total_steps)
+      if (data.snapshot.last_action) {
+        playActionSound(data.snapshot.last_action.type)
+      }
     }
   }
+
+  const stepTimeoutRef = useRef(null)
+  const isSteppingRef = useRef(false)
 
   const stepAI = async () => {
     if (timelineIdx < totalSteps - 1) return
     if (!gameState || gameState.is_terminal || gameState.players[gameState.current_player].personality === 'Human') return
+    if (isSteppingRef.current) return
     
-    // AI turn
-    setTimeout(async () => {
+    isSteppingRef.current = true
+    stepTimeoutRef.current = setTimeout(async () => {
       const data = await apiGet('/step')
       if (data && data.took_action) {
         setGameState(data.state.snapshot)
         setTimelineIdx(data.state.timeline_index)
         setTotalSteps(data.state.total_steps)
         if (data.state.snapshot.last_action) {
-          log(`[Bot] played ${data.state.snapshot.last_action.type} ${data.state.snapshot.last_action.amount.toFixed(2)}`)
+          const actionType = data.state.snapshot.last_action.type
+          playActionSound(actionType)
+          log(`[Bot] played ${actionType} ${data.state.snapshot.last_action.amount.toFixed(2)}`)
         }
       }
+      isSteppingRef.current = false
     }, 600)
   }
 
@@ -108,6 +121,9 @@ function App() {
   useEffect(() => {
     if (gameState && !gameState.is_terminal) {
       stepAI()
+    }
+    return () => {
+      if (stepTimeoutRef.current) clearTimeout(stepTimeoutRef.current)
     }
   }, [gameState, timelineIdx, totalSteps])
 
@@ -134,6 +150,7 @@ function App() {
       return
     }
     log(`[Hero] played ${type} ${amount > 0 ? amount.toFixed(2) : ''}`)
+    playActionSound(type)
     const data = await apiPost('/action', { action_type: type, amount })
     if (data && data.snapshot) {
       setGameState(data.snapshot)
@@ -153,7 +170,7 @@ function App() {
 
       {/* Left Sidebar */}
       <div className="sidebar glass-panel">
-        <h2>DeepMind Poker Bot</h2>
+        <h2>Poker AI</h2>
         <button className="btn primary block" onClick={startHand}>Start New Hand</button>
         
         <TimelineScrubber 

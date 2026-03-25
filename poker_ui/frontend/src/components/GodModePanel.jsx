@@ -1,6 +1,7 @@
 import React from 'react'
 
-const SIZING_LABELS = ['10%', '25%', '33%', '50%', '66%', '75%', '100%', '150%', '200%', 'ALL'];
+const SIZING_LABELS = ['10%', '25%', '33%', '50%', '66%', '75%', '100%', '150%', '200%', 'ALL-IN'];
+const POT_FRACTIONS = [0.1, 0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0, -1.0];
 
 export default function GodModePanel({ gameState, selectedSeat }) {
   if (!gameState || !gameState.god_mode || !gameState.players[selectedSeat]) {
@@ -27,11 +28,34 @@ export default function GodModePanel({ gameState, selectedSeat }) {
     pc = (evData.probs[1] * 100 + evData.probs[2] * 100).toFixed(1)
     pr = (evData.probs[3] * 100).toFixed(1)
     
-    // sizing is now an array of size 10
     if (evData.sizing && evData.sizing.length === 10) {
       sizingProbs = evData.sizing
     }
   }
+
+  // Build sorted sizing entries with bb amounts
+  const pot = gameState.pot || 0
+  const currentBet = gameState.current_bet || 0
+  const totalProb = sizingProbs.reduce((a, b) => a + b, 0)
+
+  const sizingEntries = sizingProbs.map((prob, idx) => {
+    const frac = POT_FRACTIONS[idx]
+    const label = SIZING_LABELS[idx]
+    const normalized = totalProb > 0 ? prob / totalProb : 0
+    
+    let bbAmount
+    if (frac < 0) {
+      // All-in: use the player's remaining stack + current street bet
+      bbAmount = p.stack + (p.bet || 0)
+    } else {
+      bbAmount = currentBet + frac * pot
+    }
+    
+    return { label, normalized, bbAmount, idx }
+  })
+
+  // Sort descending by normalized probability
+  const sorted = [...sizingEntries].sort((a, b) => b.normalized - a.normalized)
 
   return (
     <div className="god-mode-panel glass-panel">
@@ -71,14 +95,19 @@ export default function GodModePanel({ gameState, selectedSeat }) {
       </div>
 
       <div className="sizing-display">
-        <span className="ev-label">Sizing Distribution (If Raising):</span>
-        <div className="sizing-histogram">
-          {SIZING_LABELS.map((label, idx) => {
-            const prob = sizingProbs[idx] * 100;
+        <span className="ev-label">Sizing Distribution (If Raising)</span>
+        <div className="sizing-list">
+          {sorted.map((entry) => {
+            const pct = (entry.normalized * 100).toFixed(1)
+            if (entry.normalized < 0.001) return null
             return (
-              <div key={idx} className="hist-bar-container" title={`${label}: ${prob.toFixed(1)}%`}>
-                <div className="hist-bar" style={{ height: `${prob}%` }}></div>
-                <span className="hist-label">{label}</span>
+              <div key={entry.idx} className="sizing-row">
+                <span className="sizing-label">{entry.label}</span>
+                <div className="sizing-bar-bg">
+                  <div className="sizing-bar" style={{ width: `${pct}%` }}></div>
+                </div>
+                <span className="sizing-pct">{pct}%</span>
+                <span className="sizing-bb">{entry.bbAmount.toFixed(1)} bb</span>
               </div>
             )
           })}

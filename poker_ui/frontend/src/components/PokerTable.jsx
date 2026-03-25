@@ -1,7 +1,21 @@
-import React from 'react'
-import { formatCard } from '../utils'
+import React, { useState } from 'react'
+import { formatCard, isRedSuit } from '../utils'
 
 export default function PokerTable({ gameState, selectedSeat, onSelectSeat }) {
+  const [revealedSeats, setRevealedSeats] = useState(new Set())
+
+  const handleDoubleClick = (seatIdx) => {
+    setRevealedSeats(prev => {
+      const next = new Set(prev)
+      if (next.has(seatIdx)) {
+        next.delete(seatIdx)
+      } else {
+        next.add(seatIdx)
+      }
+      return next
+    })
+  }
+
   if (!gameState) {
     return (
       <div className="poker-table">
@@ -27,7 +41,7 @@ export default function PokerTable({ gameState, selectedSeat, onSelectSeat }) {
 
       <div className="board-cards">
         {board.filter(c => c !== -1).map((c, i) => (
-          <div key={i} className={`card ${[1, 2].includes(Math.floor(c / 13)) ? 'red' : ''}`}>
+          <div key={i} className={`card ${isRedSuit(c) ? 'red' : ''}`}>
             {formatCard(c)}
           </div>
         ))}
@@ -37,14 +51,26 @@ export default function PokerTable({ gameState, selectedSeat, onSelectSeat }) {
         {players.map((p, i) => {
           const isTurn = current_player === i && !is_terminal
           const isActiveSeat = selectedSeat === i
+          const isHero = i === 0
+          const isRevealed = revealedSeats.has(i)
+          
+          // Show cards for Hero always, for others only if revealed via double-click (or showdown)
+          const showCards = isHero || isRevealed || street === 'SHOWDOWN'
+          // Show personality only if revealed
+          const displayName = isHero 
+            ? 'Hero' 
+            : isRevealed 
+              ? `Seat ${i} (${p.personality})` 
+              : `Seat ${i}`
 
           return (
             <div 
               key={i} 
-              className={`seat seat-${i} ${isTurn ? 'turn-active' : ''} ${p.is_folded ? 'folded' : ''} ${isActiveSeat ? 'selected' : ''} ${i===0 ? 'hero' : ''}`}
+              className={`seat seat-${i} ${isTurn ? 'turn-active' : ''} ${p.is_folded ? 'folded' : ''} ${isActiveSeat ? 'selected' : ''} ${isHero ? 'hero' : ''} ${isRevealed ? 'revealed' : ''}`}
               onClick={() => onSelectSeat(i)}
+              onDoubleClick={() => handleDoubleClick(i)}
             >
-              <div className="seat-name">Seat {i} ({p.personality})</div>
+              <div className="seat-name">{displayName}</div>
               <div className="seat-stack">{p.stack.toFixed(2)} bb</div>
               {p.bet > 0 && <div className="seat-bet">{p.bet.toFixed(2)}</div>}
               {dealer_button === i && <div className="dealer-btn">D</div>}
@@ -52,10 +78,10 @@ export default function PokerTable({ gameState, selectedSeat, onSelectSeat }) {
               {big_blind === i && <div className="bb-btn">BB</div>}
               
               <div className="seat-cards">
-                {p.hole_cards && p.hole_cards.length === 2 ? (
+                {showCards && p.hole_cards && p.hole_cards.length === 2 ? (
                   <>
-                    <div className={`card ${[1, 2].includes(Math.floor(p.hole_cards[0] / 13)) ? 'red' : ''}`}>{formatCard(p.hole_cards[0])}</div>
-                    <div className={`card ${[1, 2].includes(Math.floor(p.hole_cards[1] / 13)) ? 'red' : ''}`}>{formatCard(p.hole_cards[1])}</div>
+                    <div className={`card ${isRedSuit(p.hole_cards[0]) ? 'red' : ''}`}>{formatCard(p.hole_cards[0])}</div>
+                    <div className={`card ${isRedSuit(p.hole_cards[1]) ? 'red' : ''}`}>{formatCard(p.hole_cards[1])}</div>
                   </>
                 ) : (
                   <>

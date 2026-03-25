@@ -87,6 +87,7 @@ def _serialize_snapshot(snap: TimelineSnapshot):
         "legal_actions": [a.name for a in gs.get_legal_actions()],
         "min_raise": gs.get_min_raise_to(),
         "max_raise": gs.get_max_raise_to(),
+        "current_bet": gs.current_bet,
         "players": [
             {
                 "id": pid,
@@ -95,7 +96,7 @@ def _serialize_snapshot(snap: TimelineSnapshot):
                 "is_active": p.is_active,
                 "is_all_in": p.is_all_in,
                 "is_folded": p.is_folded,
-                "hole_cards": p.hole_cards if (pid == game_manager.human_seat or gs.street == Street.SHOWDOWN) else [],
+                "hole_cards": list(p.hole_cards) if p.hole_cards else [],
                 "personality": getattr(game_manager.personalities[pid].base, 'name', 'Bot') if game_manager.personalities[pid] else "Human",
             } for pid, p in enumerate(gs.players)
         ],
