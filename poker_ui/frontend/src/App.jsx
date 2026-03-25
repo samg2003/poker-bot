@@ -83,23 +83,31 @@ function App() {
 
   const stepAI = async () => {
     if (timelineIdx < totalSteps - 1) return
-    if (!gameState || gameState.is_terminal || gameState.players[gameState.current_player].personality === 'Human') return
+    if (!gameState || gameState.is_terminal) return
+    const cp = gameState.current_player
+    if (cp == null || !gameState.players[cp] || gameState.players[cp].personality === 'Human') return
     if (isSteppingRef.current) return
     
     isSteppingRef.current = true
     stepTimeoutRef.current = setTimeout(async () => {
-      const data = await apiGet('/step')
-      if (data && data.took_action) {
-        setGameState(data.state.snapshot)
-        setTimelineIdx(data.state.timeline_index)
-        setTotalSteps(data.state.total_steps)
-        if (data.state.snapshot.last_action) {
-          const actionType = data.state.snapshot.last_action.type
-          playActionSound(actionType)
-          log(`[Bot] played ${actionType} ${data.state.snapshot.last_action.amount.toFixed(2)}`)
+      try {
+        const data = await apiGet('/step')
+        if (data && data.took_action) {
+          setGameState(data.state.snapshot)
+          setTimelineIdx(data.state.timeline_index)
+          setTotalSteps(data.state.total_steps)
+          if (data.state.snapshot.last_action) {
+            const actionType = data.state.snapshot.last_action.type
+            playActionSound(actionType)
+            const amt = data.state.snapshot.last_action.amount
+            log(`[Bot] played ${actionType} ${amt != null ? amt.toFixed(2) : ''}`)
+          }
         }
+      } catch (e) {
+        console.error('stepAI error:', e)
+      } finally {
+        isSteppingRef.current = false
       }
-      isSteppingRef.current = false
     }, 600)
   }
 

@@ -1,110 +1,127 @@
-// Poker sound effects using Web Audio API — chip clinks and bass kicks
+// Wizard Poker — mystical sound effects via Web Audio API
 let audioCtx = null
 
-function getCtx() {
+function ctx() {
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)()
   return audioCtx
 }
 
-// --- Noise generator for chip/click sounds ---
-function playNoiseBurst(duration = 0.04, volume = 0.2, highpass = 3000) {
+// --- Primitives ---
+
+function tone(freq, dur, type = 'sine', vol = 0.12, delay = 0) {
   try {
-    const ctx = getCtx()
-    const bufferSize = ctx.sampleRate * duration
-    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate)
-    const data = buffer.getChannelData(0)
-    for (let i = 0; i < bufferSize; i++) {
-      data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize) // decaying noise
-    }
-    const source = ctx.createBufferSource()
-    source.buffer = buffer
-
-    const hp = ctx.createBiquadFilter()
-    hp.type = 'highpass'
-    hp.frequency.value = highpass
-
-    const gain = ctx.createGain()
-    gain.gain.setValueAtTime(volume, ctx.currentTime)
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration)
-
-    source.connect(hp).connect(gain).connect(ctx.destination)
-    source.start(ctx.currentTime)
+    const c = ctx(), t = c.currentTime + delay
+    const osc = c.createOscillator()
+    const gain = c.createGain()
+    osc.type = type
+    osc.frequency.setValueAtTime(freq, t)
+    gain.gain.setValueAtTime(vol, t)
+    gain.gain.exponentialRampToValueAtTime(0.001, t + dur)
+    osc.connect(gain).connect(c.destination)
+    osc.start(t)
+    osc.stop(t + dur)
   } catch (e) {}
 }
 
-// Chip clink = two quick high-frequency noise bursts
-function chipClink(volume = 0.2) {
-  playNoiseBurst(0.03, volume, 4000)
-  setTimeout(() => playNoiseBurst(0.025, volume * 0.7, 5000), 40)
+function sweep(startFreq, endFreq, dur, type = 'sine', vol = 0.1, delay = 0) {
+  try {
+    const c = ctx(), t = c.currentTime + delay
+    const osc = c.createOscillator()
+    const gain = c.createGain()
+    osc.type = type
+    osc.frequency.setValueAtTime(startFreq, t)
+    osc.frequency.exponentialRampToValueAtTime(endFreq, t + dur)
+    gain.gain.setValueAtTime(vol, t)
+    gain.gain.exponentialRampToValueAtTime(0.001, t + dur)
+    osc.connect(gain).connect(c.destination)
+    osc.start(t)
+    osc.stop(t + dur)
+  } catch (e) {}
 }
 
-// Multiple chips = rapid burst of clinks
-function chipStack(count = 3, volume = 0.15) {
-  for (let i = 0; i < count; i++) {
-    setTimeout(() => playNoiseBurst(0.025, volume * (0.6 + Math.random() * 0.4), 3500 + Math.random() * 2000), i * 35)
+function noise(dur = 0.03, vol = 0.1, hp = 3000, delay = 0) {
+  try {
+    const c = ctx(), t = c.currentTime + delay
+    const buf = c.createBuffer(1, c.sampleRate * dur, c.sampleRate)
+    const d = buf.getChannelData(0)
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length)
+    const src = c.createBufferSource()
+    src.buffer = buf
+    const filter = c.createBiquadFilter()
+    filter.type = 'highpass'
+    filter.frequency.value = hp
+    const gain = c.createGain()
+    gain.gain.setValueAtTime(vol, t)
+    gain.gain.exponentialRampToValueAtTime(0.001, t + dur)
+    src.connect(filter).connect(gain).connect(c.destination)
+    src.start(t)
+  } catch (e) {}
+}
+
+// --- Wizard Poker Sounds ---
+
+// Fold: cards sliding away — descending whoosh
+export function playFoldSound() {
+  sweep(800, 200, 0.2, 'sine', 0.1)
+  noise(0.08, 0.06, 2000, 0.05)
+}
+
+// Check: magical tap — two bright pings
+export function playCheckSound() {
+  tone(1200, 0.06, 'sine', 0.1)
+  tone(1600, 0.08, 'sine', 0.08, 0.07)
+}
+
+// Call: chip stack with a warm chime
+export function playCallSound() {
+  tone(600, 0.1, 'triangle', 0.1)
+  tone(800, 0.12, 'triangle', 0.08, 0.08)
+  noise(0.02, 0.08, 4000, 0.0)
+  noise(0.02, 0.06, 5000, 0.04)
+  noise(0.02, 0.05, 4500, 0.08)
+}
+
+// Raise: ascending magical power-up
+export function playRaiseSound() {
+  sweep(300, 900, 0.15, 'sawtooth', 0.07)
+  tone(700, 0.08, 'triangle', 0.1, 0.1)
+  tone(900, 0.08, 'triangle', 0.1, 0.16)
+  tone(1200, 0.12, 'triangle', 0.12, 0.22)
+  // Chip scatter
+  for (let i = 0; i < 4; i++) {
+    noise(0.02, 0.08, 3500 + Math.random() * 2000, i * 0.04)
   }
 }
 
-// --- Bass/Kick drum for navigation ---
-function playKick(volume = 0.3) {
-  try {
-    const ctx = getCtx()
-    const osc = ctx.createOscillator()
-    const gain = ctx.createGain()
-
-    osc.type = 'sine'
-    osc.frequency.setValueAtTime(150, ctx.currentTime)
-    osc.frequency.exponentialRampToValueAtTime(30, ctx.currentTime + 0.12)
-
-    gain.gain.setValueAtTime(volume, ctx.currentTime)
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15)
-
-    osc.connect(gain).connect(ctx.destination)
-    osc.start(ctx.currentTime)
-    osc.stop(ctx.currentTime + 0.15)
-
-    // Add a click transient
-    playNoiseBurst(0.01, volume * 0.5, 1000)
-  } catch (e) {}
-}
-
-// --- Exported sounds ---
-
-export function playFoldSound() {
-  // Single soft chip toss
-  playNoiseBurst(0.05, 0.1, 2000)
-}
-
-export function playCheckSound() {
-  // Two quick taps (knocking the table)
-  chipClink(0.12)
-}
-
-export function playCallSound() {
-  // A few chips hitting the felt
-  chipStack(3, 0.15)
-}
-
-export function playRaiseSound() {
-  // More aggressive chip stack
-  chipStack(5, 0.2)
-}
-
+// All-In: dramatic energy blast
 export function playAllInSound() {
-  // Big chip shove — lots of chips
-  chipStack(8, 0.25)
+  sweep(100, 600, 0.25, 'sawtooth', 0.1)
+  sweep(200, 1200, 0.3, 'square', 0.06, 0.05)
+  tone(800, 0.15, 'triangle', 0.12, 0.2)
+  tone(1000, 0.15, 'triangle', 0.12, 0.28)
+  tone(1400, 0.2, 'triangle', 0.15, 0.35)
+  // Big chip cascade
+  for (let i = 0; i < 8; i++) {
+    noise(0.025, 0.1, 3000 + Math.random() * 3000, 0.05 + i * 0.03)
+  }
 }
 
+// New Hand: mystical card deal — quick sparkle sequence
 export function playNewHandSound() {
-  // Card shuffle / dealing sound
-  setTimeout(() => playNoiseBurst(0.02, 0.08, 6000), 0)
-  setTimeout(() => playNoiseBurst(0.02, 0.08, 6000), 60)
-  setTimeout(() => playNoiseBurst(0.02, 0.1, 5000), 120)
-  setTimeout(() => playNoiseBurst(0.02, 0.1, 5000), 180)
+  tone(523, 0.06, 'sine', 0.06)
+  tone(659, 0.06, 'sine', 0.06, 0.08)
+  tone(784, 0.06, 'sine', 0.08, 0.16)
+  tone(1047, 0.1, 'sine', 0.1, 0.24)
+  // Card flick sounds
+  noise(0.015, 0.05, 6000, 0.0)
+  noise(0.015, 0.05, 6000, 0.1)
+  noise(0.015, 0.05, 6000, 0.2)
 }
 
+// Timeline Navigate: soft page-turn whoosh
 export function playNavigateSound() {
-  playKick(0.25)
+  sweep(400, 800, 0.08, 'sine', 0.06)
+  noise(0.04, 0.05, 5000, 0.0)
 }
 
 export function playActionSound(actionType) {
