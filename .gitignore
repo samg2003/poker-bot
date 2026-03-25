@@ -32,3 +32,17 @@ wandb/
 
 # Pytest
 .pytest_cache/
+
+# Node / Vite (Poker UI Frontend)
+poker_ui/frontend/node_modules/
+poker_ui/frontend/dist/
+node_modules/
+dist/
+dist-ssr/
+*.local
+.npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+poker_ui/frontend_corrupted/
