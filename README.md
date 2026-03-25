@@ -116,6 +116,8 @@ python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 
 python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 4 --hands 2048 --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --device cuda --verbose --save-interval 50
 
 python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 4 --hands 2048 --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --verbose --save-interval 50
+
+python3 scripts/train.py --game nlhe --embed-dim 512 --num-layers 8 --num-heads 8 --hands 3000 --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --verbose --save-interval 50 --batch-chunk-size 2000
 ```
 
 ### Full CLI Options
@@ -137,6 +139,7 @@ python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 
 --threads N             Number of CPU threads to use; 0=all (default: 0)
 --verbose               Enable verbose output with timing and progress updates
 --search-fraction F     Fraction of hands using search (default: 0)
+--batch-chunk-size N    Max simultaneous games per sub-batch (default: 500)
 --save-interval N       Save checkpoint every N epochs (default: 0 = end only)
 --resume TAG            Resume training from checkpoint tag
 --checkpoint-dir DIR    Where to save checkpoints (default: checkpoints/)
@@ -147,11 +150,17 @@ python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 
 ## Evaluation
 
 ```bash
-# With trained checkpoint — architecture auto-loaded from checkpoint metadata
-python3 scripts/evaluate.py --checkpoint latest
+# Run all benchmarks on the default Leduc game
+python3 scripts/evaluate.py
 
-# With latency benchmark
-python3 scripts/evaluate.py --checkpoint best --benchmark-latency
+# Run all benchmarks on full No-Limit Texas Hold'em (NLHE)
+python3 scripts/evaluate.py --game nlhe
+
+# Run evaluation with more hands per benchmark (slower but more accurate)
+python3 scripts/evaluate.py --game nlhe --num-hands 2000
+
+# Evaluate a specific checkpoint (architecture and game type auto-loaded)
+python3 scripts/evaluate.py --checkpoint latest
 ```
 
 ## Development

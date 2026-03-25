@@ -94,6 +94,7 @@ class NLHETrainingConfig:
 
     # Self-play
     hands_per_epoch: int = 128
+    batch_chunk_size: int = 500  # Max simultaneous games per sub-batch
 
     # Opponent modeling
     history_reset_interval: Tuple[int, int] = (300, 500)
@@ -235,25 +236,31 @@ class NLHESelfPlayTrainer:
         token = encode_action(action_type, bet_frac, pot, stack, street)
         self.action_histories[player_id].append(token)
 
-        # Cap at 512 actions (rolling window)
-        if len(self.action_histories[player_id]) > 512:
-            self.action_histories[player_id] = self.action_histories[player_id][-512:]
+        # Cap at 16 actions (rolling window — last ~4 hands of context)
+        if len(self.action_histories[player_id]) > 16:
+            self.action_histories[player_id] = self.action_histories[player_id][-16:]
 
     def _get_opponent_embedding(self, player_id: int) -> torch.Tensor:
         """
-        Get opponent embedding from action history.
+        Get opponent embedding from action history (cached per hand).
         Returns: (1, embed_dim) tensor.
         """
+        # Cache keyed by player_id — cleared once per hand in _play_hand_gen
+        if player_id in self._opp_embed_cache:
+            return self._opp_embed_cache[player_id]
+
         history = self.action_histories.get(player_id, [])
 
         if not history:
-            return self.opponent_encoder.encode_empty(1, device=str(self.device))
-
-        # Stack to (1, seq_len, 7)
-        seq = torch.stack(history).unsqueeze(0)
-        seq = self._to(seq)
-        embedding = self.opponent_encoder(seq)  # (1, embed_dim)
-        return embedding
+            emb = self.opponent_encoder.encode_empty(1, device=str(self.device))
+        else:
+            seq = torch.stack(history).unsqueeze(0)
+            seq = self._to(seq)
+            with torch.no_grad():
+                emb = self.opponent_encoder(seq)
+        
+        self._opp_embed_cache[player_id] = emb.detach()
+        return emb
 
     def _get_all_opponent_embeddings(self, hero_id: int, num_players: int) -> torch.Tensor:
         """
@@ -416,6 +423,7 @@ class NLHESelfPlayTrainer:
         Returns (experiences, reward) via StopIteration.value.
         """
         num_p, stacks = self._sample_table()
+        self._opp_embed_cache = {}  # Clear cache for new hand
 
         dealer = Dealer(
             num_players=num_p,
@@ -597,132 +605,138 @@ class NLHESelfPlayTrainer:
         """
         Run all hands for one epoch with batched GPU inference.
         
-        Instead of 16,000 individual GPU calls, this batches all pending
-        game decisions into ~40 large GPU forward passes.
+        Processes hands in sub-batches (chunks) to limit peak memory usage.
+        Each chunk runs all its games to completion before starting the next.
         """
         self.policy.eval()
         self.opponent_encoder.eval()
 
+        # Clear stale embedding cache from previous epoch
+        self._opp_embed_cache = {}
+
         num_hands = self.config.hands_per_epoch
         all_exp: List[Experience] = []
         total_reward = 0.0
+        total_finished = 0
 
-        # Start all games as generators
-        games = [self._play_hand_gen() for _ in range(num_hands)]
-        
-        # Prime each generator — advance to first yield
-        pending = {}
-        finished = 0
-        for i, g in enumerate(games):
-            try:
-                state = next(g)
-                pending[i] = (g, state)
-            except StopIteration as e:
-                # Game ended immediately (e.g., everyone folds preflop)
-                exps, reward = e.value
-                for pexp in exps:
-                    all_exp.extend(pexp)
-                total_reward += reward
-                finished += 1
+        # Process in chunks to limit memory
+        chunk_size = min(self.config.batch_chunk_size, num_hands)
+        epoch_start = time.time()
 
-        batch_count = 0
-        while pending:
-            batch_count += 1
-            game_indices = list(pending.keys())
-            states = [pending[i][1] for i in game_indices]
+        for chunk_start in range(0, num_hands, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, num_hands)
+            chunk_n = chunk_end - chunk_start
 
-            # ── Pad opponent tensors to same shape for batching ──
-            max_opps = max(s['opponent_embeddings'].shape[1] for s in states)
-            embed_dim = states[0]['opponent_embeddings'].shape[2]
-            stat_dim = states[0]['opponent_stats'].shape[2]
+            # Start this chunk of games
+            games = [self._play_hand_gen() for _ in range(chunk_n)]
 
-            # Collate into batched tensors
-            batch_hole = torch.cat([s['hole_cards'] for s in states], dim=0)
-            batch_comm = torch.cat([s['community_cards'] for s in states], dim=0)
-            batch_num = torch.cat([s['numeric_features'] for s in states], dim=0)
-            batch_mask = torch.cat([s['action_mask'] for s in states], dim=0)
-            batch_own = torch.cat([s['own_stats'] for s in states], dim=0)
-
-            # Pad opponent embeddings/stats to uniform shape
-            padded_opp_embeds = []
-            padded_opp_stats = []
-            opp_masks = []
-            for s in states:
-                oe = s['opponent_embeddings']  # (1, num_opp, embed_dim)
-                os_t = s['opponent_stats']      # (1, num_opp, stat_dim)
-                n_opp = oe.shape[1]
-                
-                if n_opp < max_opps:
-                    pad_e = torch.zeros(1, max_opps - n_opp, embed_dim, device=oe.device)
-                    oe = torch.cat([oe, pad_e], dim=1)
-                    pad_s = torch.zeros(1, max_opps - n_opp, stat_dim, device=os_t.device)
-                    os_t = torch.cat([os_t, pad_s], dim=1)
-                
-                padded_opp_embeds.append(oe)
-                padded_opp_stats.append(os_t)
-                
-                # Build mask: True for real opponents, False for padding
-                m = torch.zeros(1, max_opps, dtype=torch.bool, device=oe.device)
-                m[0, :n_opp] = True
-                opp_masks.append(m)
-
-            batch_opp_embed = torch.cat(padded_opp_embeds, dim=0)
-            batch_opp_stats = torch.cat(padded_opp_stats, dim=0)
-            batch_opp_mask = torch.cat(opp_masks, dim=0)
-
-            # Move entire batch to GPU in one shot
-            batch_hole = batch_hole.to(self.device)
-            batch_comm = batch_comm.to(self.device)
-            batch_num = batch_num.to(self.device)
-            batch_mask = batch_mask.to(self.device)
-            batch_own = batch_own.to(self.device)
-            batch_opp_embed = batch_opp_embed.to(self.device)
-            batch_opp_stats = batch_opp_stats.to(self.device)
-            batch_opp_mask = batch_opp_mask.to(self.device)
-
-            # ONE batched GPU forward pass for ALL pending games
-            with torch.no_grad():
-                output = self.policy(
-                    hole_cards=batch_hole,
-                    community_cards=batch_comm,
-                    numeric_features=batch_num,
-                    opponent_embeddings=batch_opp_embed,
-                    opponent_stats=batch_opp_stats,
-                    own_stats=batch_own,
-                    action_mask=batch_mask,
-                    opponent_mask=batch_opp_mask,
-                )
-
-            # Distribute results back to each game
-            for batch_idx, game_idx in enumerate(game_indices):
-                g, state_dict = pending[game_idx]
-
-                probs = output.action_type_probs[batch_idx].cpu()
-                value = output.value[batch_idx, 0].item()
-                sizing = output.bet_sizing[batch_idx, 0].item()
-
-                # Apply personality perturbation for opponent seats
-                personality = state_dict['_personality']
-                situations = state_dict['_situations']
-                if personality is not None:
-                    probs = personality.apply(probs, situations, hand_strength=0.5)
-
+            # Prime each generator
+            pending = {}
+            for i, g in enumerate(games):
                 try:
-                    new_state = g.send((probs, value, sizing))
-                    pending[game_idx] = (g, new_state)
+                    state = next(g)
+                    pending[i] = (g, state)
                 except StopIteration as e:
                     exps, reward = e.value
                     for pexp in exps:
                         all_exp.extend(pexp)
                     total_reward += reward
-                    del pending[game_idx]
-                    finished += 1
+                    total_finished += 1
 
-            # Verbose progress
-            if self.config.verbose and batch_count % 5 == 0:
-                import time as _t
-                elapsed = _t.time() - _t.time() if not hasattr(self, '_epoch_start') else _t.time() - self._epoch_start
-                print(f"    Batch {batch_count}: {finished}/{num_hands} hands done, {len(pending)} active")
+            # Run this chunk to completion
+            while pending:
+                game_indices = list(pending.keys())
+                states = [pending[i][1] for i in game_indices]
+
+                # Pad opponent tensors to same shape for batching
+                max_opps = max(s['opponent_embeddings'].shape[1] for s in states)
+                embed_dim = states[0]['opponent_embeddings'].shape[2]
+                stat_dim = states[0]['opponent_stats'].shape[2]
+
+                # Collate into batched tensors
+                batch_hole = torch.cat([s['hole_cards'] for s in states], dim=0)
+                batch_comm = torch.cat([s['community_cards'] for s in states], dim=0)
+                batch_num = torch.cat([s['numeric_features'] for s in states], dim=0)
+                batch_mask = torch.cat([s['action_mask'] for s in states], dim=0)
+                batch_own = torch.cat([s['own_stats'] for s in states], dim=0)
+
+                padded_opp_embeds = []
+                padded_opp_stats = []
+                opp_masks = []
+                for s in states:
+                    oe = s['opponent_embeddings']
+                    os_t = s['opponent_stats']
+                    n_opp = oe.shape[1]
+                    if n_opp < max_opps:
+                        pad_e = torch.zeros(1, max_opps - n_opp, embed_dim, device=oe.device)
+                        oe = torch.cat([oe, pad_e], dim=1)
+                        pad_s = torch.zeros(1, max_opps - n_opp, stat_dim, device=os_t.device)
+                        os_t = torch.cat([os_t, pad_s], dim=1)
+                    padded_opp_embeds.append(oe)
+                    padded_opp_stats.append(os_t)
+                    m = torch.zeros(1, max_opps, dtype=torch.bool, device=oe.device)
+                    m[0, :n_opp] = True
+                    opp_masks.append(m)
+
+                batch_opp_embed = torch.cat(padded_opp_embeds, dim=0)
+                batch_opp_stats = torch.cat(padded_opp_stats, dim=0)
+                batch_opp_mask = torch.cat(opp_masks, dim=0)
+
+                # Move entire batch to device
+                batch_hole = batch_hole.to(self.device)
+                batch_comm = batch_comm.to(self.device)
+                batch_num = batch_num.to(self.device)
+                batch_mask = batch_mask.to(self.device)
+                batch_own = batch_own.to(self.device)
+                batch_opp_embed = batch_opp_embed.to(self.device)
+                batch_opp_stats = batch_opp_stats.to(self.device)
+                batch_opp_mask = batch_opp_mask.to(self.device)
+
+                # Batched GPU forward pass
+                with torch.no_grad():
+                    output = self.policy(
+                        hole_cards=batch_hole,
+                        community_cards=batch_comm,
+                        numeric_features=batch_num,
+                        opponent_embeddings=batch_opp_embed,
+                        opponent_stats=batch_opp_stats,
+                        own_stats=batch_own,
+                        action_mask=batch_mask,
+                        opponent_mask=batch_opp_mask,
+                    )
+
+                # Distribute results back to each game
+                for batch_idx, game_idx in enumerate(game_indices):
+                    g, state_dict = pending[game_idx]
+
+                    probs = output.action_type_probs[batch_idx].cpu()
+                    value = output.value[batch_idx, 0].item()
+                    sizing = output.bet_sizing[batch_idx, 0].item()
+
+                    personality = state_dict['_personality']
+                    situations = state_dict['_situations']
+                    if personality is not None:
+                        probs = personality.apply(probs, situations, hand_strength=0.5)
+
+                    try:
+                        new_state = g.send((probs, value, sizing))
+                        pending[game_idx] = (g, new_state)
+                    except StopIteration as e:
+                        exps, reward = e.value
+                        for pexp in exps:
+                            all_exp.extend(pexp)
+                        total_reward += reward
+                        del pending[game_idx]
+                        total_finished += 1
+
+            # Verbose progress per chunk
+            if self.config.verbose and num_hands > chunk_size:
+                elapsed = time.time() - epoch_start
+                hands_done = chunk_end
+                hands_per_s = hands_done / elapsed if elapsed > 0 else 0
+                remaining = num_hands - hands_done
+                eta = remaining / hands_per_s if hands_per_s > 0 else 0
+                print(f"    {hands_done}/{num_hands} hands ({elapsed:.1f}s, {hands_per_s:.1f} h/s, ETA {eta:.0f}s)")
 
         return all_exp, total_reward
 
@@ -827,8 +841,13 @@ class NLHESelfPlayTrainer:
     # Training loop
     # ─────────────────────────────────────────────────────────
 
-    def train(self, num_epochs: int = 100) -> Dict[str, List[float]]:
-        """Run NLHE self-play training with batched GPU inference."""
+    def train(self, num_epochs: int = 100, epoch_callback=None) -> Dict[str, List[float]]:
+        """Run NLHE self-play training with batched GPU inference.
+        
+        Args:
+            num_epochs: Number of epochs to train.
+            epoch_callback: Optional function(trainer, epoch, metrics) called after each epoch.
+        """
         metrics = {
             'epoch_reward': [],
             'epoch_loss': [],
@@ -857,6 +876,13 @@ class NLHESelfPlayTrainer:
 
             avg_loss = total_loss / self.config.ppo_epochs
 
+            # Free experience memory and flush device cache
+            del all_exp
+            if self.device.type == 'mps':
+                torch.mps.empty_cache()
+            elif self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+
             metrics['epoch_reward'].append(avg_reward)
             metrics['epoch_loss'].append(avg_loss)
 
@@ -869,6 +895,9 @@ class NLHESelfPlayTrainer:
                     f"Reward: {avg_reward:+.3f} bb | "
                     f"Loss: {avg_loss:.4f}"
                 )
+
+            if epoch_callback:
+                epoch_callback(self, epoch + 1, metrics)
 
         return metrics
 

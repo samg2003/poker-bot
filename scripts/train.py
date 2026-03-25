@@ -151,34 +151,44 @@ def train_nlhe(args):
         device=args.device,
         search_fraction=args.search_fraction,
         verbose=args.verbose,
+        batch_chunk_size=args.batch_chunk_size,
     )
     trainer = NLHESelfPlayTrainer(config=config, seed=args.seed)
 
     checkpoint_mgr = CheckpointManager(args.checkpoint_dir)
-    metrics = trainer.train(num_epochs=args.epochs)
 
-    # Save checkpoint
-    avg_reward = metrics['epoch_reward'][-1] if metrics['epoch_reward'] else 0.0
-    avg_loss = metrics['epoch_loss'][-1] if metrics['epoch_loss'] else 0.0
+    def _make_metadata(epoch, metrics):
+        avg_reward = metrics['epoch_reward'][-1] if metrics['epoch_reward'] else 0.0
+        avg_loss = metrics['epoch_loss'][-1] if metrics['epoch_loss'] else 0.0
+        return CheckpointMetadata(
+            version=f"nlhe_v{epoch:04d}",
+            created_at=datetime.now().isoformat(),
+            epoch=epoch,
+            stage=f"NLHE {players_str} {stacks_str}",
+            total_hands=epoch * args.hands,
+            avg_reward=avg_reward,
+            loss=avg_loss,
+            test_count=175,
+            config={
+                'embed_dim': args.embed_dim,
+                'num_heads': args.num_heads,
+                'num_layers': args.num_layers,
+                'game': 'nlhe',
+            },
+        )
 
-    metadata = CheckpointMetadata(
-        version=f"nlhe_v{args.epochs:04d}",
-        created_at=datetime.now().isoformat(),
-        epoch=args.epochs,
-        stage=f"NLHE {players_str} {stacks_str}",
-        total_hands=args.epochs * args.hands,
-        avg_reward=avg_reward,
-        loss=avg_loss,
-        test_count=175,
-        config={
-            'embed_dim': args.embed_dim,
-            'num_heads': args.num_heads,
-            'num_layers': args.num_layers,
-            'game': 'nlhe',
-        },
-    )
-    checkpoint_mgr.save(trainer.policy, trainer.opponent_encoder, trainer.optimizer, metadata)
-    checkpoint_mgr.save_best(trainer.policy, trainer.opponent_encoder, trainer.optimizer, metadata)
+    def _on_epoch(trainer, epoch, metrics):
+        if args.save_interval > 0 and epoch % args.save_interval == 0:
+            meta = _make_metadata(epoch, metrics)
+            checkpoint_mgr.save(trainer.policy, trainer.opponent_encoder, trainer.optimizer, meta)
+            print(f"    ✓ Checkpoint saved at epoch {epoch}")
+
+    metrics = trainer.train(num_epochs=args.epochs, epoch_callback=_on_epoch)
+
+    # Final save
+    meta = _make_metadata(args.epochs, metrics)
+    checkpoint_mgr.save(trainer.policy, trainer.opponent_encoder, trainer.optimizer, meta)
+    checkpoint_mgr.save_best(trainer.policy, trainer.opponent_encoder, trainer.optimizer, meta)
 
     best_reward = max(metrics['epoch_reward']) if metrics['epoch_reward'] else 0.0
     print(f"\nTraining complete. Best reward: {best_reward:+.4f} bb")
@@ -235,6 +245,8 @@ def main():
                         help='Enable verbose output with timing and progress updates')
     parser.add_argument('--search-fraction', type=float, default=0.0,
                         help='Fraction of hands using search (0-1, default: 0 = off)')
+    parser.add_argument('--batch-chunk-size', type=int, default=500,
+                        help='Max simultaneous games per sub-batch (default: 500, lower to save memory)')
 
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',

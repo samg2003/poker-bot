@@ -40,6 +40,8 @@ def main():
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
                         help='Directory where checkpoints are stored')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--game', type=str, choices=['leduc', 'nlhe'], default='leduc',
+                        help='Game to evaluate (default: leduc)')
 
     args = parser.parse_args()
 
@@ -60,7 +62,8 @@ def main():
                 embed_dim = cfg.get('embed_dim', embed_dim)
                 num_heads = cfg.get('num_heads', num_heads)
                 num_layers = cfg.get('num_layers', num_layers)
-                print(f"Auto-loaded architecture: embed_dim={embed_dim}, num_heads={num_heads}, num_layers={num_layers}")
+                args.game = cfg.get('game', args.game)
+                print(f"Auto-loaded config: game={args.game}, embed_dim={embed_dim}, num_heads={num_heads}, num_layers={num_layers}")
 
     # Create models
     policy = PolicyNetwork(
@@ -83,10 +86,10 @@ def main():
         print()
 
     # Run evaluation benchmarks
-    print("Running evaluation benchmarks...")
+    print(f"Running evaluation benchmarks for {args.game.upper()}...")
     print()
 
-    evaluator = Evaluator(policy, encoder, seed=args.seed, num_hands=args.num_hands)
+    evaluator = Evaluator(policy, encoder, seed=args.seed, num_hands=args.num_hands, game=args.game)
     results = evaluator.run_all_benchmarks()
     print(results.summary())
 

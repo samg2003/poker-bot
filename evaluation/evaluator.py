@@ -30,6 +30,8 @@ from training.personality import (
     detect_situations, sample_table_personalities,
 )
 from engine.leduc_poker import LeducState, deal_leduc, CHECK, BET, FOLD, CALL, RAISE
+from engine.dealer import Dealer
+from engine.game_state import ActionType, Action, Street
 from agent.config import AgentConfig
 
 
@@ -94,11 +96,13 @@ class Evaluator:
         opponent_encoder: OpponentEncoder,
         seed: int = 42,
         num_hands: int = 500,
+        game: str = 'leduc',
     ):
         self.policy = policy
         self.opponent_encoder = opponent_encoder
         self.rng = random.Random(seed)
         self.num_hands = num_hands
+        self.game = game
         self.stat_tracker = StatTracker()
 
     def _play_eval_hand(
@@ -109,6 +113,9 @@ class Evaluator:
         Play one hand: model (player 0) vs personality-modified opponent (player 1).
         Returns reward for player 0.
         """
+        if self.game == 'nlhe':
+            return self._play_eval_hand_nlhe(personality)
+        
         self.policy.eval()
 
         p1_card, p2_card, board_card = deal_leduc(self.rng)
@@ -190,6 +197,116 @@ class Evaluator:
         if state.is_terminal:
             return state.get_payoff(0)
         return 0.0
+
+    def _play_eval_hand_nlhe(self, personality: SituationalPersonality) -> float:
+        self.policy.eval()
+
+        dealer = Dealer(
+            num_players=2,
+            stacks=[100.0, 100.0],
+            small_blind=0.5,
+            big_blind=1.0,
+            dealer_button=self.rng.randint(0, 1),
+            seed=self.rng.randint(0, 2**31)
+        )
+        game_state = dealer.start_hand()
+        # player 0 is model, player 1 is opponent
+
+        while not dealer.is_hand_over():
+            pid = game_state.current_player_idx
+            p = game_state.players[pid]
+
+            hole = torch.tensor([list(p.hole_cards)], dtype=torch.long)
+            board = list(game_state.board)
+            while len(board) < 5:
+                board.append(-1)
+            community = torch.tensor([board[:5]], dtype=torch.long)
+
+            pot = game_state.pot / 100.0
+            own_stack = p.stack / 100.0
+            own_bet = p.bet_this_street / 100.0
+            rel_pos = (pid - game_state.dealer_button) % 2
+            position = rel_pos / 1.0
+
+            street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
+            street_val = street_map.get(game_state.street, 0) / 3.0
+
+            num_active = sum(1 for pp in game_state.players if pp.is_active)
+            current_bet = game_state.current_bet / 100.0
+            min_raise = game_state.min_raise / 100.0
+
+            numeric = torch.tensor([[
+                pot, own_stack, own_bet, position, street_val,
+                2.0 / 9.0, num_active / 9.0,
+                current_bet, min_raise,
+            ]], dtype=torch.float32)
+
+            legal_types = game_state.get_legal_actions()
+            mask = torch.zeros(1, NUM_ACTION_TYPES, dtype=torch.bool)
+            for at in legal_types:
+                if at == ActionType.FOLD:
+                    mask[0, ActionIndex.FOLD] = True
+                elif at == ActionType.CHECK:
+                    mask[0, ActionIndex.CHECK] = True
+                elif at == ActionType.CALL:
+                    mask[0, ActionIndex.CALL] = True
+                elif at in (ActionType.RAISE, ActionType.ALL_IN):
+                    mask[0, ActionIndex.RAISE] = True
+
+            opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)
+            opp_stats = torch.zeros(1, 1, NUM_STAT_FEATURES)
+            own_stats = torch.zeros(1, NUM_STAT_FEATURES)
+
+            with torch.no_grad():
+                out = self.policy(
+                    hole, community, numeric, opp_embed, opp_stats, own_stats,
+                    action_mask=mask
+                )
+
+            probs = out.action_type_probs[0]
+            sizing = out.bet_sizing[0, 0].item()
+
+            if pid == 1:
+                # Calculate simple hand strength proxy for opponent personality
+                hand_strength = 0.5
+                if game_state.street == Street.PREFLOP:
+                    c1, c2 = p.hole_cards
+                    r1 = c1 // 4
+                    r2 = c2 // 4
+                    if r1 == r2: hand_strength = 0.8
+                    elif max(r1, r2) >= 10: hand_strength = 0.6
+                    else: hand_strength = 0.2
+
+                situations = detect_situations(street=street_map.get(game_state.street, 0))
+                probs = personality.apply(probs, situations, hand_strength=hand_strength)
+
+            from torch.distributions import Categorical
+            dist = Categorical(probs)
+            a_idx = dist.sample().item()
+
+            if a_idx == ActionIndex.FOLD and ActionType.FOLD in legal_types:
+                act = Action(ActionType.FOLD)
+            elif a_idx == ActionIndex.CHECK and ActionType.CHECK in legal_types:
+                act = Action(ActionType.CHECK)
+            elif a_idx == ActionIndex.CALL and ActionType.CALL in legal_types:
+                act = Action(ActionType.CALL)
+            elif a_idx == ActionIndex.RAISE and ActionType.RAISE in legal_types:
+                min_r = game_state.get_min_raise_to()
+                max_r = game_state.get_max_raise_to()
+                rt = min_r + sizing * (max_r - min_r)
+                act = Action(ActionType.RAISE, amount=max(min_r, min(rt, max_r)))
+            else:
+                if ActionType.CHECK in legal_types:
+                    act = Action(ActionType.CHECK)
+                elif ActionType.CALL in legal_types:
+                    act = Action(ActionType.CALL)
+                else:
+                    act = Action(ActionType.FOLD)
+
+            dealer.apply_action(act)
+
+        # Player 0 profit in big blinds (from 100bb start)
+        return game_state.players[0].stack - 100.0
 
     def benchmark_exploitation(self) -> BenchmarkResult:
         """
