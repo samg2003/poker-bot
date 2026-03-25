@@ -101,8 +101,8 @@ python3 scripts/train.py --curriculum --epochs 500
 
 ### No-Limit Hold'em (GPU recommended)
 ```bash
-# Universal training — randomizes players (2-6) & stacks (20-200bb) per hand
-# Auto-detects GPU (CUDA/MPS), tracks opponent history, trains one universal model
+# Universal training — randomizes players (2-9) & stacks (10-300bb) per hand
+# Auto-detects GPU (CUDA/MPS), personality curriculum kicks in at epoch 10
 python3 scripts/train.py --game nlhe --epochs 500
 
 # With search-guided expert iteration (10% of hands use System 2 CFR)
@@ -111,10 +111,8 @@ python3 scripts/train.py --game nlhe --epochs 500 --search-fraction 0.1
 # Fixed heads-up, 100bb deep
 python3 scripts/train.py --game nlhe --epochs 500 --num-players 2 --starting-bb 100
 
-# Custom ranges
-python3 scripts/train.py --game nlhe --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300
-
-python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 4 --hands 2048 --epochs 100 --workers 5 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --verbose 
+# Full config for GPU instance (e.g., g5.xlarge with CUDA)
+python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 4 --hands 2048 --epochs 500 --min-players 2 --max-players 9 --min-bb 10 --max-bb 300 --device cuda --verbose
 ```
 
 ### Full CLI Options
@@ -134,8 +132,6 @@ python3 scripts/train.py --game nlhe --embed-dim 256 --num-layers 4 --num-heads 
 --max-bb N              Max stack in BB when random (default: 200)
 --device STR            Device: auto, cuda, mps, cpu (default: auto)
 --threads N             Number of CPU threads to use; 0=all (default: 0)
---workers N             Number of parallel CPU simulation workers (default: 1)
---compile               Use torch.compile to aggressively optimize model math structure
 --verbose               Enable verbose output with timing and progress updates
 --search-fraction F     Fraction of hands using search (default: 0)
 --checkpoint-dir DIR    Where to save checkpoints (default: checkpoints/)

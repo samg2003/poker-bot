@@ -104,63 +104,12 @@ class NLHETrainingConfig:
 
     # Device
     device: str = "auto"  # "auto", "cuda", "mps", "cpu"
-    workers: int = 1      # Number of parallel CPU workers
-    compile: bool = False # Use torch.compile to accelerate model mathematically
 
     # Logging
     log_interval: int = 10
     verbose: bool = False
 
 
-# ─────────────────────────────────────────────────────────────
-# Trainer
-# ─────────────────────────────────────────────────────────────
-
-import io
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
-
-def _mp_rollout_worker(args):
-    """Module-level worker function for parallel self-play.
-    
-    Each worker receives the model weights ONCE and plays MULTIPLE hands,
-    avoiding the massive IPC serialization bottleneck of sending weights per-hand.
-    """
-    import sys, os
-    # Suppress verbose PyTorch macOS Metal Performance Shaders (MPS) Graph permission warnings
-    sys.stderr = open(os.devnull, 'w')
-    sys.stdout = open(os.devnull, 'w')
-    
-    # Disable Xcode cache locks to allow multiple workers to successfully compile PyTorch C++ kernels identically
-    os.environ['XCRUN_CACHE_DISABLE'] = '1'
-    
-    config, seed, sd_policy, sd_opp, num_hands = args
-    # Recreate a lightweight CPU-only trainer for simulation
-    config.device = "cpu"
-    # macOS strictly forbids spawned child processes from invoking clang++ in /tmp directories, 
-    # so we MUST disable torch.compile for the rollouts. (this works fine on AWS Linux though!)
-    if sys.platform == 'darwin':
-        config.compile = False
-        
-    trainer = NLHESelfPlayTrainer(config, seed=seed)
-    
-    # Load PyTorch state dicts seamlessly via numpy arrays (ONCE per worker)
-    sd_policy_t = {k: torch.from_numpy(v) for k, v in sd_policy.items()}
-    sd_opp_t = {k: torch.from_numpy(v) for k, v in sd_opp.items()}
-    
-    trainer.policy.load_state_dict(sd_policy_t)
-    trainer.opponent_encoder.load_state_dict(sd_opp_t)
-    
-    # Play MULTIPLE hands in this single worker process
-    all_results = []
-    for _ in range(num_hands):
-        experiences = trainer._play_hand(use_search=False)
-        all_results.append(experiences)
-    
-    # Serialize all hands to raw bytes to bypass PyTorch IPC shared_memory socket limits on Mac
-    buf = io.BytesIO()
-    torch.save(all_results, buf)
-    return buf.getvalue()
 
 class NLHESelfPlayTrainer:
     """
@@ -191,17 +140,6 @@ class NLHESelfPlayTrainer:
             num_cross_attn_heads=self.config.num_heads,
             num_cross_attn_layers=self.config.num_layers,
         ).to(self.device)
-
-        if self.config.compile:
-            try:
-                # Compile networks down to C++ / triton loops to maximize speed on CPU layers
-                self.policy = torch.compile(self.policy)
-                self.opponent_encoder = torch.compile(self.opponent_encoder)
-                if self.config.verbose:
-                    print(f"✅ Successfully compiled Policy and Encoder networks on {self.device}")
-            except Exception as e:
-                import warnings
-                warnings.warn(f"torch.compile failed on {self.device}. Falling back to default: {e}")
 
         all_params = list(self.policy.parameters()) + list(self.opponent_encoder.parameters())
         self.optimizer = torch.optim.Adam(all_params, lr=self.config.lr)
@@ -749,9 +687,7 @@ class NLHESelfPlayTrainer:
             'epoch_loss': [],
         }
 
-        print(f"Device: {self.device}")
-        
-        pool = ProcessPoolExecutor(max_workers=self.config.workers) if self.config.workers > 1 else None
+
 
         for epoch in range(num_epochs):
             self.current_epoch = epoch + 1
@@ -764,50 +700,17 @@ class NLHESelfPlayTrainer:
                 for _ in range(self.config.hands_per_epoch)
             ]
 
-            if pool:
-                # Export weights as simple nested numpy matrices, stripping compiled `_orig_mod.` prefix
-                sd_policy = {k.replace('_orig_mod.', ''): v.cpu().numpy() for k, v in self.policy.state_dict().items()}
-                sd_opp = {k.replace('_orig_mod.', ''): v.cpu().numpy() for k, v in self.opponent_encoder.state_dict().items()}
-                
-                # Distribute hands evenly across workers (send weights ONCE per worker, not per hand)
-                num_workers = self.config.workers
-                hands_per_worker = self.config.hands_per_epoch // num_workers
-                remainder = self.config.hands_per_epoch % num_workers
-                
-                base_seed = self.rng.randint(0, 1000000)
-                tasks = []
-                for w in range(num_workers):
-                    w_hands = hands_per_worker + (1 if w < remainder else 0)
-                    if w_hands > 0:
-                        tasks.append((self.config, base_seed + w, sd_policy, sd_opp, w_hands))
-                
-                results_bytes = list(pool.map(_mp_rollout_worker, tasks))
-                
-                # Deserialize batched results from each worker
-                for b in results_bytes:
-                    worker_hands = torch.load(io.BytesIO(b), weights_only=False)
-                    for player_experiences in worker_hands:
-                        for pexp in player_experiences:
-                            all_exp.extend(pexp)
-                        if player_experiences[0]:
-                            epoch_reward += player_experiences[0][0].reward
-                        
-                if self.config.verbose:
+            for hand_i in range(self.config.hands_per_epoch):
+                player_experiences = self._play_hand(use_search=use_search_list[hand_i])
+                for pexp in player_experiences:
+                    all_exp.extend(pexp)
+                if player_experiences[0]:
+                    epoch_reward += player_experiences[0][0].reward
+
+                # Verbose progress tracking
+                if self.config.verbose and (hand_i + 1) % max(1, self.config.hands_per_epoch // 5) == 0:
                     elapsed = time.time() - epoch_start
-                    print(f"  [Epoch {epoch+1:4d}] Collected {self.config.hands_per_epoch} hands concurrently... ({elapsed:.1f}s)")
-
-            else:
-                for hand_i in range(self.config.hands_per_epoch):
-                    player_experiences = self._play_hand(use_search=use_search_list[hand_i])
-                    for pexp in player_experiences:
-                        all_exp.extend(pexp)
-                    if player_experiences[0]:
-                        epoch_reward += player_experiences[0][0].reward
-
-                    # Verbose progress tracking
-                    if self.config.verbose and (hand_i + 1) % max(1, self.config.hands_per_epoch // 5) == 0:
-                        elapsed = time.time() - epoch_start
-                        print(f"  [Epoch {epoch+1:4d}] Hand {hand_i+1}/{self.config.hands_per_epoch}... ({elapsed:.1f}s)")
+                    print(f"  [Epoch {epoch+1:4d}] Hand {hand_i+1}/{self.config.hands_per_epoch}... ({elapsed:.1f}s)")
 
             avg_reward = (epoch_reward / self.config.hands_per_epoch) * 100.0
 

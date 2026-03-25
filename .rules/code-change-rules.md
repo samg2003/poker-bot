@@ -1,0 +1,5 @@
+- IF permission issues, stop and ask user to run the command. Continue once user replies back continue
+- Do not make janky fixes, do not assume things, if something is unclear. Stop ask user directly. Do not make any assumptions without user approval
+- Make sure whatever you do there is test for it and you tested the test running. 
+- Your prompt can influence multiple things look into docs/ to understand relevant project level information
+- run /update-docs.md workflow after each code change

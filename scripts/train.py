@@ -149,8 +149,6 @@ def train_nlhe(args):
         min_bb=args.min_bb,
         max_bb=args.max_bb,
         device=args.device,
-        workers=args.workers,
-        compile=args.compile,
         search_fraction=args.search_fraction,
         verbose=args.verbose,
     )
@@ -225,10 +223,6 @@ def main():
     # Hardware & features
     parser.add_argument('--threads', type=int, default=0,
                         help='Number of CPU threads to use (0 = unconstrained, default: 0)')
-    parser.add_argument('--workers', type=int, default=1,
-                        help='Number of parallel CPU workers (1 = disable)')
-    parser.add_argument('--compile', action='store_true',
-                        help='Use torch.compile to aggressively optimize model math structure')
     parser.add_argument('--device', type=str, default='auto',
                         help='Device: auto, cuda, mps, cpu (default: auto)')
     parser.add_argument('--verbose', action='store_true',
