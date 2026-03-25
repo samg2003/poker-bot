@@ -213,11 +213,19 @@ class PolicyNetwork(nn.Module):
             nn.Linear(embed_dim, 10),
         )
 
-        # Value head (scalar expected value)
+        # Value head — own trunk + deeper network (separate from policy)
+        # V(s) needs high capacity to learn state values for GAE
+        self.value_trunk = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),  # separate projection from combined features
+            nn.GELU(),
+            nn.LayerNorm(embed_dim),
+        )
         self.value_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, 1),
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, 1),
         )
 
         self._init_weights()
@@ -226,7 +234,7 @@ class PolicyNetwork(nn.Module):
         """Initialize weights with small values."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.02)
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -301,7 +309,12 @@ class PolicyNetwork(nn.Module):
         # 4. Add own stats awareness
         own_repr = self.own_stats_proj(own_stats)
         combined = torch.cat([state_with_opponents, own_repr], dim=-1)
+
+        # Policy trunk
         features = self.pre_head(combined)  # (batch, embed_dim)
+
+        # Value trunk (separate from policy to prevent interference)
+        value_features = self.value_trunk(combined)  # (batch, embed_dim)
 
         # 5. Action type head
         action_logits = self.action_head(features)  # (batch, 4)
@@ -319,8 +332,8 @@ class PolicyNetwork(nn.Module):
         if sizing_mask is not None:
             bet_size_logits = bet_size_logits.masked_fill(~sizing_mask, float('-inf'))
 
-        # 7. Value head
-        value = self.value_head(features)  # (batch, 1)
+        # 7. Value head (uses its own trunk, not shared features)
+        value = self.value_head(value_features)  # (batch, 1)
 
         return ActionOutput(
             action_type_logits=action_logits,

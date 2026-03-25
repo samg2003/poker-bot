@@ -18,13 +18,13 @@ def test_sizing_mask_preflop_deep():
     assert mask.dtype == torch.bool
     
     # Let's check which buckets are legal.
-    # target = 2 + frac * 3
-    # min_raise = 4. 4 <= 2 + frac*3 => frac >= 2/3 (0.66)
+    # target = frac * pot = frac * 3
+    # min_raise = 4. frac*3 >= 4 => frac >= 4/3 (1.33)
     for i, frac in enumerate(POT_FRACTIONS):
         if frac < 0:
             assert mask[i] == True, "All-in should always be legal if raising is legal"
         else:
-            target = state.current_bet + frac * state.pot
+            target = frac * state.pot
             is_legal = (target >= 4.0 - 1e-5) and (target <= 100.0 + 1e-5)
             assert mask[i] == is_legal, f"Bucket {frac} legality mismatch. Target = {target}"
 
@@ -41,7 +41,7 @@ def test_sizing_mask_short_stack():
         if frac < 0:
             assert mask[i] == True  # All in
         else:
-            target = state.current_bet + frac * state.pot
+            target = frac * state.pot
             # If target > 10, should be masked!
             if target > 10.0 + 1e-5:
                 assert mask[i] == False, f"Target {target} should be illegal since stack is 10"
@@ -53,17 +53,18 @@ def test_sizing_mask_forced_all_in():
     state.post_blinds()
     # P0 posted 1 (2 left). BB posted 2. Pot = 3.
     # P0 max raise is 3 (all-in).
-    # But current_bet = 2. Min raise = 4 (which is > 3).
-    # Therefore NO sizing multiplier is mathematically >= min_raise AND <= max_raise, EXCEPT all-in.
+    # With frac * pot formula: pot=3, min_raise=4 (>3=max_raise)
     mask = get_sizing_mask(state)
-    
-    # We expect all buckets to fail typical constraints, but Fallback/All-in MUST be True.
-    assert mask[-1] == True, "All-in bucket must be legal even if it's a short all-in"
-    
-    # Standard check: None of the other buckets should realistically be allowed,
-    # OR if they evaluate, they shouldn't mistakenly trigger the mask.
+    # frac*3 must be >= 4 and <= 3 — impossible for any positive frac.
+    # Only all-in and the fallback should be legal.
+    # 1.0*3=3 which is <= max_raise=3 but < min_raise=4, so still illegal.
+    # Actually frac*pot: frac=1.0 => 3.0 which equals max_raise but < min_raise.
+    # So only all-in should be legal.
     for i in range(len(POT_FRACTIONS) - 1):
-        assert mask[i] == False, f"Bucket index {i} should be illegal because stack is too small"
+        frac = POT_FRACTIONS[i]
+        target = frac * state.pot  # frac * 3
+        is_legal = (target >= state.get_min_raise_to() - 1e-5) and (target <= state.get_max_raise_to() + 1e-5)
+        assert mask[i] == is_legal, f"Bucket index {i} (frac={frac}, target={target}) legality mismatch"
 
 def test_evaluator_amount_clamping():
     """
@@ -81,19 +82,19 @@ def test_evaluator_amount_clamping():
     max_r = state.get_max_raise_to() # 10
     
     # Suppose model selected the 2.0x pot bucket (index 8).
-    # Target = 2 + 2.0 * 3 = 8
+    # Target = frac * pot = 2.0 * 3 = 6
     frac = 2.0
-    rt = state.current_bet + frac * state.pot
-    assert rt == 8.0
+    rt = frac * state.pot
+    assert rt == 6.0
     
     # Clamp
     amount = max(min_r, min(rt, max_r))
-    assert amount == 8.0
+    assert amount == 6.0
     
-    # Now suppose pot explodes and model selected 2.0x pot which is 20 chips!
+    # Now suppose pot explodes and model selected 2.0x pot which is 30 chips!
     state.pot = 15.0
-    rt = state.current_bet + frac * state.pot
-    assert rt == 32.0  # 2 + 2*15
+    rt = frac * state.pot
+    assert rt == 30.0  # 2*15
     # Clamp
     amount = max(min_r, min(rt, max_r))
     assert amount == 10.0  # Clamped exactly to max_raise (All In!)

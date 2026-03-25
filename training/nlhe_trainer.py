@@ -13,6 +13,7 @@ Each hand randomly samples:
 
 from __future__ import annotations
 
+import copy
 import random
 import time
 from dataclasses import dataclass, field
@@ -26,7 +27,7 @@ from engine.game_state import GameState, Action, ActionType, Street
 from engine.dealer import Dealer
 from model.action_space import (
     ActionIndex, ActionOutput, NUM_ACTION_TYPES,
-    ACTION_FEATURE_DIM, encode_action,
+    ACTION_FEATURE_DIM, encode_action, POT_FRACTIONS,
 )
 from model.opponent_encoder import OpponentEncoder
 from model.policy_network import PolicyNetwork
@@ -51,14 +52,15 @@ class Experience(NamedTuple):
     opponent_embeddings: torch.Tensor # (1, num_opp, embed_dim)
     opponent_stats: torch.Tensor      # (1, num_opp, stat_dim)
     own_stats: torch.Tensor           # (1, stat_dim)
-    own_stats: torch.Tensor           # (1, stat_dim)
     action_mask: torch.Tensor         # (1, 4)
     sizing_mask: torch.Tensor         # (1, 10)
     action_idx: int                   # chosen action
     sizing_idx: int                   # chosen sizing bucket (0 if not raise)
-    log_prob: float                   # log prob of chosen action
+    log_prob: float                   # log prob of chosen action (from RAW model, not floor)
     value: float                      # value estimate
     reward: float                     # final reward (set after hand ends)
+    hand_id: int = 0                  # groups decisions into per-hand trajectories
+    step_idx: int = 0                 # position within trajectory
 
 
 # ─────────────────────────────────────────────────────────────
@@ -89,15 +91,25 @@ class NLHETrainingConfig:
 
     # Training
     lr: float = 3e-4
-    gamma: float = 1.0
+    gamma: float = 0.99          # was 1.0 — temporal discount for GAE
+    gae_lambda: float = 0.95     # GAE lambda parameter
     ppo_clip: float = 0.2
     ppo_epochs: int = 4
-    entropy_coef: float = 0.02
+    entropy_coef: float = 0.05   # was 0.02 — anneals to entropy_coef_end
+    entropy_coef_end: float = 0.01
     value_coef: float = 0.5
 
     # Self-play
-    hands_per_epoch: int = 128
+    hands_per_epoch: int = 512   # was 128 — increased for hero-only training
     batch_chunk_size: int = 500  # Max simultaneous games per sub-batch
+
+    # Frozen opponent pool
+    frozen_update_interval: int = 20   # sync frozen opponent every N epochs
+    max_opponent_pool_size: int = 10   # keep last N snapshots
+
+    # Exploration floor (training only, annealed)
+    exploration_floor: float = 0.05    # min probability for each legal action type
+    exploration_floor_end: float = 0.01  # floor at end of training
 
     # Opponent modeling
     history_reset_interval: Tuple[int, int] = (300, 500)
@@ -117,8 +129,11 @@ class NLHETrainingConfig:
 
 class NLHESelfPlayTrainer:
     """
-    Self-play trainer on full NLHE with:
+    Balanced self-play trainer on full NLHE with:
+    - Frozen opponent pool (hero-only training)
+    - Per-hand trajectory GAE for credit assignment
     - Real opponent embeddings from action history tracking
+    - Exploration floor to prevent local minima collapse
     - Auto GPU/MPS acceleration
     - Optional search-guided expert iteration
     """
@@ -131,7 +146,7 @@ class NLHESelfPlayTrainer:
         # ── Device ────────────────────────────────────────────
         self.device = self._resolve_device(self.config.device)
 
-        # ── Models ────────────────────────────────────────────
+        # ── Live models (trained via PPO) ─────────────────────
         self.opponent_encoder = OpponentEncoder(
             embed_dim=self.config.opponent_embed_dim,
             num_layers=self.config.num_layers,
@@ -148,6 +163,21 @@ class NLHESelfPlayTrainer:
         all_params = list(self.policy.parameters()) + list(self.opponent_encoder.parameters())
         self.optimizer = torch.optim.Adam(all_params, lr=self.config.lr)
 
+        # ── Frozen opponent (no gradients, provides stable opposition) ──
+        # Kept on CPU: individual per-opponent forward passes are faster on CPU
+        # than MPS/CUDA (avoids GPU kernel launch overhead for small batches)
+        self.frozen_policy = copy.deepcopy(self.policy).to('cpu')
+        self.frozen_opponent_encoder = copy.deepcopy(self.opponent_encoder).to('cpu')
+        for p in self.frozen_policy.parameters():
+            p.requires_grad = False
+        for p in self.frozen_opponent_encoder.parameters():
+            p.requires_grad = False
+
+        # Opponent pool: list of state_dicts from past checkpoints
+        self.opponent_pool: List[dict] = [
+            copy.deepcopy(self.policy.state_dict())
+        ]
+
         # ── Opponent tracking ─────────────────────────────────
         # action_histories[player_id] = list of (action_type, bet_frac, pot, stack, street)
         self.action_histories: Dict[int, List[torch.Tensor]] = {}
@@ -159,7 +189,11 @@ class NLHESelfPlayTrainer:
 
         # Personality curriculum — initially no personalities (pure self-play GTO)
         self.current_epoch = 0
+        self.total_epochs = 1  # set by train() for annealing schedules
         self.table_personalities: List[SituationalPersonality] = []
+
+        # ── Hand counter for unique hand IDs ──────────────────
+        self._hand_counter = 0
 
         # ── Search engine ─────────────────────────────────────
         if self.config.search_fraction > 0:
@@ -189,6 +223,79 @@ class NLHESelfPlayTrainer:
     def _to(self, tensor: torch.Tensor) -> torch.Tensor:
         """Move tensor to training device."""
         return tensor.to(self.device)
+
+    def _sync_frozen(self):
+        """
+        Save current live weights to opponent pool and load a random
+        pool member into the frozen policy. Called every frozen_update_interval epochs.
+        """
+        # Save current live weights
+        self.opponent_pool.append(copy.deepcopy(self.policy.state_dict()))
+        if len(self.opponent_pool) > self.config.max_opponent_pool_size:
+            self.opponent_pool.pop(0)
+
+        # Load random pool member into frozen policy
+        snapshot = self.rng.choice(self.opponent_pool)
+        self.frozen_policy.load_state_dict(snapshot)
+
+        # Also sync opponent encoder
+        frozen_enc_state = copy.deepcopy(self.opponent_encoder.state_dict())
+        self.frozen_opponent_encoder.load_state_dict(frozen_enc_state)
+
+    def _get_exploration_floor(self) -> float:
+        """Get the annealed exploration floor for the current epoch."""
+        c = self.config
+        progress = min(self.current_epoch / max(self.total_epochs, 1), 1.0)
+        return c.exploration_floor + (c.exploration_floor_end - c.exploration_floor) * progress
+
+    def _get_entropy_coef(self) -> float:
+        """Get the annealed entropy coefficient for the current epoch."""
+        c = self.config
+        progress = min(self.current_epoch / max(self.total_epochs, 1), 1.0)
+        return c.entropy_coef + (c.entropy_coef_end - c.entropy_coef) * progress
+
+    def _compute_gae(self, trajectory: List[Experience]) -> Tuple[List[float], List[float]]:
+        """
+        Compute GAE advantages and returns for a single hand trajectory.
+
+        Args:
+            trajectory: List of Experience tuples for one hand, ordered by step_idx.
+
+        Returns:
+            (advantages, returns) — parallel lists of floats, one per step.
+        """
+        gamma = self.config.gamma
+        lam = self.config.gae_lambda
+        n = len(trajectory)
+        if n == 0:
+            return [], []
+
+        # Collect values and the terminal reward
+        values = [exp.value for exp in trajectory]
+        terminal_reward = trajectory[-1].reward  # only last step has real reward
+
+        # TD errors: δ_t = r_t + γ·V(s_{t+1}) - V(s_t)
+        deltas = []
+        for t in range(n):
+            if t == n - 1:
+                # Last step: r = terminal_reward, V(s_{t+1}) = 0 (hand over)
+                delta = terminal_reward - values[t]
+            else:
+                # Intermediate step: r = 0, V(s_{t+1}) = values[t+1]
+                delta = gamma * values[t + 1] - values[t]
+            deltas.append(delta)
+
+        # GAE: A_t = Σ (γλ)^k · δ_{t+k}, computed backward
+        advantages = [0.0] * n
+        gae = 0.0
+        for t in reversed(range(n)):
+            gae = deltas[t] + gamma * lam * gae
+            advantages[t] = gae
+
+        # Returns: G_t = A_t + V(s_t) (proper targets for value head)
+        returns = [advantages[t] + values[t] for t in range(n)]
+
+        return advantages, returns
 
     # ─────────────────────────────────────────────────────────
     # Table sampling
@@ -433,14 +540,25 @@ class NLHESelfPlayTrainer:
 
     def _play_hand_gen(self) -> Generator[dict, Tuple[torch.Tensor, float, float], Tuple[List[List[Experience]], float]]:
         """
-        Generator version of _play_hand for batched GPU inference.
-        
-        Yields a dict of encoded tensors when needing a policy decision.
+        Generator for batched GPU inference with balanced self-play.
+
+        Hero (player 0) uses LIVE policy (yielded for batched inference).
+        Opponents use FROZEN policy (run inline with no_grad).
+        Only hero experiences are collected.
+
+        Yields a dict of encoded tensors for hero decisions.
         Receives (probs, value, sizing) via .send().
         Returns (experiences, reward) via StopIteration.value.
         """
         num_p, stacks = self._sample_table()
         self._opp_embed_cache = {}  # Clear cache for new hand
+
+        # Effective stack for reward normalization
+        effective_stack = min(stacks[0], max(stacks[1:])) if num_p > 1 else stacks[0]
+
+        # Unique hand ID for GAE grouping
+        hand_id = self._hand_counter
+        self._hand_counter += 1
 
         dealer = Dealer(
             num_players=num_p,
@@ -452,9 +570,10 @@ class NLHESelfPlayTrainer:
         )
 
         game_state = dealer.start_hand()
-        experiences: List[List[dict]] = [[] for _ in range(num_p)]
+        hero_experiences: List[dict] = []  # only hero's decisions
+        hero_step_idx = 0
 
-        # Sample table personalities
+        # Sample table personalities (opponents only — hero plays raw policy)
         gto_frac = self._get_personality_gto_fraction()
         if len(self.table_personalities) != num_p:
             self.table_personalities = sample_table_personalities(
@@ -462,6 +581,7 @@ class NLHESelfPlayTrainer:
             )
 
         hand_records = [HandRecord() for _ in range(num_p)]
+        floor = self._get_exploration_floor()
 
         while not dealer.is_hand_over():
             pid = game_state.current_player_idx
@@ -470,133 +590,197 @@ class NLHESelfPlayTrainer:
             if not p.is_active:
                 break
 
-            # Encode state (on CPU — device placement happens in batch)
+            # Encode state
             encoded = self._encode_state(game_state, pid)
             opp_embed = self._get_all_opponent_embeddings(pid, num_p)
             opp_stats = self._get_opponent_stats(pid, num_p)
             own_stats = self._to(self.stat_tracker.get_stats(pid).unsqueeze(0))
 
-            # Build personality context for post-processing
-            personality = None
-            situations = []
-            hand_strength = 0.5
-            is_facing_raise = game_state.current_bet > 0 and p.bet_this_street < game_state.current_bet
-            if pid < len(self.table_personalities):
-                personality = self.table_personalities[pid]
-                street_map_sit = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
-                situations = detect_situations(
-                    street=street_map_sit.get(game_state.street, 0),
-                    board_cards=list(game_state.board) if game_state.board else None,
-                    stack_bb=p.stack / max(game_state.big_blind, 1),
-                    is_facing_raise=is_facing_raise,
+            if pid == 0:
+                # ── HERO: yield for batched live policy inference ──
+                probs, value, sizing_probs = yield {
+                    'hole_cards': encoded['hole_cards'],
+                    'community_cards': encoded['community_cards'],
+                    'numeric_features': encoded['numeric_features'],
+                    'opponent_embeddings': opp_embed,
+                    'opponent_stats': opp_stats,
+                    'own_stats': own_stats,
+                    'action_mask': encoded['action_mask'],
+                    'sizing_mask': encoded['sizing_mask'],
+                    # No personality for hero — plays raw policy
+                    '_personality': None,
+                    '_situations': [],
+                    '_hand_strength': 0.5,
+                    '_is_facing_raise': False,
+                    '_game_id': id(dealer),
+                }
+
+                # Store RAW log_prob from model (before floor) for PPO
+                raw_probs = probs.clone()
+
+                # Search-guided action selection (expert iteration)
+                if self.search_engine is not None and self.rng.random() < self.config.search_fraction:
+                    street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
+                    cur_street = street_map.get(game_state.street, 0)
+                    pot_bb = game_state.pot / game_state.big_blind
+
+                    if self.search_engine.should_search(probs, pot_bb, cur_street):
+                        search_stacks = [pp.stack for pp in game_state.players]
+                        search_actions, search_probs = self.search_engine.search(
+                            pot=game_state.pot,
+                            stacks=search_stacks,
+                            board=list(game_state.board),
+                            street=cur_street,
+                            hero=pid,
+                        )
+                        refined = torch.zeros(NUM_ACTION_TYPES, device=self.device)
+                        for sa, sp in zip(search_actions, search_probs):
+                            if sa == 'check':
+                                refined[ActionIndex.CHECK] += sp
+                            elif sa == 'fold':
+                                refined[ActionIndex.FOLD] += sp
+                            elif sa == 'call':
+                                refined[ActionIndex.CALL] += sp
+                            elif sa.startswith('raise_') or sa == 'allin':
+                                refined[ActionIndex.RAISE] += sp
+                        if refined.sum() > 0:
+                            refined = refined / refined.sum()
+                            probs = 0.7 * refined + 0.3 * probs.to(self.device)
+
+                # ── Exploration floor (training only) ──
+                # Apply floor to action type probs (all on CPU since probs comes from orchestrator)
+                action_mask_cpu = encoded['action_mask'].squeeze(0).cpu()  # (4,)
+                probs_floored = probs.clone().cpu()
+                probs_floored = torch.where(
+                    action_mask_cpu,
+                    torch.max(probs_floored, torch.tensor(floor)),
+                    probs_floored,
                 )
-                # Approximate hand strength (cheap heuristic)
-                c1, c2 = p.hole_cards
-                r1, r2 = c1 // 4, c2 // 4
-                if game_state.street == Street.PREFLOP:
-                    if r1 == r2:  # pocket pair
-                        hand_strength = 0.55 + r1 * 0.035  # 22=0.55, AA=0.97
-                    elif max(r1, r2) >= 10:  # broadway
-                        hand_strength = 0.45 + max(r1, r2) * 0.02
-                    elif (c1 % 4) == (c2 % 4):  # suited
-                        hand_strength = 0.3
+                probs_floored = probs_floored / probs_floored.sum()
+
+                # Sample action from FLOORED distribution
+                dist = Categorical(probs_floored)
+                action_idx = dist.sample().item()
+
+                # Log prob from RAW model output (not floored) for PPO
+                raw_dist = Categorical(raw_probs)
+                log_prob = raw_dist.log_prob(torch.tensor(action_idx)).item()
+
+                # Sizing with exploration floor
+                sizing_idx = 0
+                if action_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
+                    sizing_tensor = torch.tensor(sizing_probs, dtype=torch.float32)
+                    raw_sizing = sizing_tensor.clone()
+
+                    # Apply floor to 3 representative sizing buckets
+                    sizing_mask_1d = encoded['sizing_mask'].squeeze(0).cpu()  # (10,)
+                    legal = [i for i, m in enumerate(sizing_mask_1d) if m]
+                    if len(legal) >= 3:
+                        explore = [legal[0], legal[len(legal)//2], legal[-1]]
                     else:
-                        hand_strength = 0.15 + max(r1, r2) * 0.01
-                else:
-                    # Postflop: rough proxy — high cards + pair potential
-                    paired_board = any(r1 == (bc // 4) or r2 == (bc // 4)
-                                       for bc in game_state.board if bc >= 0)
-                    if paired_board:
-                        hand_strength = 0.65 + max(r1, r2) * 0.02
-                    elif max(r1, r2) >= 10:
-                        hand_strength = 0.4
-                    else:
-                        hand_strength = 0.2
+                        explore = legal
+                    for idx in explore:
+                        sizing_tensor[idx] = max(sizing_tensor[idx].item(), floor)
+                    sizing_tensor = sizing_tensor / sizing_tensor.sum()
 
-            # YIELD — pause game, wait for batched GPU result
-            probs, value, sizing_probs = yield {
-                'hole_cards': encoded['hole_cards'],
-                'community_cards': encoded['community_cards'],
-                'numeric_features': encoded['numeric_features'],
-                'opponent_embeddings': opp_embed,
-                'opponent_stats': opp_stats,
-                'own_stats': own_stats,
-                'action_mask': encoded['action_mask'],
-                'sizing_mask': encoded['sizing_mask'],
-                # context for post-processing (not sent to GPU)
-                '_personality': personality,
-                '_situations': situations,
-                '_hand_strength': hand_strength,
-                '_is_facing_raise': is_facing_raise,
-                '_game_id': id(dealer),
-            }
+                    s_dist = Categorical(sizing_tensor)
+                    sizing_idx = s_dist.sample().item()
 
-            # Note: personality perturbation is applied by _run_batched_epoch before .send()
+                    # Raw sizing log prob for PPO
+                    raw_s_dist = Categorical(raw_sizing)
+                    log_prob += raw_s_dist.log_prob(torch.tensor(sizing_idx)).item()
 
-            # Search-guided action selection (expert iteration)
-            if self.search_engine is not None and self.rng.random() < self.config.search_fraction:
-                street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
-                cur_street = street_map.get(game_state.street, 0)
-                pot_bb = game_state.pot / game_state.big_blind
+                # Store hero experience
+                hero_experiences.append({
+                    'hole_cards': encoded['hole_cards'].detach(),
+                    'community_cards': encoded['community_cards'].detach(),
+                    'numeric_features': encoded['numeric_features'].detach(),
+                    'opponent_embeddings': opp_embed.detach(),
+                    'opponent_stats': opp_stats.detach(),
+                    'own_stats': own_stats.detach(),
+                    'action_mask': encoded['action_mask'].detach(),
+                    'sizing_mask': encoded['sizing_mask'].detach(),
+                    'action_idx': action_idx,
+                    'sizing_idx': sizing_idx,
+                    'log_prob': log_prob,
+                    'value': value,
+                    'step_idx': hero_step_idx,
+                })
+                hero_step_idx += 1
 
-                if self.search_engine.should_search(probs, pot_bb, cur_street):
-                    search_stacks = [pp.stack for pp in game_state.players]
-                    search_actions, search_probs = self.search_engine.search(
-                        pot=game_state.pot,
-                        stacks=search_stacks,
-                        board=list(game_state.board),
-                        street=cur_street,
-                        hero=pid,
+            else:
+                # ── OPPONENT: run through frozen policy (no grad, no yield) ──
+                with torch.no_grad():
+                    opp_mask = torch.zeros(1, num_p - 1, dtype=torch.bool)
+                    output = self.frozen_policy(
+                        hole_cards=encoded['hole_cards'].cpu(),
+                        community_cards=encoded['community_cards'].cpu(),
+                        numeric_features=encoded['numeric_features'].cpu(),
+                        opponent_embeddings=opp_embed.cpu(),
+                        opponent_stats=opp_stats.cpu(),
+                        own_stats=own_stats.cpu(),
+                        action_mask=encoded['action_mask'].cpu(),
+                        sizing_mask=encoded['sizing_mask'].cpu(),
+                        opponent_mask=opp_mask,
                     )
-                    # Map search result to 4-way action distribution
-                    refined = torch.zeros(NUM_ACTION_TYPES, device=self.device)
-                    for sa, sp in zip(search_actions, search_probs):
-                        if sa == 'check':
-                            refined[ActionIndex.CHECK] += sp
-                        elif sa == 'fold':
-                            refined[ActionIndex.FOLD] += sp
-                        elif sa == 'call':
-                            refined[ActionIndex.CALL] += sp
-                        elif sa.startswith('raise_') or sa == 'allin':
-                            refined[ActionIndex.RAISE] += sp
+                    probs = output.action_type_probs[0]  # already CPU
+                    sizing_probs = torch.softmax(output.bet_size_logits[0], dim=-1).tolist()
 
-                    # Blend: 70% search, 30% policy (smooth transition)
-                    if refined.sum() > 0:
-                        refined = refined / refined.sum()
-                        probs = 0.7 * refined + 0.3 * probs.to(self.device) # Ensure probs is on device for blending
+                # Apply personality to opponent (hero never gets personality)
+                personality = None
+                is_facing_raise = game_state.current_bet > 0 and p.bet_this_street < game_state.current_bet
+                if pid < len(self.table_personalities):
+                    personality = self.table_personalities[pid]
+                    if personality is not None:
+                        street_map_sit = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
+                        situations = detect_situations(
+                            street=street_map_sit.get(game_state.street, 0),
+                            board_cards=list(game_state.board) if game_state.board else None,
+                            stack_bb=p.stack / max(game_state.big_blind, 1),
+                            is_facing_raise=is_facing_raise,
+                        )
+                        # Approximate hand strength (cheap heuristic)
+                        c1, c2 = p.hole_cards
+                        r1, r2 = c1 // 4, c2 // 4
+                        if game_state.street == Street.PREFLOP:
+                            if r1 == r2:
+                                hand_strength = 0.55 + r1 * 0.035
+                            elif max(r1, r2) >= 10:
+                                hand_strength = 0.45 + max(r1, r2) * 0.02
+                            elif (c1 % 4) == (c2 % 4):
+                                hand_strength = 0.3
+                            else:
+                                hand_strength = 0.15 + max(r1, r2) * 0.01
+                        else:
+                            paired_board = any(r1 == (bc // 4) or r2 == (bc // 4)
+                                               for bc in game_state.board if bc >= 0)
+                            if paired_board:
+                                hand_strength = 0.65 + max(r1, r2) * 0.02
+                            elif max(r1, r2) >= 10:
+                                hand_strength = 0.4
+                            else:
+                                hand_strength = 0.2
 
-            # Sample action (probs is on CPU from orchestrator)
-            dist = Categorical(probs)
-            action_idx = dist.sample().item()
-            log_prob = dist.log_prob(torch.tensor(action_idx)).item()
+                        probs = personality.apply(
+                            probs, situations,
+                            hand_strength=hand_strength,
+                            is_facing_raise=is_facing_raise,
+                        )
+                        sizing_probs = personality.apply_sizing(sizing_probs, situations)
 
-            sizing_idx = 0
-            if action_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
-                s_dist = Categorical(torch.tensor(sizing_probs))
-                sizing_idx = s_dist.sample().item()
-                log_prob += s_dist.log_prob(torch.tensor(sizing_idx)).item()
-
-            # Store experience (detach to prevent double backward in PPO)
-            experiences[pid].append({
-                'hole_cards': encoded['hole_cards'].detach(),
-                'community_cards': encoded['community_cards'].detach(),
-                'numeric_features': encoded['numeric_features'].detach(),
-                'opponent_embeddings': opp_embed.detach(),
-                'opponent_stats': opp_stats.detach(),
-                'own_stats': own_stats.detach(),
-                'action_mask': encoded['action_mask'].detach(),
-                'sizing_mask': encoded['sizing_mask'].detach(),
-                'action_idx': action_idx,
-                'sizing_idx': sizing_idx,
-                'log_prob': log_prob,
-                'value': value,
-            })
+                # Sample opponent action (no experience stored)
+                dist = Categorical(probs)
+                action_idx = dist.sample().item()
+                sizing_idx = 0
+                if action_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
+                    s_dist = Categorical(torch.tensor(sizing_probs))
+                    sizing_idx = s_dist.sample().item()
 
             # Decode and apply action
             action = self._decode_action(action_idx, sizing_idx, game_state)
             dealer.apply_action(action)
 
-            # Record action in opponent history
+            # Record action in opponent history (for all players — hero needs to see this)
             pot_for_record = game_state.pot
             bet_frac = action.amount / max(pot_for_record, 1.0) if action.amount > 0 else 0.0
             street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
@@ -628,32 +812,31 @@ class NLHESelfPlayTrainer:
 
         self._maybe_reset_histories()
 
-        # Convert to Experience objects
-        all_experiences = []
-        hero_reward = 0.0
-        for pid in range(num_p):
-            player_exp = []
-            reward = (profits[pid] / self.config.big_blind) / 100.0
-            if pid == 0:
-                hero_reward = reward
-            for exp_dict in experiences[pid]:
-                player_exp.append(Experience(
-                    hole_cards=exp_dict['hole_cards'],
-                    community_cards=exp_dict['community_cards'],
-                    numeric_features=exp_dict['numeric_features'],
-                    opponent_embeddings=exp_dict['opponent_embeddings'],
-                    opponent_stats=exp_dict['opponent_stats'],
-                    own_stats=exp_dict['own_stats'],
-                    action_mask=exp_dict['action_mask'],
-                    sizing_mask=exp_dict['sizing_mask'],
-                    action_idx=exp_dict['action_idx'],
-                    sizing_idx=exp_dict['sizing_idx'],
-                    log_prob=exp_dict['log_prob'],
-                    value=exp_dict['value'],
-                    reward=reward,
-                ))
-            all_experiences.append(player_exp)
+        # ── Hero-only experience conversion with effective stack normalization ──
+        hero_reward = profits[0] / max(effective_stack, 1e-6)
 
+        hero_exp_list = []
+        for exp_dict in hero_experiences:
+            hero_exp_list.append(Experience(
+                hole_cards=exp_dict['hole_cards'],
+                community_cards=exp_dict['community_cards'],
+                numeric_features=exp_dict['numeric_features'],
+                opponent_embeddings=exp_dict['opponent_embeddings'],
+                opponent_stats=exp_dict['opponent_stats'],
+                own_stats=exp_dict['own_stats'],
+                action_mask=exp_dict['action_mask'],
+                sizing_mask=exp_dict['sizing_mask'],
+                action_idx=exp_dict['action_idx'],
+                sizing_idx=exp_dict['sizing_idx'],
+                log_prob=exp_dict['log_prob'],
+                value=exp_dict['value'],
+                reward=hero_reward,  # same reward for all steps — GAE distributes credit
+                hand_id=hand_id,
+                step_idx=exp_dict['step_idx'],
+            ))
+
+        # Return as [[hero_exps]] with empty lists for opponents (backward compat)
+        all_experiences = [hero_exp_list] + [[] for _ in range(num_p - 1)]
         return all_experiences, hero_reward
 
     def _run_batched_epoch(self) -> Tuple[List[Experience], float]:
@@ -773,17 +956,8 @@ class NLHESelfPlayTrainer:
                     sizing_logits = output.bet_size_logits[batch_idx]
                     sizing_probs = torch.softmax(sizing_logits, dim=-1).cpu().tolist()
 
-                    personality = state_dict['_personality']
-                    situations = state_dict['_situations']
-                    if personality is not None:
-                        hand_strength = state_dict['_hand_strength']
-                        is_facing_raise = state_dict['_is_facing_raise']
-                        probs = personality.apply(
-                            probs, situations,
-                            hand_strength=hand_strength,
-                            is_facing_raise=is_facing_raise,
-                        )
-                        sizing_probs = personality.apply_sizing(sizing_probs, situations)
+                    # Hero always has _personality=None — skip post-processing
+                    # (opponent personalities are applied inline in _play_hand_gen)
 
                     try:
                         new_state = g.send((probs, value, sizing_probs))
@@ -864,9 +1038,34 @@ class NLHESelfPlayTrainer:
         action_t = torch.tensor([e.action_idx for e in experiences], device=self.device, dtype=torch.long)
         sizing_t = torch.tensor([e.sizing_idx for e in experiences], device=self.device, dtype=torch.long)
         old_log_probs = torch.tensor([e.log_prob for e in experiences], device=self.device, dtype=torch.float32)
-        rewards = torch.tensor([e.reward for e in experiences], device=self.device, dtype=torch.float32)
         old_values = torch.tensor([e.value for e in experiences], device=self.device, dtype=torch.float32)
-        
+
+        # ── Compute GAE advantages and returns per hand trajectory ──
+        # Group experience indices by hand_id
+        hand_groups: Dict[int, List[int]] = {}
+        for idx, e in enumerate(experiences):
+            hid = e.hand_id
+            if hid not in hand_groups:
+                hand_groups[hid] = []
+            hand_groups[hid].append(idx)
+
+        # Compute GAE per hand trajectory
+        gae_advantages = torch.zeros(len(experiences), device=self.device)
+        gae_returns = torch.zeros(len(experiences), device=self.device)
+
+        for hid, indices in hand_groups.items():
+            # Sort by step_idx within the hand
+            indices.sort(key=lambda i: experiences[i].step_idx)
+            trajectory = [experiences[i] for i in indices]
+            advantages, returns = self._compute_gae(trajectory)
+            for local_idx, global_idx in enumerate(indices):
+                gae_advantages[global_idx] = advantages[local_idx]
+                gae_returns[global_idx] = returns[local_idx]
+
+        # Normalize advantages
+        if len(gae_advantages) > 1:
+            gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
+
         # 4. Batched forward pass
         output = self.policy(
             hole_cards=hole_cards,
@@ -900,21 +1099,20 @@ class NLHESelfPlayTrainer:
         entropy = action_entropy + (sizing_entropy * is_raise.float()).mean()
         
         ratio = torch.exp(new_log_probs - old_log_probs)
-        advantages = rewards - old_values
-        if len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-            
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * advantages
+        surr1 = ratio * gae_advantages
+        surr2 = torch.clamp(ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
         policy_loss = -torch.min(surr1, surr2).mean()
         
+        # Value head trained on GAE returns (not flat terminal reward)
         value_pred = output.value.squeeze(-1)
-        value_loss = ((value_pred - rewards) ** 2).mean()
+        value_loss = ((value_pred - gae_returns) ** 2).mean()
         
+        # Use annealed entropy coefficient
+        entropy_coef = self._get_entropy_coef()
         loss = (
             policy_loss
             + self.config.value_coef * value_loss
-            - self.config.entropy_coef * entropy
+            - entropy_coef * entropy
         )
         
         loss.backward()
@@ -926,23 +1124,35 @@ class NLHESelfPlayTrainer:
     # ─────────────────────────────────────────────────────────
 
     def train(self, num_epochs: int = 100, epoch_callback=None) -> Dict[str, List[float]]:
-        """Run NLHE self-play training with batched GPU inference.
+        """Run balanced self-play training with batched GPU inference.
         
         Args:
             num_epochs: Number of epochs to train.
             epoch_callback: Optional function(trainer, epoch, metrics) called after each epoch.
         """
+        self.total_epochs = num_epochs  # for annealing schedules
+
         metrics = {
             'epoch_reward': [],
             'epoch_loss': [],
         }
 
         print(f"Device: {self.device}")
+        print(f"Balanced self-play: hero-only training, frozen opponent pool")
+        print(f"GAE: gamma={self.config.gamma}, lambda={self.config.gae_lambda}")
+        print(f"Entropy: {self.config.entropy_coef} -> {self.config.entropy_coef_end}")
+        print(f"Exploration floor: {self.config.exploration_floor} -> {self.config.exploration_floor_end}")
 
         for epoch in range(num_epochs):
             self.current_epoch = epoch + 1
             epoch_start = time.time()
-            
+
+            # Sync frozen opponent periodically
+            if epoch > 0 and epoch % self.config.frozen_update_interval == 0:
+                self._sync_frozen()
+                if self.config.verbose:
+                    print(f"    [Frozen sync] Pool size: {len(self.opponent_pool)}")
+
             # Batched simulation: all hands run as generators with batched GPU calls
             all_exp, total_reward = self._run_batched_epoch()
 
