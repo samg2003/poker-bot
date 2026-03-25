@@ -83,14 +83,17 @@ function App() {
 
   const timelineIdxRef = useRef(timelineIdx)
   const totalStepsRef = useRef(totalSteps)
+  const gameStateRef = useRef(gameState)
   useEffect(() => { timelineIdxRef.current = timelineIdx }, [timelineIdx])
   useEffect(() => { totalStepsRef.current = totalSteps }, [totalSteps])
+  useEffect(() => { gameStateRef.current = gameState }, [gameState])
 
   const stepAI = async () => {
     if (timelineIdxRef.current < totalStepsRef.current - 1) return
-    if (!gameState || gameState.is_terminal) return
-    const currentSeat = gameState.current_player
-    const currentPlayer = gameState.players.find(p => p.id === currentSeat)
+    const gs = gameStateRef.current
+    if (!gs || gs.is_terminal) return
+    const currentSeat = gs.current_player
+    const currentPlayer = gs.players.find(p => p.id === currentSeat)
     if (!currentPlayer || currentPlayer.is_human) return
     if (isSteppingRef.current) return
     
