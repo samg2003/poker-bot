@@ -88,7 +88,7 @@ def get_sizing_mask(game_state) -> torch.Tensor:
             mask[i] = True  # All-in is always legal if raising is legal
             continue
             
-        target_size = current_bet + frac * pot
+        target_size = frac * pot
         if target_size >= min_raise - 1e-5 and target_size <= max_raise + 1e-5:
             mask[i] = True
 

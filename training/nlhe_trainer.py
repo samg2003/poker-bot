@@ -406,7 +406,7 @@ class NLHESelfPlayTrainer:
                 return Action(ActionType.ALL_IN, amount=game_state.get_max_raise_to())
             min_r = game_state.get_min_raise_to()
             max_r = game_state.get_max_raise_to()
-            raise_to = game_state.current_bet + frac * game_state.pot
+            raise_to = frac * game_state.pot
             return Action(ActionType.RAISE, amount=max(min_r, min(raise_to, max_r)))
 
         # Fallback
