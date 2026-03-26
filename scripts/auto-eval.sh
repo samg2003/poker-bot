@@ -26,7 +26,8 @@ while true; do
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
             # Run eval and capture output
-            EVAL_OUTPUT=$(cd "$PROJECT_DIR" && python3 scripts/evaluate.py --checkpoint latest --num-hands 2000 2>&1) || true
+            # Run eval on CPU to avoid competing with training for GPU
+            EVAL_OUTPUT=$(cd "$PROJECT_DIR" && CUDA_VISIBLE_DEVICES= python3 scripts/evaluate.py --checkpoint latest --num-hands 1000 2>&1) || true
 
             # Log with timestamp
             TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
