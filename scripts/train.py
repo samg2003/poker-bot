@@ -152,8 +152,9 @@ def train_nlhe(args):
         search_fraction=args.search_fraction,
         verbose=args.verbose,
         batch_chunk_size=args.batch_chunk_size,
+        seed=args.seed,
     )
-    trainer = NLHESelfPlayTrainer(config=config, seed=args.seed)
+    trainer = NLHESelfPlayTrainer(config=config)
 
     checkpoint_mgr = CheckpointManager(args.checkpoint_dir)
 

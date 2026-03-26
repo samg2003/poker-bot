@@ -1,5 +1,21 @@
 """Profile training bottlenecks — run from project root."""
-import sys, os, time, functools
+import sys, os, time, functools, subprocess
+import torch
+import gc
+
+def get_mem_mb():
+    try:
+        kb = int(subprocess.check_output(['ps', '-p', str(os.getpid()), '-o', 'rss=']).strip())
+        return kb / 1024.0
+    except:
+        return 0.0
+
+def get_gpu_mem_mb():
+    if torch.backends.mps.is_available():
+        return torch.mps.current_allocated_memory() / 1024 / 1024
+    elif torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / 1024 / 1024
+    return 0.0
 
 # Add project root to path
 sys.path.insert(0, os.getcwd())
@@ -27,18 +43,17 @@ def make_timer(name, orig_fn):
         return result
     return wrapper
 
-trainer._build_table_models = make_timer('build_table_models', trainer._build_table_models)
-trainer._get_opponent_embedding = make_timer('get_opp_embedding', trainer._get_opponent_embedding)
-trainer._get_all_opponent_embeddings = make_timer('get_all_opp_embeddings', trainer._get_all_opponent_embeddings)
 trainer._get_opponent_stats = make_timer('get_opp_stats', trainer._get_opponent_stats)
 # trainer._encode_game_state doesn't exist — encoding is inline in _play_hand_gen
 
 # Run 1 epoch
 print(f"Device: {trainer.device}")
 print(f"Running 100 hands...")
+print(f"Initial Mem: CPU {get_mem_mb():.1f}MB | GPU {get_gpu_mem_mb():.1f}MB")
 t0 = time.time()
 all_exp, reward = trainer._run_batched_epoch()
 sim_time = time.time() - t0
+print(f"Post-Sim Mem: CPU {get_mem_mb():.1f}MB | GPU {get_gpu_mem_mb():.1f}MB")
 
 # PPO
 import torch.nn as nn
@@ -63,6 +78,17 @@ if ppo_data:
             trainer.optimizer.step()
 ppo_time = time.time() - t2
 
+num_exps = len(all_exp)
+# Trigger a collection to see retained memory
+del all_exp
+del ppo_data
+gc.collect()
+if torch.backends.mps.is_available():
+    torch.mps.empty_cache()
+elif torch.cuda.is_available():
+    torch.cuda.empty_cache()
+print(f"Post-PPO/GC Mem: CPU {get_mem_mb():.1f}MB | GPU {get_gpu_mem_mb():.1f}MB")
+
 print(f"\n{'='*60}")
 print(f"PROFILING RESULTS (100 hands)")
 print(f"{'='*60}")
@@ -77,4 +103,4 @@ for name, (total, count) in sorted(timers.items(), key=lambda x: -x[1][0]):
     print(f"  {name:30s}: {total:.3f}s ({count:5d} calls, {avg*1000:.1f}ms avg) [{pct:.0f}%]")
 other = sim_time - sum(v[0] for k,v in timers.items())
 print(f"  {'other (engine, batching)':30s}: {other:.3f}s [{other/sim_time*100:.0f}%]")
-print(f"\n{len(all_exp)} experiences collected")
+print(f"\n{num_exps} experiences collected")

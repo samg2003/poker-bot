@@ -55,7 +55,17 @@ All notable changes to the poker AI training pipeline are documented here.
 #### Batched Opponent Encoder
 - **Before:** Individual forward pass per opponent per decision (3381 calls, 44% of simulation time)
 - **After:** Single batched forward pass for all opponents with padded sequences
+- Patched `TransformerEncoder` inside `OpponentEncoder` to set `enable_nested_tensor=False`. This completely bypasses the MPS `aten::_nested_tensor_from_mask_left_aligned` bug and allows padded sequence batching on Apple Silicon.
 - **Expected:** 12 hands/s → 25-30 hands/s on MPS
+
+### Massive Batched Inference & TableState Isolation (March 25, 2026)
+- **State Leak Fixed**: Identified a critical bug where 100 parallel games running in a chunk were all mutating the *same* global `self.action_histories` and `self.stat_tracker`. This meant independent opponents from completely different hands were clobbering each other's historical tracks. Fixed by isolating game memory into persistent `TableState` environments.
+- **Reward Scaling Bug Fixed**: Discovered a hardcoded `/ 100.0` reward scalar inside `_play_hand_gen` that was causing training advantages to shrink by 100x when `config.big_blind` was 1.0. This paralyzed the RL gradients, freezing the model structure wherever it was loaded from. Changed to `/ max(config.big_blind, 1)`.
+- **Global Batching Rewrite**: Completely rewrote the core `_play_hand_gen` and `_run_batched_epoch` architecture.
+  - Sub-generators now pause and yield state queries for BOTH the Hero (live policy) and the Opponents (frozen pool models).
+  - Neural network inference is no longer processed game-by-game. Instead, `_run_batched_epoch` collects queries from *all* active games, groups them by target model identity, and evaluates them batched on the GPU simultaneously.
+  - The `OpponentEncoder` is also batched across all parallel game environments at once.
+- **Result**: Completely removed the O(num_opponents) sequential CPU bottleneck on frozen models. Training throughput surged from ~17 hands/sec to roughly **30 hands/sec** on MPS.
 
 ### 📊 Results (First 47 Epochs with Fixes)
 
