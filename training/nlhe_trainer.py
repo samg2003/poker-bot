@@ -30,7 +30,7 @@ from model.action_space import (
     ACTION_FEATURE_DIM, encode_action, POT_FRACTIONS,
 )
 from model.opponent_encoder import OpponentEncoder
-from model.policy_network import PolicyNetwork
+from model.policy_network import PolicyNetwork, OPP_GAME_STATE_DIM
 from model.stat_tracker import StatTracker, HandRecord, NUM_STAT_FEATURES
 from model.nlhe_encoder import NLHEEncoder
 from search.search import SearchEngine, SearchConfig
@@ -52,6 +52,7 @@ class Experience(NamedTuple):
     opponent_embeddings: torch.Tensor # (1, num_opp, embed_dim)
     opponent_stats: torch.Tensor      # (1, num_opp, stat_dim)
     own_stats: torch.Tensor           # (1, stat_dim)
+    opponent_game_state: torch.Tensor # (1, num_opp, 14) — per-opp seat/stack/bet/status
     action_mask: torch.Tensor         # (1, 4)
     sizing_mask: torch.Tensor         # (1, 10)
     action_idx: int                   # chosen action
@@ -443,6 +444,31 @@ class NLHESelfPlayTrainer:
 
         return torch.stack(stats).unsqueeze(0).to(self.device)  # (1, num_opp, stat_dim)
 
+    def _get_opponent_game_state(self, game_state: GameState, hero_id: int, num_players: int) -> torch.Tensor:
+        """Build per-opponent game state: seat_onehot(9) + stack + bet + pot_committed + active + all_in.
+        Returns (1, num_opp, 14)."""
+        bb = max(game_state.big_blind, 1.0)
+        pot = max(game_state.pot, 1.0)
+        opp_states = []
+        for pid in range(num_players):
+            if pid == hero_id:
+                continue
+            p = game_state.players[pid]
+            seat_oh = [0.0] * 9
+            seat_oh[min(pid, 8)] = 1.0
+            opp_states.append(torch.tensor(
+                seat_oh + [
+                    p.stack / (100.0 * bb),
+                    p.bet_this_street / pot if pot > 0 else 0.0,
+                    p.bet_total / (100.0 * bb),
+                    float(p.is_active),
+                    float(p.is_all_in),
+                ], dtype=torch.float32
+            ))
+        if not opp_states:
+            return torch.zeros(1, 1, OPP_GAME_STATE_DIM, device=self.device)
+        return torch.stack(opp_states).unsqueeze(0).to(self.device)
+
     def _get_personality_gto_fraction(self) -> float:
         """Graduated personality curriculum schedule."""
         epoch = self.current_epoch
@@ -664,6 +690,7 @@ class NLHESelfPlayTrainer:
             encoded = self._encode_state(game_state, pid)
             opp_stats = self._get_opponent_stats(table, pid, num_p)
             own_stats = self._to(table.stat_tracker.get_stats(pid).unsqueeze(0))
+            opp_game_state = self._get_opponent_game_state(game_state, pid, num_p)
 
             opp_ids = [opid for opid in range(num_p) if opid != pid]
             uncached = []
@@ -681,6 +708,7 @@ class NLHESelfPlayTrainer:
                 'numeric_features': encoded['numeric_features'],
                 'opponent_stats': opp_stats,
                 'own_stats': own_stats,
+                'opponent_game_state': opp_game_state,
                 'action_mask': encoded['action_mask'],
                 'sizing_mask': encoded['sizing_mask'],
                 '_is_hero': pid == 0,
@@ -752,6 +780,7 @@ class NLHESelfPlayTrainer:
                     'opponent_embeddings': opp_embed_tensor.detach().cpu(),
                     'opponent_stats': opp_stats.detach().cpu(),
                     'own_stats': own_stats.detach().cpu(),
+                    'opponent_game_state': opp_game_state.detach().cpu(),
                     'action_mask': encoded['action_mask'].detach().cpu(),
                     'sizing_mask': encoded['sizing_mask'].detach().cpu(),
                     'action_idx': action_idx,
@@ -914,6 +943,7 @@ class NLHESelfPlayTrainer:
                 opponent_embeddings=exp_dict['opponent_embeddings'],
                 opponent_stats=exp_dict['opponent_stats'],
                 own_stats=exp_dict['own_stats'],
+                opponent_game_state=exp_dict['opponent_game_state'],
                 action_mask=exp_dict['action_mask'],
                 sizing_mask=exp_dict['sizing_mask'],
                 action_idx=exp_dict['action_idx'],
@@ -1079,24 +1109,30 @@ class NLHESelfPlayTrainer:
 
                     padded_opp_embeds = []
                     padded_opp_stats = []
+                    padded_opp_gs = []
                     opp_masks = []
                     for s in sub_states:
                         oe = s['opponent_embeddings']
                         os_t = s['opponent_stats']
+                        og = s.get('opponent_game_state', torch.zeros(1, oe.shape[1], OPP_GAME_STATE_DIM, device=oe.device))
                         n_opp = oe.shape[1]
                         if n_opp < max_opps:
                             pad_e = torch.zeros(1, max_opps - n_opp, embed_dim, device=oe.device)
                             oe = torch.cat([oe, pad_e], dim=1)
                             pad_s = torch.zeros(1, max_opps - n_opp, stat_dim, device=os_t.device)
                             os_t = torch.cat([os_t, pad_s], dim=1)
+                            pad_g = torch.zeros(1, max_opps - n_opp, OPP_GAME_STATE_DIM, device=og.device)
+                            og = torch.cat([og, pad_g], dim=1)
                         padded_opp_embeds.append(oe)
                         padded_opp_stats.append(os_t)
+                        padded_opp_gs.append(og)
                         m = torch.zeros(1, max_opps, dtype=torch.bool, device=oe.device)
                         m[0, :n_opp] = True
                         opp_masks.append(m)
 
                     batch_opp_embed = torch.cat(padded_opp_embeds, dim=0).to(self.device)
                     batch_opp_stats = torch.cat(padded_opp_stats, dim=0).to(self.device)
+                    batch_opp_gs = torch.cat(padded_opp_gs, dim=0).to(self.device)
                     batch_opp_mask = torch.cat(opp_masks, dim=0).to(self.device)
 
                     target_model = self.policy if model_id == 'hero' else self._frozen_models.get(model_id, self._frozen_template)
@@ -1105,6 +1141,7 @@ class NLHESelfPlayTrainer:
                         output = target_model(
                             hole_cards=batch_hole, community_cards=batch_comm, numeric_features=batch_num,
                             opponent_embeddings=batch_opp_embed, opponent_stats=batch_opp_stats, own_stats=batch_own,
+                            opponent_game_state=batch_opp_gs,
                             action_mask=batch_mask, sizing_mask=batch_s_mask, opponent_mask=batch_opp_mask,
                         )
 
@@ -1202,11 +1239,13 @@ class NLHESelfPlayTrainer:
         
         opp_emb_list = []
         opp_stat_list = []
+        opp_gs_list = []
         opp_mask_list = []
         
         for e in experiences:
             emb = e.opponent_embeddings
             stat = e.opponent_stats
+            gs = e.opponent_game_state
             
             curr_opps = emb.shape[1]
             pad_len = max_opps - curr_opps
@@ -1214,9 +1253,11 @@ class NLHESelfPlayTrainer:
             if pad_len > 0:
                 emb_pad = torch.zeros(1, pad_len, emb.shape[2])
                 stat_pad = torch.zeros(1, pad_len, stat.shape[2])
+                gs_pad = torch.zeros(1, pad_len, OPP_GAME_STATE_DIM)
                 
                 emb = torch.cat([emb, emb_pad], dim=1)
                 stat = torch.cat([stat, stat_pad], dim=1)
+                gs = torch.cat([gs, gs_pad], dim=1)
                 
                 mask = torch.tensor([[False]*curr_opps + [True]*pad_len], dtype=torch.bool)
             else:
@@ -1224,10 +1265,12 @@ class NLHESelfPlayTrainer:
                 
             opp_emb_list.append(emb)
             opp_stat_list.append(stat)
+            opp_gs_list.append(gs)
             opp_mask_list.append(mask)
             
         opp_embeds = torch.cat(opp_emb_list, dim=0)
         opp_stats = torch.cat(opp_stat_list, dim=0)
+        opp_gs = torch.cat(opp_gs_list, dim=0)
         opp_masks = torch.cat(opp_mask_list, dim=0)
         
         # 3. Stack targets (keep on CPU)
@@ -1270,6 +1313,7 @@ class NLHESelfPlayTrainer:
             'sizing_masks': sizing_masks,
             'opp_embeds': opp_embeds,
             'opp_stats': opp_stats,
+            'opp_gs': opp_gs,
             'opp_masks': opp_masks,
             'action_t': action_t,
             'sizing_t': sizing_t,
@@ -1293,6 +1337,7 @@ class NLHESelfPlayTrainer:
         sizing_masks = data['sizing_masks'][idx].to(self.device)
         opp_embeds = data['opp_embeds'][idx].to(self.device)
         opp_stats = data['opp_stats'][idx].to(self.device)
+        opp_gs = data['opp_gs'][idx].to(self.device)
         opp_masks = data['opp_masks'][idx].to(self.device)
         action_t = data['action_t'][idx].to(self.device)
         sizing_t = data['sizing_t'][idx].to(self.device)
@@ -1310,6 +1355,7 @@ class NLHESelfPlayTrainer:
             opponent_embeddings=opp_embeds,
             opponent_stats=opp_stats,
             own_stats=own_stats,
+            opponent_game_state=opp_gs,
             action_mask=action_masks,
             sizing_mask=sizing_masks,
             opponent_mask=opp_masks,

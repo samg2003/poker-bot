@@ -166,13 +166,17 @@ class GameStateEncoder(nn.Module):
         return self.combine(combined)
 
 
+# Per-opponent game state: seat_onehot(9) + stack + bet + pot_committed + active + all_in = 14d
+OPP_GAME_STATE_DIM = 14
+
+
 class PolicyNetwork(nn.Module):
     """
     Full policy + value network with opponent cross-attention.
 
     Architecture:
         1. Game state encoder → state embedding
-        2. Cross-attention: state embedding queries opponent embeddings + stats
+        2. Cross-attention: state embedding queries opponent embeddings + stats + game_state
         3. Action head → action type distribution (4-way)
         4. Sizing head → bet size classification (10 discrete buckets)
         5. Value head → expected value
@@ -197,9 +201,9 @@ class PolicyNetwork(nn.Module):
         # Game state encoder
         self.state_encoder = GameStateEncoder(embed_dim=embed_dim)
 
-        # Project opponent embeddings + stats into the same space
+        # Project opponent embeddings + stats + game_state into the same space
         self.opponent_proj = nn.Linear(
-            opponent_embed_dim + NUM_STAT_FEATURES, embed_dim
+            opponent_embed_dim + NUM_STAT_FEATURES + OPP_GAME_STATE_DIM, embed_dim
         )
 
         # Cross-attention layers: game state attends to opponent embeddings
@@ -288,6 +292,7 @@ class PolicyNetwork(nn.Module):
         opponent_embeddings: torch.Tensor,    # (batch, num_opponents, opponent_embed_dim)
         opponent_stats: torch.Tensor,         # (batch, num_opponents, NUM_STAT_FEATURES)
         own_stats: torch.Tensor,              # (batch, NUM_STAT_FEATURES)
+        opponent_game_state: Optional[torch.Tensor] = None,  # (batch, num_opponents, 14)
         opponent_mask: Optional[torch.Tensor] = None,  # (batch, num_opponents) True=masked
         action_mask: Optional[torch.Tensor] = None,    # (batch, 4) True=legal
         sizing_mask: Optional[torch.Tensor] = None,    # (batch, 10) True=legal
@@ -298,14 +303,20 @@ class PolicyNetwork(nn.Module):
         Returns ActionOutput with action logits, probs, sizing, and value.
         """
         batch_size = hole_cards.shape[0]
+        num_opps = opponent_embeddings.shape[1]
 
         # 1. Encode game state
         state = self.state_encoder(
             hole_cards, community_cards, numeric_features
         )  # (batch, embed_dim)
 
-        # 2. Project opponent embeddings + stats
-        opp_combined = torch.cat([opponent_embeddings, opponent_stats], dim=-1)
+        # 2. Project opponent embeddings + stats + game_state
+        if opponent_game_state is None:
+            opponent_game_state = torch.zeros(
+                batch_size, num_opps, OPP_GAME_STATE_DIM,
+                device=opponent_embeddings.device,
+            )
+        opp_combined = torch.cat([opponent_embeddings, opponent_stats, opponent_game_state], dim=-1)
         opp_projected = self.opponent_proj(opp_combined)  # (batch, num_opp, embed_dim)
 
         # 3. Cross-attention: game state attends to opponents
