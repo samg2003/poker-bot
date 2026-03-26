@@ -64,6 +64,7 @@ All notable changes to the poker AI training pipeline are documented here.
 - **Global Batching Rewrite**: Completely rewrote the core `_play_hand_gen` and `_run_batched_epoch` architecture.
   - Sub-generators now pause and yield state queries for BOTH the Hero (live policy) and the Opponents (frozen pool models).
   - Neural network inference is no longer processed game-by-game. Instead, `_run_batched_epoch` collects queries from *all* active games, groups them by target model identity, and evaluates them batched on the GPU simultaneously.
+- **Metal Shader Graph Optimization**: Fixed a severe memory leak and CPU bottleneck specific to Apple Silicon (MPS). PyTorch's MPS backend compiles a unique `mpsgraph` for every distinct tensor shape it sees. Because batch sizes and sequence lengths dynamically fluctuated as hands ended or opponent counts changed, PyTorch was compiling and caching thousands of graphs. Fixed by mathematically padding all Opponent Encoder sequences to the nearest power of 2, and all batch sizes to the nearest multiple of 32. This collapsed the unique shapes down to ~20, immediately dropping CPU memory bloat by ~500MB and boosting throughput from 35.7 hands/s to **51.4 hands/s**.
   - The `OpponentEncoder` is also batched across all parallel game environments at once.
 - **Result**: Completely removed the O(num_opponents) sequential CPU bottleneck on frozen models. Training throughput surged from ~17 hands/sec to roughly **30 hands/sec** on MPS.
 

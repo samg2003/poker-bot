@@ -878,11 +878,19 @@ class NLHESelfPlayTrainer:
                 new_embs_flat = []
                 if all_seqs_to_encode:
                     seqs = [torch.stack(h) for _, _, h in all_seqs_to_encode]
-                    max_len = max(sq.shape[0] for sq in seqs)
+                    orig_len = max(sq.shape[0] for sq in seqs)
+                    
+                    # Pad to power of 2 to avoid MPS graph leak!
+                    pad_len = 1
+                    while pad_len < orig_len: pad_len *= 2
+                    
+                    orig_b = len(seqs)
+                    pad_b = ((orig_b + 31) // 32) * 32
+                    
                     feat_dim = seqs[0].shape[1]
                     
-                    padded = torch.zeros(len(seqs), max_len, feat_dim, device=self.device)
-                    mask = torch.ones(len(seqs), max_len, device=self.device, dtype=torch.bool)
+                    padded = torch.zeros(pad_b, pad_len, feat_dim, device=self.device)
+                    mask = torch.ones(pad_b, pad_len, device=self.device, dtype=torch.bool)
                     for i, sq in enumerate(seqs):
                         sq = self._to(sq)
                         padded[i, :sq.shape[0]] = sq
@@ -890,6 +898,10 @@ class NLHESelfPlayTrainer:
                         
                     with torch.no_grad():
                         out_embs = self.opponent_encoder(padded, mask=mask)
+                    
+                    # Slice back
+                    out_embs = out_embs[:orig_b]
+                    
                     new_embs_flat = [out_embs[i:i+1].detach() for i in range(len(seqs))]
 
                 # Distribute back to cache and build tensor
@@ -927,9 +939,16 @@ class NLHESelfPlayTrainer:
                 results_to_yield = {} # game_idx -> (probs, value, sizing_probs, opp_embed)
 
                 for model_id, items in groups.items():
-                    sub_states = [item[2] for item in items]
+                    orig_b = len(items)
+                    pad_b = ((orig_b + 31) // 32) * 32
                     
-                    max_opps = max(s['opponent_embeddings'].shape[1] for s in sub_states)
+                    # Duplicate last state to pad batch
+                    sub_states = [item[2] for item in items]
+                    while len(sub_states) < pad_b:
+                        sub_states.append(sub_states[-1])
+                    
+                    # Always pad to maximum possible opponents to keep shape constant
+                    max_opps = self.config.max_players - 1
                     embed_dim = sub_states[0]['opponent_embeddings'].shape[2]
                     stat_dim = sub_states[0]['opponent_stats'].shape[2]
 
@@ -1290,6 +1309,9 @@ class NLHESelfPlayTrainer:
                 for _ in range(self.config.ppo_epochs):
                     self.rng.shuffle(all_indices)
                     for start in range(0, n, mini_batch_size):
+                        if start + mini_batch_size > n:
+                            break  # Drop last incomplete batch to avoid MPS graph compilation leak
+                            
                         mb_indices = all_indices[start:start + mini_batch_size]
                         self.optimizer.zero_grad()
                         loss_val = self._compute_ppo_loss_minibatch(ppo_data, mb_indices)
