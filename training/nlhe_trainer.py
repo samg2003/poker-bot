@@ -417,12 +417,15 @@ class NLHESelfPlayTrainer:
     # ─────────────────────────────────────────────────────────
 
     def _record_action(self, table: TableState, player_id: int, action_type: int,
-                       bet_frac: float, pot: float, stack: float, street: int):
+                       bet_frac: float, pot: float, stack: float, street: int,
+                       relative_position: float = 0.0, hand_boundary: float = 0.0):
         """Record an observed action for a player."""
         if player_id not in table.action_histories:
             table.action_histories[player_id] = []
 
-        token = encode_action(action_type, bet_frac, pot, stack, street)
+        token = encode_action(action_type, bet_frac, pot, stack, street,
+                              relative_position=relative_position,
+                              hand_boundary=hand_boundary)
         table.action_histories[player_id].append(token)
 
         # Cap at 16 actions (rolling window — last ~4 hands of context)
@@ -908,7 +911,12 @@ class NLHESelfPlayTrainer:
             # Apply the action
             dealer.apply_action(action)
 
-            self._record_action(table, pid, self._action_to_type_idx(action), bet_frac, pot_for_record, p.stack, street_map.get(pre_street, 0))
+            # Compute relative position for enriched action tokens
+            dealer_btn = game_state.dealer_button
+            rel_pos = ((pid - dealer_btn) % num_p) / 8.0
+            is_hand_boundary = 1.0 if (len(table.action_histories.get(pid, [])) == 0 or pre_street == Street.PREFLOP and pf_raise_count == 0 and pid == game_state.current_player_idx) else 0.0
+            self._record_action(table, pid, self._action_to_type_idx(action), bet_frac, pot_for_record, p.stack, street_map.get(pre_street, 0),
+                                relative_position=rel_pos, hand_boundary=is_hand_boundary)
 
             # Detect street transitions to reset per-street state
             if game_state.street != current_street:

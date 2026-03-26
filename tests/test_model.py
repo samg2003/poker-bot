@@ -46,9 +46,15 @@ class TestActionSpace:
         # Check features
         assert token[4] == 0.75  # bet_size_frac
         assert abs(token[5] - 0.1) < 1e-5  # pot/100
+        assert abs(token[6] - 1.0) < 1e-5  # stack/100
+        # Check street one-hot (street=1 means flop)
+        assert token[8] == 0.0   # preflop
+        assert token[9] == 1.0   # flop
+        assert token[10] == 0.0  # turn
+        assert token[11] == 0.0  # river
 
     def test_action_feature_dim(self):
-        assert ACTION_FEATURE_DIM == 7  # 4 one-hot + 3 numeric
+        assert ACTION_FEATURE_DIM == 13  # 4 one-hot + 9 (bet, pot, stack, pos, street_oh[4], boundary)
 
 
 # =============================================================================

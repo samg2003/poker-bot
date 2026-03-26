@@ -31,7 +31,7 @@ class OpponentEncoder(nn.Module):
     representing everything the model knows about this opponent.
 
     Args:
-        action_dim: dimension of each action token (default: ACTION_FEATURE_DIM = 7)
+        action_dim: dimension of each action token (default: ACTION_FEATURE_DIM = 14)
         embed_dim: dimension of the output embedding (default: 128)
         num_heads: number of attention heads (default: 4)
         num_layers: number of transformer layers (default: 3)

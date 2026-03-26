@@ -44,24 +44,35 @@ def encode_action(
     pot_size: float,
     stack_size: float,
     street: int,
+    relative_position: float = 0.0,
+    hand_boundary: float = 0.0,
 ) -> torch.Tensor:
     """
     Encode a single observed action as a feature vector.
 
     Used to build action history sequences for the opponent encoder.
 
-    Returns: (7,) tensor:
-        [action_one_hot(4), bet_size/pot, pot/100bb, street/3]
+    Returns: (13,) tensor:
+        [action_one_hot(4), bet_size/pot, pot/100bb, actor_stack/100bb,
+         relative_position, street_onehot(4), hand_boundary]
     """
     # One-hot action type
     action_oh = [0.0] * NUM_ACTION_TYPES
     if 0 <= action_type < NUM_ACTION_TYPES:
         action_oh[action_type] = 1.0
 
+    # Street one-hot (4d: preflop, flop, turn, river)
+    street_oh = [0.0] * 4
+    if 0 <= street <= 3:
+        street_oh[street] = 1.0
+
     features = action_oh + [
-        bet_size_frac,           # bet size as fraction of pot
-        pot_size / 100.0,        # pot normalized by 100bb
-        street / 3.0,            # street: 0=preflop, 1=flop, 2=turn, 3=river
+        bet_size_frac,                # bet size as fraction of pot
+        pot_size / 100.0,             # pot normalized by 100bb
+        stack_size / 100.0,           # actor's stack normalized by 100bb
+        relative_position,            # (actor - dealer) % num_players / 8.0
+    ] + street_oh + [
+        hand_boundary,                # 1.0 = first action of a new hand
     ]
     return torch.tensor(features, dtype=torch.float32)
 
@@ -98,4 +109,5 @@ def get_sizing_mask(game_state) -> torch.Tensor:
     return mask
 
 # Dimension of one encoded action token
-ACTION_FEATURE_DIM = NUM_ACTION_TYPES + 3  # 4 + 3 = 7
+ACTION_FEATURE_DIM = NUM_ACTION_TYPES + 9  # 4 + 9 = 13
+
