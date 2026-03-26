@@ -430,12 +430,39 @@ class GameManager:
                                  and p.bet_this_street < self.game_state.current_bet),
             )
             probs = probs_tensor.tolist()
-            sizing_probs = seat_info.personality.apply_sizing(sizing_probs, situations)
+            
+            sizing_tensor = seat_info.personality.apply_sizing(
+                torch.tensor(sizing_probs), situations,
+                hand_strength=hs
+            )
+            sizing_probs = sizing_tensor.tolist()
+
+        import math
+        action_evs = {}
+        T = 0.5  # Soft-Q temperature
+        bb = max(self.game_state.big_blind, 1.0)
+        
+        for i, name in enumerate(["FOLD", "CHECK", "CALL", "RAISE"]):
+            prob = probs[i]
+            # Verify if action is legal
+            is_legal = any(at.name == name for at in legal_types)
+            if name == "RAISE" and not is_legal and any(at.name == "ALL_IN" for at in legal_types):
+                name = "ALL_IN"
+                is_legal = True
+                
+            if is_legal:
+                if name == "FOLD":
+                    action_evs[name] = -(p.bet_total / bb)
+                elif prob > 1e-4:
+                    action_evs[name] = ev + T * math.log(prob)
+                else:
+                    action_evs[name] = ev - 5.0
 
         return {
             'probs': probs,
             'sizing': sizing_probs,
             'ev': ev,
+            'action_evs': action_evs,
             'legal_actions': [at.name for at in legal_types]
         }
 

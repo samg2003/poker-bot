@@ -196,6 +196,7 @@ class SituationalPersonality:
         active_situations: List[Situation],
         hand_strength: float = 0.5,
         is_facing_raise: bool = False,
+        opponent_stats: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Apply personality to an action distribution.
@@ -205,6 +206,7 @@ class SituationalPersonality:
             active_situations: list of current Situation tags
             hand_strength: 0-1 (0=worst, 1=nuts)
             is_facing_raise: whether currently facing a raise
+            opponent_stats: Optional (30,) tensor of opponent's tracking stats
 
         Returns:
             Modified action_probs (4,) tensor, re-normalized.
@@ -267,28 +269,29 @@ class SituationalPersonality:
 
     def apply_sizing(
         self,
-        sizing_probs: List[float],
+        sizing_probs: torch.Tensor,
         active_situations: List[Situation],
-    ) -> List[float]:
+        hand_strength: float = 0.5,
+        opponent_stats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        Apply personality to bet sizing distribution.
-
-        sizing_mult > 1 shifts weight towards larger bets.
-        sizing_mult < 1 shifts weight towards smaller bets.
+        Apply personality to a bet sizing distribution.
 
         Args:
-            sizing_probs: list of 10 floats (pot fraction buckets)
-            active_situations: current situation tags
+            sizing_probs: (10,) tensor of size bucket probabilities
+            active_situations: list of current Situation tags
+            hand_strength: 0-1 (0=worst, 1=nuts)
+            opponent_stats: Optional (30,) tensor of opponent's tracking stats
 
         Returns:
-            Modified sizing_probs list, re-normalized.
+            Modified sizing_probs (10,) tensor, re-normalized.
         """
         mod = self.get_modifier(active_situations)
         n = len(sizing_probs)
         if n == 0:
             return sizing_probs
 
-        adjusted = list(sizing_probs)
+        adjusted = sizing_probs.clone()
         sm = mod.sizing_mult
 
         # Apply exponential weighting: later indices = bigger bets
@@ -301,11 +304,57 @@ class SituationalPersonality:
             factor = 1.0 + (sm - 1.0) * (2.0 * pos - 1.0)
             adjusted[i] *= max(factor, 0.05)
 
-        total = sum(adjusted)
-        if total > 0:
-            adjusted = [p / total for p in adjusted]
+        # --- Clamp and re-normalize ---
+        adjusted = adjusted.clamp(min=1e-6)
+        adjusted = adjusted / adjusted.sum()
 
         return adjusted
+
+
+class DynamicNemesis(SituationalPersonality):
+    """
+    A dynamic anti-strategy bot that intercepts the opponent's live stats
+    (VPIP, PFR) and constructs a direct mathematical counter-strategy.
+    """
+    def apply(
+        self,
+        action_probs: torch.Tensor,
+        active_situations: List[Situation],
+        hand_strength: float = 0.5,
+        is_facing_raise: bool = False,
+        opponent_stats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        
+        # Determine counter-strategy from Hero's VPIP / PFR
+        if opponent_stats is not None:
+            vpip = opponent_stats[0].item()
+            pfr = opponent_stats[1].item()
+            hands_played_conf = opponent_stats[16].item() # Sample size confidence
+            
+            # Only adapt if we have a decent sample size on them (e.g. >20 hands, so conf > 0.04)
+            if hands_played_conf > 0.04:
+                if vpip < 0.15:
+                    self.base = PersonalityModifier.maniac()          # Punish Nits by stealing
+                elif vpip > 0.30 and pfr < 0.10:
+                    self.base = PersonalityModifier.tag()             # Punish Stations by value betting linearly
+                elif pfr > 0.25:
+                    self.base = PersonalityModifier.calling_station() # Punish Maniacs by trapping
+                elif vpip > 0.25 and pfr > 0.15:
+                    self.base = PersonalityModifier.nit()             # Punish LAGs by tightening up
+                else:
+                    self.base = PersonalityModifier.gto()             # Baseline TAG/GTO for unknown
+        
+        return super().apply(action_probs, active_situations, hand_strength, is_facing_raise, opponent_stats)
+
+    def apply_sizing(
+        self,
+        sizing_probs: torch.Tensor,
+        active_situations: List[Situation],
+        hand_strength: float = 0.5,
+        opponent_stats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Relies on the base set in `apply` which is called first usually
+        return super().apply_sizing(sizing_probs, active_situations, hand_strength, opponent_stats)
 
 
 # =============================================================================
@@ -398,21 +447,17 @@ def sample_table_personalities(
             # GTO player (no modification)
             personalities.append(SituationalPersonality())
         else:
-            # Sample archetype — weighted to match $1/$2 online player pool
+            # Sample archetype — heavily weighted toward Nemesis (20%) to break passivity
             archetypes = [
-                PersonalityModifier.fish,             # 30%
+                PersonalityModifier.fish,             # 20%
                 PersonalityModifier.fish,
                 PersonalityModifier.fish,
                 PersonalityModifier.fish,
-                PersonalityModifier.fish,
-                PersonalityModifier.fish,
-                PersonalityModifier.tag,              # 25%
+                PersonalityModifier.tag,              # 20%
                 PersonalityModifier.tag,
                 PersonalityModifier.tag,
                 PersonalityModifier.tag,
-                PersonalityModifier.tag,
-                PersonalityModifier.calling_station,  # 20%
-                PersonalityModifier.calling_station,
+                PersonalityModifier.calling_station,  # 15%
                 PersonalityModifier.calling_station,
                 PersonalityModifier.calling_station,
                 PersonalityModifier.lag,              # 10%
@@ -420,9 +465,17 @@ def sample_table_personalities(
                 PersonalityModifier.nit,              # 10%
                 PersonalityModifier.nit,
                 PersonalityModifier.maniac,           # 5%
+                "NEMESIS",                            # 20%
+                "NEMESIS",
+                "NEMESIS",
+                "NEMESIS"
             ]
-            base = rng.choice(archetypes)()
-            personalities.append(SituationalPersonality(base=base))
+            choice = rng.choice(archetypes)
+            if choice == "NEMESIS":
+                personalities.append(DynamicNemesis())
+            else:
+                base = choice()
+                personalities.append(SituationalPersonality(base=base))
 
     return personalities
 

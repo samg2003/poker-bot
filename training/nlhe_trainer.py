@@ -761,13 +761,26 @@ class NLHESelfPlayTrainer:
                             elif max(r1, r2) >= 10: hand_strength = 0.4
                             else: hand_strength = 0.2
 
-                        probs = personality.apply(probs, situations, hand_strength=hand_strength, is_facing_raise=is_facing_raise)
+                        probs = personality.apply(
+                            probs, 
+                            situations, 
+                            hand_strength=hand_strength, 
+                            is_facing_raise=is_facing_raise,
+                            opponent_stats=table.stat_tracker.get_stats(0).to(probs.device)
+                        )
 
                 dist = Categorical(probs)
                 action_idx = dist.sample().item()
                 sizing_idx = 0
                 if action_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
                     sizing_tensor = torch.tensor(sizing_probs, dtype=torch.float32)
+                    if personality is not None:
+                        sizing_tensor = personality.apply_sizing(
+                            sizing_tensor, 
+                            situations, 
+                            hand_strength=hand_strength,
+                            opponent_stats=table.stat_tracker.get_stats(0)
+                        )
                     s_dist = Categorical(sizing_tensor)
                     sizing_idx = s_dist.sample().item()
 

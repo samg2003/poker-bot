@@ -22,12 +22,14 @@ export default function GodModePanel({ gameState, selectedSeat }) {
   let pf = 0, pc = 0, pr = 0
   let evText = '-- bb'
   let sizingProbs = Array(10).fill(0)
+  let actionEvs = {}
 
   if (evData && !p.is_folded) {
     evText = `${evData.ev > 0 ? '+' : ''}${evData.ev.toFixed(2)} bb`
     pf = (evData.probs[0] * 100).toFixed(1)
     pc = (evData.probs[1] * 100 + evData.probs[2] * 100).toFixed(1)
     pr = (evData.probs[3] * 100).toFixed(1)
+    actionEvs = evData.action_evs || {}
     
     if (evData.sizing && evData.sizing.length === 10) {
       sizingProbs = evData.sizing
@@ -81,17 +83,17 @@ export default function GodModePanel({ gameState, selectedSeat }) {
         <div className="prob-row">
           <span className="prob-label text-fold">Fold</span>
           <div className="bar-bg"><div className="bar bg-fold" style={{ width: `${pf}%` }}></div></div>
-          <span className="prob-val">{pf}%</span>
+          <span className="prob-val" style={{width: 'auto', minWidth: '70px'}}>{pf}% <span style={{color: '#8b949e', fontSize: '10px'}}>{actionEvs.FOLD !== undefined ? `(${actionEvs.FOLD > 0 ? '+' : ''}${actionEvs.FOLD.toFixed(1)})` : ''}</span></span>
         </div>
         <div className="prob-row">
-          <span className="prob-label text-call">Check/Call</span>
+          <span className="prob-label text-call">Ch/Call</span>
           <div className="bar-bg"><div className="bar bg-call" style={{ width: `${pc}%` }}></div></div>
-          <span className="prob-val">{pc}%</span>
+          <span className="prob-val" style={{width: 'auto', minWidth: '70px'}}>{pc}% <span style={{color: '#8b949e', fontSize: '10px'}}>{Math.max(actionEvs.CHECK || -999, actionEvs.CALL || -999) !== -999 ? `(${Math.max(actionEvs.CHECK || -999, actionEvs.CALL || -999) > 0 ? '+' : ''}${Math.max(actionEvs.CHECK || -999, actionEvs.CALL || -999).toFixed(1)})` : ''}</span></span>
         </div>
         <div className="prob-row">
           <span className="prob-label text-raise">Raise</span>
           <div className="bar-bg"><div className="bar bg-raise" style={{ width: `${pr}%` }}></div></div>
-          <span className="prob-val">{pr}%</span>
+          <span className="prob-val" style={{width: 'auto', minWidth: '70px'}}>{pr}% <span style={{color: '#8b949e', fontSize: '10px'}}>{Math.max(actionEvs.RAISE || -999, actionEvs.ALL_IN || -999) !== -999 ? `(${Math.max(actionEvs.RAISE || -999, actionEvs.ALL_IN || -999) > 0 ? '+' : ''}${Math.max(actionEvs.RAISE || -999, actionEvs.ALL_IN || -999).toFixed(1)})` : ''}</span></span>
         </div>
       </div>
 

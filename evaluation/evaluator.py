@@ -367,7 +367,7 @@ class Evaluator:
                 probs = personality.apply(probs, situations,
                                          hand_strength=hand_strength,
                                          is_facing_raise=is_facing_raise)
-                sizing_probs = personality.apply_sizing(sizing_probs, situations)
+                sizing_probs = personality.apply_sizing(torch.tensor(sizing_probs, dtype=torch.float32), situations).tolist()
 
             from torch.distributions import Categorical
             dist = Categorical(probs)
