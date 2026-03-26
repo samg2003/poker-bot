@@ -517,11 +517,12 @@ class NLHESelfPlayTrainer:
         num_active = sum(1 for pp in game_state.players if pp.is_active)
         current_bet = game_state.current_bet / norm
         min_raise = game_state.min_raise / norm
+        amount_to_call = max(0.0, current_bet - own_bet)
 
         numeric = self._to(torch.tensor([[
             pot, own_stack, own_bet, position, street_val,
             game_state.num_players / 9.0, num_active / 9.0,
-            current_bet, min_raise,
+            current_bet, min_raise, amount_to_call
         ]], dtype=torch.float32))
 
         action_mask = self._encode_action_mask(game_state)

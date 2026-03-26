@@ -211,6 +211,7 @@ class CurriculumTrainer:
             numeric = torch.tensor([[
                 pot / 10.0, 1.0, 0.0, float(player),
                 float(state.round_idx), 2.0/9, 2.0/9, 0.0, 0.0,
+                0.0,  # amount to call
             ]], dtype=torch.float32)
 
             opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)

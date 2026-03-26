@@ -209,6 +209,7 @@ class Evaluator:
             numeric = torch.tensor([[
                 pot / 10.0, 1.0, 0.0, float(player),
                 float(state.round_idx), 2.0/9, 2.0/9, 0.0, 0.0,
+                0.0,  # amount to call
             ]], dtype=torch.float32)
 
             opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)
@@ -309,11 +310,12 @@ class Evaluator:
             num_active = sum(1 for pp in game_state.players if pp.is_active)
             current_bet = game_state.current_bet / 100.0
             min_raise = game_state.min_raise / 100.0
+            amount_to_call = max(0.0, current_bet - own_bet)
 
             numeric = torch.tensor([[
                 pot, own_stack, own_bet, position, street_val,
                 num_players / 9.0, num_active / 9.0,
-                current_bet, min_raise,
+                current_bet, min_raise, amount_to_call
             ]], dtype=torch.float32)
 
             legal_types = game_state.get_legal_actions()
@@ -535,7 +537,7 @@ class Evaluator:
 
         hole = torch.tensor([[0, 1]], dtype=torch.long)
         community = torch.tensor([[10, 20, 30, -1, -1]], dtype=torch.long)
-        numeric = torch.tensor([[0.5, 1.0, 0.0, 0.0, 0.33, 0.22, 0.22, 0.0, 0.0]], dtype=torch.float32)
+        numeric = torch.tensor([[0.5, 1.0, 0.0, 0.0, 0.33, 0.22, 0.22, 0.0, 0.0, 0.0]], dtype=torch.float32)
         opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)
         opp_stats = torch.zeros(1, 1, NUM_STAT_FEATURES)
         own_stats = torch.zeros(1, NUM_STAT_FEATURES)
@@ -565,7 +567,7 @@ class Evaluator:
         for _ in range(20):
             hole = torch.randint(0, 52, (1, 2))
             community = torch.tensor([[-1, -1, -1, -1, -1]], dtype=torch.long)
-            numeric = torch.randn(1, 9)
+            numeric = torch.randn(1, 10)
             opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)
             opp_stats = torch.zeros(1, 1, NUM_STAT_FEATURES)
             own_stats = torch.zeros(1, NUM_STAT_FEATURES)

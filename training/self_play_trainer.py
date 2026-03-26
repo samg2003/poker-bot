@@ -174,6 +174,7 @@ class LeducSelfPlayTrainer:
             2.0 / 9.0,                   # num_active / max
             0.0,                          # current bet (normalized)
             0.0,                          # min raise (normalized)
+            0.0,                          # amount to call
         ]
 
     @torch.no_grad()

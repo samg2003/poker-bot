@@ -210,7 +210,7 @@ class InferenceEngine:
         for _ in range(num_iterations):
             hole = torch.randint(0, 52, (batch_size, 2))
             community = torch.full((batch_size, 5), -1, dtype=torch.long)
-            numeric = torch.randn(batch_size, 9)
+            numeric = torch.randn(batch_size, 10).to(self.device)
 
             self.infer(hole, community, numeric)
 
@@ -227,7 +227,7 @@ class InferenceEngine:
         # Create example inputs for tracing
         hole = torch.randint(0, 52, (1, 2))
         community = torch.full((1, 5), -1, dtype=torch.long)
-        numeric = torch.randn(1, 9)
+        numeric = torch.randn(1, 10).to(self.device)
         opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)
         opp_stats = torch.zeros(1, 1, NUM_STAT_FEATURES)
         own_stats = torch.zeros(1, NUM_STAT_FEATURES)

@@ -33,7 +33,7 @@ class TestPokerAgent:
         result = agent.get_action(
             hole_cards=(0, 1),
             community_cards=[10, 20, 30],
-            numeric_features=[0.5, 1.0, 0.0, 0.0, 0.33, 0.22, 0.22, 0.0, 0.0],
+            numeric_features=[0.5, 1.0, 0.0, 0.0, 0.33, 0.22, 0.22, 0.0, 0.0, 0.0],
             opponent_ids=[1],
         )
         assert isinstance(result, ActionResult)
@@ -47,7 +47,7 @@ class TestPokerAgent:
         result = agent.get_action(
             hole_cards=(0, 1),
             community_cards=[],
-            numeric_features=[0.5, 1.0, 0.0, 0.0, 0.0, 0.22, 0.22, 0.0, 0.0],
+            numeric_features=[0.5, 1.0, 0.0, 0.0, 0.0, 0.22, 0.22, 0.0, 0.0, 0.0],
             opponent_ids=[1],
             action_mask=mask,
         )
@@ -74,7 +74,7 @@ class TestPokerAgent:
         result = agent.get_action(
             hole_cards=(0, 1),
             community_cards=[],
-            numeric_features=[0.5, 1.0, 0.0, 0.0, 0.0, 0.22, 0.22, 0.0, 0.0],
+            numeric_features=[0.5, 1.0, 0.0, 0.0, 0.0, 0.22, 0.22, 0.0, 0.0, 0.0],
             opponent_ids=[1],
         )
         assert isinstance(result, ActionResult)
@@ -99,7 +99,7 @@ class TestPokerAgent:
         result = agent.get_action(
             hole_cards=(0, 1),
             community_cards=[10, 20, 30, 40, 45],
-            numeric_features=[1.0, 0.5, 0.3, 0.0, 1.0, 0.22, 0.11, 0.5, 0.2],
+            numeric_features=[1.0, 0.5, 0.3, 0.0, 1.0, 0.22, 0.11, 0.5, 0.2, 0.2],
             opponent_ids=[],
         )
         assert isinstance(result, ActionResult)

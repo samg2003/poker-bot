@@ -76,17 +76,17 @@ class GameStateEncoder(nn.Module):
 
         # Card embedding (shared for hole and community cards)
         self.card_embed = CardEmbedding(embed_dim=64)
+        self.owner_embed = nn.Embedding(2, 64)  # 0 = Hole, 1 = Community
 
         # Aggregate cards via attention
         self.card_attn = nn.MultiheadAttention(
             embed_dim=64, num_heads=4, batch_first=True,
         )
-        self.card_proj = nn.Linear(64, embed_dim)
+        self.card_proj = nn.Linear(128, embed_dim)  # 2 hole cards * 64 dim
 
-        # Numeric features: pot_size, own_stack, own_bet, position, street,
-        # num_players, num_active, current_bet, min_raise
+        # Numeric features: pot, stack, own_bet, pos, street, num_p, active_p, current_bet, min_raise, amount_to_call
         self.numeric_proj = nn.Sequential(
-            nn.Linear(9, embed_dim),
+            nn.Linear(10, embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
         )
@@ -107,13 +107,27 @@ class GameStateEncoder(nn.Module):
         """
         Returns: (batch, embed_dim) game state encoding.
         """
-        # Embed all 7 cards
-        all_cards = torch.cat([hole_cards, community_cards], dim=1)  # (batch, 7)
-        card_embs = self.card_embed(all_cards)  # (batch, 7, 64)
+        # Embed cards and apply ownership (0=Hole, 1=Community)
+        hole_embs = self.card_embed(hole_cards) + self.owner_embed(torch.tensor(0, device=hole_cards.device))
+        comm_embs = self.card_embed(community_cards) + self.owner_embed(torch.tensor(1, device=community_cards.device))
+        
+        # Zero out absent community cards again to prevent ownership-embed noise injection
+        valid_comm = (community_cards >= 0).unsqueeze(-1).float()
+        comm_embs = comm_embs * valid_comm
 
-        # Self-attention over cards (learns card interactions)
-        card_out, _ = self.card_attn(card_embs, card_embs, card_embs)
-        card_repr = card_out.mean(dim=1)  # (batch, 64) — average pool
+        card_embs = torch.cat([hole_embs, comm_embs], dim=1)  # (batch, 7, 64)
+
+        # Self-attention over cards with padding mask for absent cards
+        all_cards = torch.cat([hole_cards, community_cards], dim=1)
+        key_padding_mask = (all_cards < 0)  # True = Ignore
+        
+        card_out, _ = self.card_attn(
+            card_embs, card_embs, card_embs,
+            key_padding_mask=key_padding_mask
+        )
+        
+        # Extract and flatten precisely the 2 Hole Cards (giving the network undiluted vision of its hand interaction)
+        card_repr = card_out[:, :2, :].flatten(start_dim=1)  # (batch, 128)
         card_repr = self.card_proj(card_repr)  # (batch, embed_dim)
 
         # Project numeric features

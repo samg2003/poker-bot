@@ -362,11 +362,12 @@ class GameManager:
         num_active = sum(1 for pp in self.game_state.players if pp.is_active)
         current_bet = self.game_state.current_bet / 100.0
         min_raise = self.game_state.min_raise / 100.0
+        amount_to_call = max(0.0, current_bet - own_bet)
 
         numeric = torch.tensor([[
             pot, own_stack, own_bet, position, street_val,
             num_engine_players / 9.0, num_active / 9.0,
-            current_bet, min_raise,
+            current_bet, min_raise, amount_to_call
         ]], dtype=torch.float32)
 
         legal_types = self.game_state.get_legal_actions()

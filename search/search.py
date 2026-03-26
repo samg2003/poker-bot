@@ -299,7 +299,8 @@ class SearchEngine:
             state.num_players / 9.0,
             sum(1 for f in state.folded if not f) / 9.0,
             max(state.bets) / (100 * bb),
-            0.0,
+            0.0,  # min_raise, dummy 0.0 for leaf evaluation
+            max(0.0, max(state.bets) - state.bets[player]) / (100 * bb),  # amount_to_call
         ]], dtype=torch.float32)
 
         opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)

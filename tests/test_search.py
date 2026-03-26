@@ -50,24 +50,24 @@ class TestComboIndexing:
 
 class TestRangeEstimator:
     def test_output_shape(self):
-        estimator = RangeEstimator(opponent_embed_dim=64, game_context_dim=9)
+        estimator = RangeEstimator(opponent_embed_dim=64, game_context_dim=10)
         opp_embed = torch.randn(2, 64)
-        game_ctx = torch.randn(2, 9)
+        game_ctx = torch.randn(2, 10).to(torch.float32)
         probs = estimator(opp_embed, game_ctx)
         assert probs.shape == (2, NUM_COMBOS)
 
     def test_output_is_distribution(self):
-        estimator = RangeEstimator(opponent_embed_dim=64, game_context_dim=9)
+        estimator = RangeEstimator(opponent_embed_dim=64, game_context_dim=10)
         opp_embed = torch.randn(1, 64)
-        game_ctx = torch.randn(1, 9)
+        game_ctx = torch.randn(1, 10)
         probs = estimator(opp_embed, game_ctx)
         assert abs(probs.sum().item() - 1.0) < 1e-4
         assert (probs >= 0).all()
 
     def test_dead_card_masking(self):
-        estimator = RangeEstimator(opponent_embed_dim=64, game_context_dim=9)
+        estimator = RangeEstimator(opponent_embed_dim=64, game_context_dim=10)
         opp_embed = torch.randn(1, 64)
-        game_ctx = torch.randn(1, 9)
+        game_ctx = torch.randn(1, 10)
 
         # Create dead mask (mark ~half as dead)
         dead = torch.zeros(1, NUM_COMBOS, dtype=torch.bool)
@@ -78,9 +78,9 @@ class TestRangeEstimator:
         assert probs[0, :600].sum().item() < 1e-4
 
     def test_gradient_flow(self):
-        estimator = RangeEstimator(opponent_embed_dim=64, game_context_dim=9)
+        estimator = RangeEstimator(opponent_embed_dim=64, game_context_dim=10)
         opp_embed = torch.randn(1, 64, requires_grad=True)
-        game_ctx = torch.randn(1, 9)
+        game_ctx = torch.randn(1, 10).to(torch.float32)
         probs = estimator(opp_embed, game_ctx)
         probs.sum().backward()
         assert opp_embed.grad is not None
