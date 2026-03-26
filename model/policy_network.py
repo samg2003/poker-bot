@@ -242,6 +242,9 @@ class HandHistoryEncoder(nn.Module):
         """Returns (batch, embed_dim) hand_story."""
         batch_size = action_seq.shape[0]
 
+        # Compact GRU weights for cuDNN efficiency
+        self.gru.flatten_parameters()
+
         # Clamp lengths to valid range
         seq_lengths = seq_lengths.clamp(min=1).cpu()
 
