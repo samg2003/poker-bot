@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.action_space import NUM_ACTION_TYPES, ActionOutput
+from model.action_space import NUM_ACTION_TYPES, ActionOutput, ACTION_FEATURE_DIM
 from model.stat_tracker import NUM_STAT_FEATURES
 
 
@@ -119,18 +119,19 @@ class GameStateEncoder(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
 
-        # Combine cards + numeric
+        # Combine cards + numeric + hand_story
         self.combine = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Linear(embed_dim * 3, embed_dim),
             nn.GELU(),
             nn.LayerNorm(embed_dim),
         )
 
     def forward(
         self,
-        hole_cards: torch.Tensor,       # (batch, 2) card indices
-        community_cards: torch.Tensor,   # (batch, 5) card indices (-1 if absent)
-        numeric_features: torch.Tensor,  # (batch, 23)
+        hole_cards: torch.Tensor,         # (batch, 2) card indices
+        community_cards: torch.Tensor,    # (batch, 5) card indices (-1 if absent)
+        numeric_features: torch.Tensor,   # (batch, 23)
+        hand_story: Optional[torch.Tensor] = None,  # (batch, embed_dim)
     ) -> torch.Tensor:
         batch_size = hole_cards.shape[0]
 
@@ -161,13 +162,98 @@ class GameStateEncoder(nn.Module):
         # Project numeric features
         numeric_repr = self.numeric_proj(numeric_features)
 
-        # Combine
-        combined = torch.cat([card_repr, numeric_repr], dim=-1)
+        # Hand story (zeros if not provided — backward compat)
+        if hand_story is None:
+            hand_story = torch.zeros(
+                batch_size, self.combine[0].in_features // 3,
+                device=hole_cards.device,
+            )
+
+        # Combine cards + numeric + hand_story
+        combined = torch.cat([card_repr, numeric_repr, hand_story], dim=-1)
         return self.combine(combined)
 
 
 # Per-opponent game state: seat_onehot(9) + stack + bet + pot_committed + active + all_in = 14d
 OPP_GAME_STATE_DIM = 14
+
+# Cached player profile dimension
+PROFILE_DIM = 64
+
+# Hand history token dim: raw_action(13d) + actor_profile(64d) = 77d
+HAND_ACTION_DIM = ACTION_FEATURE_DIM + PROFILE_DIM
+
+# Max actions per hand
+MAX_HAND_ACTIONS = 40
+
+
+class ProfileBuilder(nn.Module):
+    """Compress [encoder_output + HUD_stats + is_hero] into a 64d cached profile.
+
+    Built once per hand for each player, reused in cross-attention and hand history.
+    """
+
+    def __init__(self, encoder_dim: int, stat_features: int = NUM_STAT_FEATURES):
+        super().__init__()
+        self.stats_proj = nn.Linear(stat_features, 64)
+        # encoder_dim + 64 (projected stats) + 1 (is_hero flag)
+        self.combine = nn.Sequential(
+            nn.Linear(encoder_dim + 64 + 1, PROFILE_DIM),
+            nn.GELU(),
+            nn.LayerNorm(PROFILE_DIM),
+        )
+
+    def forward(
+        self,
+        encoder_output: torch.Tensor,   # (batch, encoder_dim)
+        stats: torch.Tensor,            # (batch, stat_features)
+        is_hero: torch.Tensor,          # (batch, 1)
+    ) -> torch.Tensor:
+        """Returns (batch, 64) cached profile."""
+        stats_repr = self.stats_proj(stats)
+        combined = torch.cat([encoder_output, stats_repr, is_hero], dim=-1)
+        return self.combine(combined)
+
+
+class HandHistoryEncoder(nn.Module):
+    """GRU encoder for intra-hand action sequences.
+
+    Each token is [raw_action(13d) + actor_cached_profile(64d)] = 77d.
+    Outputs hand_story (embed_dim) from the final GRU hidden state.
+    """
+
+    def __init__(self, embed_dim: int, num_layers: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.gru = nn.GRU(
+            input_size=HAND_ACTION_DIM,
+            hidden_size=embed_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.output_norm = nn.LayerNorm(embed_dim)
+
+    def forward(
+        self,
+        action_seq: torch.Tensor,     # (batch, max_seq, 77)
+        seq_lengths: torch.Tensor,    # (batch,) — actual lengths
+    ) -> torch.Tensor:
+        """Returns (batch, embed_dim) hand_story."""
+        batch_size = action_seq.shape[0]
+
+        # Clamp lengths to valid range
+        seq_lengths = seq_lengths.clamp(min=1).cpu()
+
+        # Pack for efficient GRU processing
+        packed = nn.utils.rnn.pack_padded_sequence(
+            action_seq, seq_lengths, batch_first=True, enforce_sorted=False
+        )
+        _, hidden = self.gru(packed)  # hidden: (num_layers, batch, embed_dim)
+
+        # Take the final layer's hidden state
+        hand_story = hidden[-1]  # (batch, embed_dim)
+        return self.output_norm(hand_story)
 
 
 class PolicyNetwork(nn.Module):
@@ -201,9 +287,20 @@ class PolicyNetwork(nn.Module):
         # Game state encoder
         self.state_encoder = GameStateEncoder(embed_dim=embed_dim)
 
-        # Project opponent embeddings + stats + game_state into the same space
+        # Phase 6: Profile builder — compresses encoder_output + stats + is_hero → 64d
+        self.profile_builder = ProfileBuilder(encoder_dim=opponent_embed_dim)
+
+        # Phase 5: Hand history GRU encoder
+        self.hand_history_encoder = HandHistoryEncoder(embed_dim=embed_dim)
+
+        # Project opponent profiles + game_state into cross-attention space
+        # When profiles are available: profile(64d) + game_state(14d) = 78d
+        # Legacy fallback: opponent_embed + stats + game_state = opp_embed+30+14
         self.opponent_proj = nn.Linear(
             opponent_embed_dim + NUM_STAT_FEATURES + OPP_GAME_STATE_DIM, embed_dim
+        )
+        self.opponent_proj_v2 = nn.Linear(
+            PROFILE_DIM + OPP_GAME_STATE_DIM, embed_dim
         )
 
         # Cross-attention layers: game state attends to opponent embeddings
@@ -235,8 +332,10 @@ class PolicyNetwork(nn.Module):
             for _ in range(num_cross_attn_layers)
         ])
 
-        # Own stats projection (so agent is aware of its own image)
+        # Own stats projection (legacy fallback)
         self.own_stats_proj = nn.Linear(NUM_STAT_FEATURES, embed_dim)
+        # Hero profile projection (Phase 6 — used when profiles provided)
+        self.hero_proj = nn.Linear(PROFILE_DIM, embed_dim)
 
         # Final combination before heads
         self.pre_head = nn.Sequential(
@@ -296,6 +395,12 @@ class PolicyNetwork(nn.Module):
         opponent_mask: Optional[torch.Tensor] = None,  # (batch, num_opponents) True=masked
         action_mask: Optional[torch.Tensor] = None,    # (batch, 4) True=legal
         sizing_mask: Optional[torch.Tensor] = None,    # (batch, 10) True=legal
+        # Phase 5+6 new params (backward compatible)
+        hand_action_seq: Optional[torch.Tensor] = None,   # (batch, max_seq, 13) raw actions
+        hand_action_len: Optional[torch.Tensor] = None,    # (batch,) sequence lengths
+        hero_profile: Optional[torch.Tensor] = None,       # (batch, 64) cached hero profile
+        opponent_profiles: Optional[torch.Tensor] = None,  # (batch, num_opp, 64) cached opp profiles
+        actor_profiles_seq: Optional[torch.Tensor] = None, # (batch, max_seq, 64) per-action actor profile
     ) -> ActionOutput:
         """
         Full forward pass.
@@ -305,19 +410,34 @@ class PolicyNetwork(nn.Module):
         batch_size = hole_cards.shape[0]
         num_opps = opponent_embeddings.shape[1]
 
-        # 1. Encode game state
+        # ── Phase 5: Build hand_story ──
+        hand_story = None
+        if hand_action_seq is not None and actor_profiles_seq is not None:
+            # Enrich raw action tokens with actor profiles → 77d
+            enriched = torch.cat([hand_action_seq, actor_profiles_seq], dim=-1)  # (B, seq, 77)
+            if hand_action_len is None:
+                hand_action_len = (hand_action_seq.sum(dim=-1) != 0).sum(dim=-1).long()
+            hand_story = self.hand_history_encoder(enriched, hand_action_len)
+
+        # 1. Encode game state (with hand_story when available)
         state = self.state_encoder(
-            hole_cards, community_cards, numeric_features
+            hole_cards, community_cards, numeric_features, hand_story=hand_story
         )  # (batch, embed_dim)
 
-        # 2. Project opponent embeddings + stats + game_state
+        # 2. Project opponents for cross-attention
         if opponent_game_state is None:
             opponent_game_state = torch.zeros(
                 batch_size, num_opps, OPP_GAME_STATE_DIM,
                 device=opponent_embeddings.device,
             )
-        opp_combined = torch.cat([opponent_embeddings, opponent_stats, opponent_game_state], dim=-1)
-        opp_projected = self.opponent_proj(opp_combined)  # (batch, num_opp, embed_dim)
+
+        # Use v2 projection when profiles are available, else legacy
+        if opponent_profiles is not None:
+            opp_combined = torch.cat([opponent_profiles, opponent_game_state], dim=-1)
+            opp_projected = self.opponent_proj_v2(opp_combined)
+        else:
+            opp_combined = torch.cat([opponent_embeddings, opponent_stats, opponent_game_state], dim=-1)
+            opp_projected = self.opponent_proj(opp_combined)
 
         # 3. Cross-attention: game state attends to opponents
         # Handle edge case: if ALL opponents are masked for a sample,
@@ -359,8 +479,11 @@ class PolicyNetwork(nn.Module):
         if all_masked.any():
             state_with_opponents[all_masked] = state[all_masked]
 
-        # 4. Add own stats awareness
-        own_repr = self.own_stats_proj(own_stats)
+        # 4. Add hero awareness (profile or legacy stats)
+        if hero_profile is not None:
+            own_repr = self.hero_proj(hero_profile)
+        else:
+            own_repr = self.own_stats_proj(own_stats)
         combined = torch.cat([state_with_opponents, own_repr], dim=-1)
 
         # Policy trunk

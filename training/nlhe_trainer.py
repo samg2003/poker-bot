@@ -30,7 +30,7 @@ from model.action_space import (
     ACTION_FEATURE_DIM, encode_action, POT_FRACTIONS,
 )
 from model.opponent_encoder import OpponentEncoder
-from model.policy_network import PolicyNetwork, OPP_GAME_STATE_DIM
+from model.policy_network import PolicyNetwork, OPP_GAME_STATE_DIM, PROFILE_DIM, MAX_HAND_ACTIONS
 from model.stat_tracker import StatTracker, HandRecord, NUM_STAT_FEATURES
 from model.nlhe_encoder import NLHEEncoder
 from search.search import SearchEngine, SearchConfig
@@ -52,7 +52,10 @@ class Experience(NamedTuple):
     opponent_embeddings: torch.Tensor # (1, num_opp, embed_dim)
     opponent_stats: torch.Tensor      # (1, num_opp, stat_dim)
     own_stats: torch.Tensor           # (1, stat_dim)
-    opponent_game_state: torch.Tensor # (1, num_opp, 14) — per-opp seat/stack/bet/status
+    opponent_game_state: torch.Tensor # (1, num_opp, 14)
+    hand_action_seq: torch.Tensor     # (1, max_seq, 13) raw action tokens
+    hand_action_len: torch.Tensor     # (1,) actual sequence length
+    actor_profiles_seq: torch.Tensor  # (1, max_seq, 64) per-action actor profile
     action_mask: torch.Tensor         # (1, 4)
     sizing_mask: torch.Tensor         # (1, 10)
     action_idx: int                   # chosen action
@@ -683,6 +686,9 @@ class NLHESelfPlayTrainer:
         first_bet_this_street_by = -1  # who made the first bet/raise this street
         current_street = Street.PREFLOP
 
+        # Phase 5: Accumulate all raw action tokens during this hand
+        hand_action_tokens = []  # list of (raw_token_13d, actor_pid)
+
         while not dealer.is_hand_over():
             pid = game_state.current_player_idx
             p = game_state.players[pid]
@@ -704,6 +710,14 @@ class NLHESelfPlayTrainer:
                 else:
                     uncached.append((opid, table.action_histories.get(opid, [])))
 
+            # Phase 5: Snapshot current hand action history for this decision point
+            n_actions = len(hand_action_tokens)
+            ha_seq = torch.zeros(1, MAX_HAND_ACTIONS, ACTION_FEATURE_DIM)
+            ha_len = torch.tensor([min(n_actions, MAX_HAND_ACTIONS)], dtype=torch.long)
+            if n_actions > 0:
+                tokens = [t for t, _ in hand_action_tokens[-MAX_HAND_ACTIONS:]]
+                ha_seq[0, :len(tokens)] = torch.stack(tokens)
+
             # Yield for batched inference (both hero and frozen opponents)
             probs, value, sizing_probs, opp_embed_tensor = yield {
                 'hole_cards': encoded['hole_cards'],
@@ -712,6 +726,9 @@ class NLHESelfPlayTrainer:
                 'opponent_stats': opp_stats,
                 'own_stats': own_stats,
                 'opponent_game_state': opp_game_state,
+                'hand_action_seq': ha_seq,
+                'hand_action_len': ha_len,
+                '_hand_action_pids': [apid for _, apid in hand_action_tokens[-MAX_HAND_ACTIONS:]],
                 'action_mask': encoded['action_mask'],
                 'sizing_mask': encoded['sizing_mask'],
                 '_is_hero': pid == 0,
@@ -784,6 +801,9 @@ class NLHESelfPlayTrainer:
                     'opponent_stats': opp_stats.detach().cpu(),
                     'own_stats': own_stats.detach().cpu(),
                     'opponent_game_state': opp_game_state.detach().cpu(),
+                    'hand_action_seq': ha_seq.detach().cpu(),
+                    'hand_action_len': ha_len.detach().cpu(),
+                    '_hand_action_pids': [apid for _, apid in hand_action_tokens[-MAX_HAND_ACTIONS:]],
                     'action_mask': encoded['action_mask'].detach().cpu(),
                     'sizing_mask': encoded['sizing_mask'].detach().cpu(),
                     'action_idx': action_idx,
@@ -918,6 +938,14 @@ class NLHESelfPlayTrainer:
             self._record_action(table, pid, self._action_to_type_idx(action), bet_frac, pot_for_record, p.stack, street_map.get(pre_street, 0),
                                 relative_position=rel_pos, hand_boundary=is_hand_boundary)
 
+            # Phase 5: Record raw action token for hand history
+            raw_token = encode_action(
+                self._action_to_type_idx(action), bet_frac, pot_for_record, p.stack,
+                street_map.get(pre_street, 0), relative_position=rel_pos,
+                hand_boundary=is_hand_boundary,
+            )
+            hand_action_tokens.append((raw_token, pid))
+
             # Detect street transitions to reset per-street state
             if game_state.street != current_street:
                 current_street = game_state.street
@@ -952,6 +980,9 @@ class NLHESelfPlayTrainer:
                 opponent_stats=exp_dict['opponent_stats'],
                 own_stats=exp_dict['own_stats'],
                 opponent_game_state=exp_dict['opponent_game_state'],
+                hand_action_seq=exp_dict['hand_action_seq'],
+                hand_action_len=exp_dict['hand_action_len'],
+                actor_profiles_seq=torch.zeros(1, MAX_HAND_ACTIONS, PROFILE_DIM),  # placeholder — profiles built in batch
                 action_mask=exp_dict['action_mask'],
                 sizing_mask=exp_dict['sizing_mask'],
                 action_idx=exp_dict['action_idx'],
@@ -1143,6 +1174,11 @@ class NLHESelfPlayTrainer:
                     batch_opp_gs = torch.cat(padded_opp_gs, dim=0).to(self.device)
                     batch_opp_mask = torch.cat(opp_masks, dim=0).to(self.device)
 
+                    # Phase 5: Batch hand action sequences
+                    batch_ha_seq = torch.cat([s.get('hand_action_seq', torch.zeros(1, MAX_HAND_ACTIONS, ACTION_FEATURE_DIM)) for s in sub_states], dim=0).to(self.device)
+                    batch_ha_len = torch.cat([s.get('hand_action_len', torch.ones(1, dtype=torch.long)) for s in sub_states], dim=0)
+                    batch_actor_prof = torch.zeros(len(sub_states), MAX_HAND_ACTIONS, PROFILE_DIM, device=self.device)
+
                     target_model = self.policy if model_id == 'hero' else self._frozen_models.get(model_id, self._frozen_template)
                     
                     with torch.no_grad():
@@ -1151,6 +1187,8 @@ class NLHESelfPlayTrainer:
                             opponent_embeddings=batch_opp_embed, opponent_stats=batch_opp_stats, own_stats=batch_own,
                             opponent_game_state=batch_opp_gs,
                             action_mask=batch_mask, sizing_mask=batch_s_mask, opponent_mask=batch_opp_mask,
+                            hand_action_seq=batch_ha_seq, hand_action_len=batch_ha_len,
+                            actor_profiles_seq=batch_actor_prof,
                         )
 
                     for loc_idx, (b_idx, g_idx, s) in enumerate(items):
@@ -1281,7 +1319,12 @@ class NLHESelfPlayTrainer:
         opp_gs = torch.cat(opp_gs_list, dim=0)
         opp_masks = torch.cat(opp_mask_list, dim=0)
         
-        # 3. Stack targets (keep on CPU)
+        # 3. Stack hand action history (already padded to MAX_HAND_ACTIONS)
+        hand_action_seqs = torch.cat([e.hand_action_seq for e in experiences], dim=0)
+        hand_action_lens = torch.cat([e.hand_action_len for e in experiences], dim=0)
+        actor_profiles_seqs = torch.cat([e.actor_profiles_seq for e in experiences], dim=0)
+
+        # 4. Stack targets (keep on CPU)
         action_t = torch.tensor([e.action_idx for e in experiences], dtype=torch.long)
         sizing_t = torch.tensor([e.sizing_idx for e in experiences], dtype=torch.long)
         old_log_probs = torch.tensor([e.log_prob for e in experiences], dtype=torch.float32)
@@ -1323,6 +1366,9 @@ class NLHESelfPlayTrainer:
             'opp_stats': opp_stats,
             'opp_gs': opp_gs,
             'opp_masks': opp_masks,
+            'hand_action_seqs': hand_action_seqs,
+            'hand_action_lens': hand_action_lens,
+            'actor_profiles_seqs': actor_profiles_seqs,
             'action_t': action_t,
             'sizing_t': sizing_t,
             'old_log_probs': old_log_probs,
@@ -1347,6 +1393,9 @@ class NLHESelfPlayTrainer:
         opp_stats = data['opp_stats'][idx].to(self.device)
         opp_gs = data['opp_gs'][idx].to(self.device)
         opp_masks = data['opp_masks'][idx].to(self.device)
+        hand_action_seqs = data['hand_action_seqs'][idx].to(self.device)
+        hand_action_lens = data['hand_action_lens'][idx]
+        actor_profiles_seqs = data['actor_profiles_seqs'][idx].to(self.device)
         action_t = data['action_t'][idx].to(self.device)
         sizing_t = data['sizing_t'][idx].to(self.device)
         old_log_probs = data['old_log_probs'][idx].to(self.device)
@@ -1367,6 +1416,9 @@ class NLHESelfPlayTrainer:
             action_mask=action_masks,
             sizing_mask=sizing_masks,
             opponent_mask=opp_masks,
+            hand_action_seq=hand_action_seqs,
+            hand_action_len=hand_action_lens,
+            actor_profiles_seq=actor_profiles_seqs,
         )
         
         # ── Decoupled PPO: action type and sizing get independent credit ──
