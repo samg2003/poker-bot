@@ -624,6 +624,15 @@ class NLHESelfPlayTrainer:
         hand_records = [HandRecord() for _ in range(num_p)]
         epsilon = self._get_epsilon()
 
+        # --- Per-hand stat tracking state ---
+        pf_raise_count = 0           # number of raises preflop (for 3bet detection)
+        pf_callers_after_raise = 0   # callers after first raise (for squeeze detection)
+        pf_aggressor = -1            # seat of last preflop raiser
+        pf_has_raise = False         # has there been a preflop raise?
+        player_checked_this_street = [False] * num_p  # per-player check tracking
+        first_bet_this_street_by = -1  # who made the first bet/raise this street
+        current_street = Street.PREFLOP
+
         while not dealer.is_hand_over():
             pid = game_state.current_player_idx
             p = game_state.players[pid]
@@ -786,23 +795,88 @@ class NLHESelfPlayTrainer:
 
             # Execute action
             action = self._decode_action(action_idx, sizing_idx, game_state)
-            dealer.apply_action(action)
+
+            # --- Comprehensive stat tracking BEFORE apply_action ---
+            street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
+            pre_street = game_state.street
             bet_frac = action.amount / max(game_state.pot, 1e-6) if action.amount else 0.0
             pot_for_record = game_state.pot / max(game_state.big_blind, 1.0)
-            street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
-            
-            self._record_action(table, pid, self._action_to_type_idx(action), bet_frac, pot_for_record, p.stack, street_map.get(game_state.street, 0))
 
+            # Track VPIP / PFR (original)
             if action.action_type in (ActionType.CALL, ActionType.RAISE, ActionType.ALL_IN):
                 hand_records[pid].vpip = True
             if action.action_type in (ActionType.RAISE, ActionType.ALL_IN):
                 hand_records[pid].pfr = True
 
+            # --- Preflop-specific stats ---
+            if pre_street == Street.PREFLOP:
+                if action.action_type in (ActionType.RAISE, ActionType.ALL_IN):
+                    pf_raise_count += 1
+                    if pf_raise_count >= 2:
+                        hand_records[pid].three_bet = True  # 3-bet (or 4-bet+)
+                    if pf_raise_count == 1 and pf_callers_after_raise > 0:
+                        hand_records[pid].squeeze = True  # raise after raise+call
+                    pf_aggressor = pid
+                    pf_has_raise = True
+                    pf_callers_after_raise = 0  # reset caller count
+                elif action.action_type == ActionType.CALL:
+                    if pf_has_raise:
+                        hand_records[pid].cold_call = True
+                        pf_callers_after_raise += 1
+                    else:
+                        hand_records[pid].limp = True  # call BB with no raise
+
+            # --- Post-flop stats ---
+            if pre_street in (Street.FLOP, Street.TURN, Street.RIVER):
+                st_idx = street_map.get(pre_street, 0) - 1  # 0=flop, 1=turn, 2=river
+                if 0 <= st_idx < 3:
+                    if action.action_type == ActionType.CHECK:
+                        player_checked_this_street[pid] = True
+
+                    if action.action_type in (ActionType.RAISE, ActionType.ALL_IN):
+                        # Check-raise: player checked earlier this street, now raising
+                        if player_checked_this_street[pid]:
+                            hand_records[pid].check_raise[st_idx] = True
+
+                    # C-bet: preflop aggressor makes first bet on this street
+                    if action.action_type in (ActionType.RAISE, ActionType.ALL_IN) and first_bet_this_street_by == -1:
+                        first_bet_this_street_by = pid
+                        if pid == pf_aggressor:
+                            hand_records[pid].cbet[st_idx] = True
+
+                    # Fold to C-bet: folding when facing a cbet
+                    if action.action_type == ActionType.FOLD and first_bet_this_street_by == pf_aggressor and pf_aggressor != -1:
+                        hand_records[pid].fold_to_cbet[st_idx] = True
+                    elif action.action_type == ActionType.CALL and first_bet_this_street_by == pf_aggressor and pf_aggressor != -1:
+                        hand_records[pid].fold_to_cbet[st_idx] = False
+
+            # Bet sizing tracking
+            if action.amount > 0 and action.action_type in (ActionType.RAISE, ActionType.ALL_IN):
+                hand_records[pid].bet_sizes.append(bet_frac)
+            hand_records[pid].total_wagered += (action.amount if action.amount else 0.0)
+
+            # Apply the action
+            dealer.apply_action(action)
+
+            self._record_action(table, pid, self._action_to_type_idx(action), bet_frac, pot_for_record, p.stack, street_map.get(pre_street, 0))
+
+            # Detect street transitions to reset per-street state
+            if game_state.street != current_street:
+                current_street = game_state.street
+                player_checked_this_street = [False] * num_p
+                first_bet_this_street_by = -1
+
+        # --- End of hand: populate remaining fields ---
         results = dealer.get_results()
         profits = results['profit']
         for pid in range(num_p):
             hand_records[pid].result = profits[pid]
+            # saw_flop: player didn't fold preflop and hand went past preflop
+            pf_actions = [a for a in game_state.action_history if a.player_idx == pid]
+            hand_records[pid].saw_flop = not any(a.action_type == ActionType.FOLD for a in pf_actions) and game_state.street.value > Street.PREFLOP.value
+            hand_records[pid].was_pf_aggressor = (pf_aggressor == pid)
             hand_records[pid].went_to_showdown = (game_state.street == Street.SHOWDOWN and not game_state.players[pid].is_folded)
+            hand_records[pid].won_at_showdown = (hand_records[pid].went_to_showdown and pid in (results.get('winners', [])))
             table.stat_tracker.record_hand(pid, hand_records[pid])
 
         self._maybe_reset_histories(table)

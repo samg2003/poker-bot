@@ -288,6 +288,15 @@ class Evaluator:
         game_state = dealer.start_hand()
         hand_records = [HandRecord() for _ in range(num_players)]
 
+        # --- Per-hand stat tracking state ---
+        pf_raise_count = 0
+        pf_callers_after_raise = 0
+        pf_aggressor = -1
+        pf_has_raise = False
+        player_checked_this_street = [False] * num_players
+        first_bet_this_street_by = -1
+        current_street = Street.PREFLOP
+
         while not dealer.is_hand_over():
             pid = game_state.current_player_idx
             p = game_state.players[pid]
@@ -403,32 +412,85 @@ class Evaluator:
                 else:
                     act = Action(ActionType.FOLD)
 
+            # --- Comprehensive stat tracking BEFORE apply_action ---
+            pre_street = game_state.street
+            bet_frac = act.amount / max(game_state.pot, 1.0) if act.amount > 0 else 0.0
+
+            if act.action_type in (ActionType.CALL, ActionType.RAISE, ActionType.ALL_IN):
+                hand_records[pid].vpip = True
+            if act.action_type in (ActionType.RAISE, ActionType.ALL_IN):
+                hand_records[pid].pfr = True
+
+            # Preflop stats
+            if pre_street == Street.PREFLOP:
+                if act.action_type in (ActionType.RAISE, ActionType.ALL_IN):
+                    pf_raise_count += 1
+                    if pf_raise_count >= 2:
+                        hand_records[pid].three_bet = True
+                    if pf_raise_count == 1 and pf_callers_after_raise > 0:
+                        hand_records[pid].squeeze = True
+                    pf_aggressor = pid
+                    pf_has_raise = True
+                    pf_callers_after_raise = 0
+                elif act.action_type == ActionType.CALL:
+                    if pf_has_raise:
+                        hand_records[pid].cold_call = True
+                        pf_callers_after_raise += 1
+                    else:
+                        hand_records[pid].limp = True
+
+            # Post-flop stats
+            if pre_street in (Street.FLOP, Street.TURN, Street.RIVER):
+                st_idx = street_map.get(pre_street, 0) - 1
+                if 0 <= st_idx < 3:
+                    if act.action_type == ActionType.CHECK:
+                        player_checked_this_street[pid] = True
+                    if act.action_type in (ActionType.RAISE, ActionType.ALL_IN):
+                        if player_checked_this_street[pid]:
+                            hand_records[pid].check_raise[st_idx] = True
+                    if act.action_type in (ActionType.RAISE, ActionType.ALL_IN) and first_bet_this_street_by == -1:
+                        first_bet_this_street_by = pid
+                        if pid == pf_aggressor:
+                            hand_records[pid].cbet[st_idx] = True
+                    if act.action_type == ActionType.FOLD and first_bet_this_street_by == pf_aggressor and pf_aggressor != -1:
+                        hand_records[pid].fold_to_cbet[st_idx] = True
+                    elif act.action_type == ActionType.CALL and first_bet_this_street_by == pf_aggressor and pf_aggressor != -1:
+                        hand_records[pid].fold_to_cbet[st_idx] = False
+
+            if act.amount > 0 and act.action_type in (ActionType.RAISE, ActionType.ALL_IN):
+                hand_records[pid].bet_sizes.append(bet_frac)
+            hand_records[pid].total_wagered += (act.amount if act.amount else 0.0)
+
             dealer.apply_action(act)
 
             # Record for history/stats
             pot_for_record = game_state.pot
-            bet_frac = act.amount / max(pot_for_record, 1.0) if act.amount > 0 else 0.0
             self._record_action(
                 player_id=pid,
                 action_type=self._action_to_type_idx(act),
                 bet_frac=bet_frac,
                 pot=pot_for_record,
                 stack=p.stack,
-                street=street_map.get(game_state.street, 0),
+                street=street_map.get(pre_street, 0),
             )
-            
-            if act.action_type in (ActionType.CALL, ActionType.RAISE, ActionType.ALL_IN):
-                hand_records[pid].vpip = True
-            if act.action_type in (ActionType.RAISE, ActionType.ALL_IN):
-                hand_records[pid].pfr = True
+
+            # Street transition
+            if game_state.street != current_street:
+                current_street = game_state.street
+                player_checked_this_street = [False] * num_players
+                first_bet_this_street_by = -1
 
         # End of Hand: Track Stats
         results = dealer.get_results()
         for pid in range(num_players):
             hand_records[pid].result = results['profit'][pid]
+            pf_actions = [a for a in game_state.action_history if a.player_idx == pid]
+            hand_records[pid].saw_flop = not any(a.action_type == ActionType.FOLD for a in pf_actions) and game_state.street.value > Street.PREFLOP.value
+            hand_records[pid].was_pf_aggressor = (pf_aggressor == pid)
             hand_records[pid].went_to_showdown = (
                 game_state.street == Street.SHOWDOWN and not game_state.players[pid].is_folded
             )
+            hand_records[pid].won_at_showdown = (hand_records[pid].went_to_showdown and pid in results.get('winners', []))
             self.stat_tracker.record_hand(pid, hand_records[pid])
 
         # Player 0 profit in big blinds (from starting stack)

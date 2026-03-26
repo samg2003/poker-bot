@@ -291,6 +291,8 @@ class SituationalPersonality:
         if n == 0:
             return sizing_probs
 
+        if not isinstance(sizing_probs, torch.Tensor):
+            sizing_probs = torch.tensor(sizing_probs, dtype=torch.float32)
         adjusted = sizing_probs.clone()
         sm = mod.sizing_mult
 
