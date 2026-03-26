@@ -25,18 +25,13 @@ while true; do
             echo "   Running evaluation (2000 hands)..."
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-            # Run eval and capture output
             # Run eval on CPU to avoid competing with training for GPU
-            EVAL_OUTPUT=$(cd "$PROJECT_DIR" && CUDA_VISIBLE_DEVICES= python3 scripts/evaluate.py --checkpoint latest --num-hands 1000 2>&1) || true
-
-            # Log with timestamp
+            # Use tee to show output live AND append to log
             TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
             echo "" >> "$EVAL_LOG"
             echo "=== Epoch $CURRENT_EPOCH | $TIMESTAMP ===" >> "$EVAL_LOG"
-            echo "$EVAL_OUTPUT" >> "$EVAL_LOG"
+            (cd "$PROJECT_DIR" && CUDA_VISIBLE_DEVICES= python3 scripts/evaluate.py --checkpoint latest --verbose --num-hands 1000 2>&1) | tee -a "$EVAL_LOG" || true
 
-            # Print summary
-            echo "$EVAL_OUTPUT"
             echo ""
             echo "✅ Logged to $EVAL_LOG"
             echo ""
