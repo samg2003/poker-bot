@@ -56,12 +56,14 @@ class Experience(NamedTuple):
     sizing_mask: torch.Tensor         # (1, 10)
     action_idx: int                   # chosen action
     sizing_idx: int                   # chosen sizing bucket (0 if not raise)
-    log_prob: float                   # log prob of chosen action (from RAW model, not floor)
+    log_prob: float                   # COMBINED log prob (action + sizing) for backward compat
     value: float                      # value estimate
     reward: float                     # final reward (set after hand ends)
     hand_id: int = 0                  # groups decisions into per-hand trajectories
     step_idx: int = 0                 # position within trajectory
     hero_stack_bb: float = 0.0        # hero's starting stack in bb (for deep all-in tracking)
+    action_log_prob: float = 0.0      # action-only log prob (for decoupled PPO)
+    sizing_log_prob: float = 0.0      # sizing-only log prob (for decoupled PPO, 0 if not raise)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -261,18 +263,18 @@ class NLHESelfPlayTrainer:
         return self.opponent_pool_recent + self.opponent_pool_archive
 
     def _build_table_models(self, seat_pool_idx: Dict[int, int]):
-        """Build frozen models for each unique pool index at the table."""
-        import gc
+        """Build frozen models for each unique pool index at the table.
+        
+        Caches models by pool index — only creates new models for indices
+        not already in the cache. Much faster than rebuilding every hand.
+        """
         combined_pool = self._get_combined_pool()
         unique_indices = set(seat_pool_idx.values())
-        # Clear old models first to free memory
-        self._frozen_models.clear()
-        # Build fresh models (avoid deepcopy — it retains MPS tensor refs)
+        # Only build models for new pool indices (cache hit = skip)
         for idx in unique_indices:
-            if idx < len(combined_pool):
+            if idx not in self._frozen_models and idx < len(combined_pool):
                 model = self._make_frozen_model(combined_pool[idx])
                 self._frozen_models[idx] = model
-        gc.collect()
 
     def _make_frozen_model(self, state_dict: dict):
         """Create a fresh frozen model from state dict (no deepcopy)."""
@@ -762,7 +764,8 @@ class NLHESelfPlayTrainer:
 
                 # Always compute log_prob from model's OWN distribution for PPO
                 raw_dist = Categorical(raw_probs)
-                log_prob = raw_dist.log_prob(torch.tensor(action_idx)).item()
+                action_lp = raw_dist.log_prob(torch.tensor(action_idx)).item()
+                sizing_lp = 0.0
 
                 # Sizing with epsilon-greedy
                 sizing_idx = 0
@@ -779,7 +782,9 @@ class NLHESelfPlayTrainer:
                         sizing_idx = s_dist.sample().item()
 
                     # Log prob from model's sizing distribution for PPO
-                    log_prob += Categorical(sizing_tensor).log_prob(torch.tensor(sizing_idx)).item()
+                    sizing_lp = Categorical(sizing_tensor).log_prob(torch.tensor(sizing_idx)).item()
+
+                log_prob = action_lp + sizing_lp
 
                 # Store hero experience
                 hero_experiences.append({
@@ -794,6 +799,8 @@ class NLHESelfPlayTrainer:
                     'action_idx': action_idx,
                     'sizing_idx': sizing_idx,
                     'log_prob': log_prob,
+                    'action_log_prob': action_lp,
+                    'sizing_log_prob': sizing_lp,
                     'value': value,
                     'step_idx': hero_step_idx,
                 })
@@ -1176,6 +1183,8 @@ class NLHESelfPlayTrainer:
         action_t = torch.tensor([e.action_idx for e in experiences], device=self.device, dtype=torch.long)
         sizing_t = torch.tensor([e.sizing_idx for e in experiences], device=self.device, dtype=torch.long)
         old_log_probs = torch.tensor([e.log_prob for e in experiences], device=self.device, dtype=torch.float32)
+        old_action_log_probs = torch.tensor([e.action_log_prob for e in experiences], device=self.device, dtype=torch.float32)
+        old_sizing_log_probs = torch.tensor([e.sizing_log_prob for e in experiences], device=self.device, dtype=torch.float32)
 
         # 4. Compute GAE advantages and returns ONCE (using original values)
         hand_groups: Dict[int, List[int]] = {}
@@ -1214,6 +1223,8 @@ class NLHESelfPlayTrainer:
             'action_t': action_t,
             'sizing_t': sizing_t,
             'old_log_probs': old_log_probs,
+            'old_action_log_probs': old_action_log_probs,
+            'old_sizing_log_probs': old_sizing_log_probs,
             'gae_advantages': gae_advantages,
             'gae_returns': gae_returns,
         }
@@ -1235,6 +1246,8 @@ class NLHESelfPlayTrainer:
         action_t = data['action_t'][idx]
         sizing_t = data['sizing_t'][idx]
         old_log_probs = data['old_log_probs'][idx]
+        old_action_log_probs = data['old_action_log_probs'][idx]
+        old_sizing_log_probs = data['old_sizing_log_probs'][idx]
         gae_advantages = data['gae_advantages'][idx]
         gae_returns = data['gae_returns'][idx]
 
@@ -1264,25 +1277,10 @@ class NLHESelfPlayTrainer:
         sizing_log_probs = sizing_dist.log_prob(sizing_t)
         sizing_entropy = sizing_dist.entropy()
 
-        # Separate old log probs for action and sizing
-        # old_log_probs contains combined (action + sizing for raises)
-        # We need to split: for non-raises, old_action_log_prob = old_log_probs
-        # For raises, we stored action_log_prob + sizing_log_prob combined
-        # Since we can't perfectly split, use current model's ratio on each head independently
+        # Separate old log probs stored from collection — no approximation needed
         
-        # Action head ratio (using only action log probs)
-        # For old action log prob: approximate from combined old_log_probs
-        # For raises: old_action_lp ≈ old_log_probs - old_sizing_lp (unknown)
-        # Simpler: use the combined log_prob for action ratio on non-raise,
-        # and just the action portion for raises
-        action_ratio = torch.exp(action_log_probs - old_log_probs)
-        # For raises, the old_log_probs includes sizing, so scale ratio accordingly
-        if is_raise.any():
-            # Approximate: for raise experiences, use action-only ratio
-            # by adding back the current sizing log prob to make them comparable
-            combined_new = action_log_probs.clone()
-            combined_new[is_raise] += sizing_log_probs[is_raise]
-            action_ratio = torch.exp(combined_new - old_log_probs)
+        # Action head ratio
+        action_ratio = torch.exp(action_log_probs - old_action_log_probs)
         
         surr1 = action_ratio * gae_advantages
         surr2 = torch.clamp(action_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
@@ -1293,11 +1291,7 @@ class NLHESelfPlayTrainer:
         if is_raise.any():
             raise_sizing_log = sizing_log_probs[is_raise]
             raise_advantages = gae_advantages[is_raise]
-            
-            # For sizing ratio, we need old sizing log prob
-            # Approximate: old_sizing_lp = old_log_probs - old_action_lp
-            # Use current action log prob as proxy for old action log prob
-            old_sizing_lp = old_log_probs[is_raise] - action_log_probs[is_raise].detach()
+            old_sizing_lp = old_sizing_log_probs[is_raise]
             
             sizing_ratio = torch.exp(raise_sizing_log - old_sizing_lp)
             s_surr1 = sizing_ratio * raise_advantages
