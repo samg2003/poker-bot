@@ -208,10 +208,21 @@ class CurriculumTrainer:
                     if a in (BET, RAISE, CALL):
                         pot += bet_size
 
+            # 23-dim numeric features (match NLHE layout)
+            seat_onehot = [0.0] * 9
+            seat_onehot[player] = 1.0
+            street_onehot = [0.0] * 4
+            street_onehot[min(state.round_idx, 3)] = 1.0
+            ip_flag = 1.0 if player == 1 else 0.0
+            spr = 1.0 / max(pot, 0.01)
+
             numeric = torch.tensor([[
-                pot / 10.0, 1.0, 0.0, float(player),
-                float(state.round_idx), 2.0/9, 2.0/9, 0.0, 0.0,
-                0.0,  # amount to call
+                pot / 10.0, 1.0, 0.0,
+                *seat_onehot,
+                ip_flag,
+                *street_onehot,
+                2.0/9, 2.0/9, 0.0, 0.0, 0.0,
+                spr,
             ]], dtype=torch.float32)
 
             opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)

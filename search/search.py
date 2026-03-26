@@ -252,6 +252,9 @@ class SearchEngine:
         self.range_estimator = range_estimator
         self.config = config or SearchConfig()
         self.nodes: Dict[str, SearchNode] = {}
+        self._search_opp_embed: Optional[torch.Tensor] = None
+        self._search_opp_stats: Optional[torch.Tensor] = None
+        self._search_own_stats: Optional[torch.Tensor] = None
 
     def should_search(
         self,
@@ -290,17 +293,40 @@ class SearchEngine:
         community = torch.tensor([board], dtype=torch.long)
 
         bb = 1.0
+        norm = 100 * bb
+
+        # 9-dim seat one-hot (relative position from BTN)
+        # In SearchState player index IS the seat, dealer is seat 0
+        rel_pos = player % max(state.num_players, 1)
+        seat_onehot = [0.0] * 9
+        seat_onehot[rel_pos] = 1.0
+
+        # IP flag
+        active_positions = [i for i in range(state.num_players) if not state.folded[i]]
+        ip_flag = 1.0 if (active_positions and rel_pos == max(active_positions)) else 0.0
+
+        # 4-dim street one-hot
+        street_onehot = [0.0] * 4
+        street_onehot[min(state.street, 3)] = 1.0
+
+        num_active = sum(1 for f in state.folded if not f)
+        current_bet_val = max(state.bets) / norm
+        own_bet = state.bets[player] / norm
+        amount_to_call = max(0.0, current_bet_val - own_bet)
+        spr = state.stacks[player] / max(state.pot, 0.01)
+
         numeric = torch.tensor([[
-            state.pot / (100 * bb),
-            state.stacks[player] / (100 * bb),
-            state.bets[player] / (100 * bb),
-            float(player),
-            state.street / 3.0,
-            state.num_players / 9.0,
-            sum(1 for f in state.folded if not f) / 9.0,
-            max(state.bets) / (100 * bb),
-            0.0,  # min_raise, dummy 0.0 for leaf evaluation
-            max(0.0, max(state.bets) - state.bets[player]) / (100 * bb),  # amount_to_call
+            state.pot / norm,
+            state.stacks[player] / norm,
+            own_bet,
+            *seat_onehot,        # 9 dims
+            ip_flag,             # 1 dim
+            *street_onehot,      # 4 dims
+            state.num_players / 9.0, num_active / 9.0,
+            current_bet_val,
+            0.0,                 # min_raise (dummy for leaf eval)
+            amount_to_call,
+            spr,                 # 1 dim
         ]], dtype=torch.float32)
 
         opp_embed = self._search_opp_embed if self._search_opp_embed is not None else self.opponent_encoder.encode_empty(1).unsqueeze(1)

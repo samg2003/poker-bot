@@ -56,44 +56,66 @@ class NLHEEncoder:
         player_idx: int,
     ) -> torch.Tensor:
         """
-        Encode numeric features as a (9,) float tensor.
+        Encode numeric features as a (23,) float tensor.
 
-        Features (all normalized):
-        0. pot_size / 100bb
-        1. own_stack / 100bb
-        2. own_bet_this_round / 100bb
-        3. position (0-1, relative to button)
-        4. street (0=preflop, 0.33=flop, 0.67=turn, 1=river)
-        5. num_players / 9
-        6. num_active / 9
-        7. current_bet / 100bb
-        8. min_raise / 100bb
+        Features (per final_state.md §3):
+        0.     pot_size / 100bb
+        1.     own_stack / 100bb
+        2.     own_bet_this_round / 100bb
+        3-11.  seat position one-hot [9] (relative to BTN)
+        12.    in_position flag
+        13-16. street one-hot [4]
+        17.    num_players / 9
+        18.    num_active / 9
+        19.    current_bet / 100bb
+        20.    min_raise / 100bb
+        21.    amount_to_call / 100bb
+        22.    SPR (stack / pot)
         """
         bb = game_state.big_blind
-        norm = 100.0 * bb  # normalize by 100bb
+        norm = 100.0 * bb
 
         pot = sum(game_state.bets) / norm
         own_stack = game_state.stacks[player_idx] / norm
         own_bet = game_state.bets[player_idx] / norm
 
-        # Position relative to button (0 = button, 1 = UTG)
+        # 9-dim seat one-hot
         num_players = game_state.num_players
         btn_pos = game_state.button
         rel_pos = (player_idx - btn_pos) % num_players
-        position = rel_pos / max(num_players - 1, 1)
+        seat_onehot = [0.0] * 9
+        seat_onehot[rel_pos] = 1.0
 
-        street = game_state.street / 3.0  # 0, 0.33, 0.67, 1.0
+        # IP flag
+        active_positions = [
+            (i - btn_pos) % num_players
+            for i in range(num_players)
+            if not game_state.folded[i] and game_state.stacks[i] > 0
+        ]
+        ip_flag = 1.0 if (active_positions and rel_pos == max(active_positions)) else 0.0
+
+        # 4-dim street one-hot
+        street_idx = min(game_state.street, 3)
+        street_onehot = [0.0] * 4
+        street_onehot[street_idx] = 1.0
 
         num_active = sum(1 for i in range(num_players)
                          if not game_state.folded[i] and game_state.stacks[i] > 0)
 
         current_bet = max(game_state.bets) / norm
         min_raise_size = game_state.min_raise / norm if hasattr(game_state, 'min_raise') else current_bet * 2
+        amount_to_call = max(0.0, current_bet - own_bet)
+        raw_pot = sum(game_state.bets)
+        spr = game_state.stacks[player_idx] / max(raw_pot, 0.01)
 
         return torch.tensor([
-            pot, own_stack, own_bet, position, street,
+            pot, own_stack, own_bet,
+            *seat_onehot,        # 9 dims
+            ip_flag,             # 1 dim
+            *street_onehot,      # 4 dims
             num_players / 9.0, num_active / 9.0,
-            current_bet, min_raise_size,
+            current_bet, min_raise_size, amount_to_call,
+            spr,                 # 1 dim
         ], dtype=torch.float32)
 
     @staticmethod
@@ -193,6 +215,6 @@ class NLHEEncoder:
         return {
             'hole_cards': hole.unsqueeze(0),          # (1, 2)
             'community_cards': community.unsqueeze(0), # (1, 5)
-            'numeric_features': numeric.unsqueeze(0),  # (1, 9)
+            'numeric_features': numeric.unsqueeze(0),  # (1, 23)
             'action_mask': action_mask.unsqueeze(0),   # (1, 4)
         }

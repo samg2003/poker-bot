@@ -156,7 +156,7 @@ class LeducSelfPlayTrainer:
         return legal_actions[0]
 
     def _get_numeric_features(self, state: LeducState, player: int) -> List[float]:
-        """Extract 9 numeric features from Leduc state."""
+        """Extract 23 numeric features from Leduc state (matches NLHE layout)."""
         pot = 2.0  # antes
         for rh in state.round_histories:
             bet_size = 2.0 if state.round_idx == 0 else 4.0
@@ -164,17 +164,30 @@ class LeducSelfPlayTrainer:
                 if a in (BET, RAISE, CALL):
                     pot += bet_size
 
+        # 9-dim seat one-hot
+        seat_onehot = [0.0] * 9
+        seat_onehot[player] = 1.0
+
+        # 4-dim street one-hot
+        street_onehot = [0.0] * 4
+        street_onehot[min(state.round_idx, 3)] = 1.0
+
+        ip_flag = 1.0 if player == 1 else 0.0
+        spr = 1.0 / max(pot, 0.01)
+
         return [
-            pot / 10.0,                   # pot size (normalized)
-            1.0,                          # stack (always enough in Leduc)
+            pot / 10.0,                   # pot size
+            1.0,                          # stack
             0.0,                          # own bet this street
-            float(player),                # position (0 or 1)
-            float(state.round_idx) / 1.0, # street (0 or 1)
-            2.0 / 9.0,                   # num_players / max
-            2.0 / 9.0,                   # num_active / max
-            0.0,                          # current bet (normalized)
-            0.0,                          # min raise (normalized)
+            *seat_onehot,                 # 9 dims
+            ip_flag,                      # 1 dim
+            *street_onehot,               # 4 dims
+            2.0 / 9.0,                    # num_players / max
+            2.0 / 9.0,                    # num_active / max
+            0.0,                          # current bet
+            0.0,                          # min raise
             0.0,                          # amount to call
+            spr,                          # SPR
         ]
 
     @torch.no_grad()

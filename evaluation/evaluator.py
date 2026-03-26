@@ -206,10 +206,24 @@ class Evaluator:
                     if a in (BET, RAISE, CALL):
                         pot += (2.0 if state.round_idx == 0 else 4.0)
 
+            # 23-dim numeric features (match NLHE layout, some features unused in Leduc)
+            seat_onehot = [0.0] * 9
+            seat_onehot[player] = 1.0  # player 0 or 1
+
+            street_onehot = [0.0] * 4
+            street_onehot[min(state.round_idx, 3)] = 1.0
+
+            ip_flag = 1.0 if player == 1 else 0.0  # player 1 acts last in Leduc
+            spr = 1.0 / max(pot, 0.01)  # stack=1.0 in Leduc (normalized)
+
             numeric = torch.tensor([[
-                pot / 10.0, 1.0, 0.0, float(player),
-                float(state.round_idx), 2.0/9, 2.0/9, 0.0, 0.0,
-                0.0,  # amount to call
+                pot / 10.0, 1.0, 0.0,
+                *seat_onehot,        # 9 dims
+                ip_flag,             # 1 dim
+                *street_onehot,      # 4 dims
+                2.0/9, 2.0/9,
+                0.0, 0.0, 0.0,
+                spr,                 # 1 dim
             ]], dtype=torch.float32)
 
             opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)
@@ -311,10 +325,21 @@ class Evaluator:
             own_stack = p.stack / 100.0
             own_bet = p.bet_this_street / 100.0
             rel_pos = (pid - game_state.dealer_button) % num_players
-            position = rel_pos / max(num_players - 1, 1)
+            # 23-dim numeric features
+            seat_onehot = [0.0] * 9
+            seat_onehot[rel_pos] = 1.0
 
             street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
-            street_val = street_map.get(game_state.street, 0) / 3.0
+            street_idx = street_map.get(game_state.street, 0)
+            street_onehot = [0.0] * 4
+            street_onehot[street_idx] = 1.0
+
+            active_positions = []
+            for i, pp in enumerate(game_state.players):
+                if pp.is_active:
+                    active_positions.append((i - game_state.dealer_button) % num_players)
+            ip_flag = 1.0 if (active_positions and rel_pos == max(active_positions)) else 0.0
+            spr = p.stack / max(game_state.pot, 0.01)
 
             num_active = sum(1 for pp in game_state.players if pp.is_active)
             current_bet = game_state.current_bet / 100.0
@@ -322,9 +347,13 @@ class Evaluator:
             amount_to_call = max(0.0, current_bet - own_bet)
 
             numeric = torch.tensor([[
-                pot, own_stack, own_bet, position, street_val,
+                pot, own_stack, own_bet,
+                *seat_onehot,
+                ip_flag,
+                *street_onehot,
                 num_players / 9.0, num_active / 9.0,
-                current_bet, min_raise, amount_to_call
+                current_bet, min_raise, amount_to_call,
+                spr,
             ]], dtype=torch.float32)
 
             legal_types = game_state.get_legal_actions()
@@ -599,7 +628,7 @@ class Evaluator:
 
         hole = torch.tensor([[0, 1]], dtype=torch.long)
         community = torch.tensor([[10, 20, 30, -1, -1]], dtype=torch.long)
-        numeric = torch.tensor([[0.5, 1.0, 0.0, 0.0, 0.33, 0.22, 0.22, 0.0, 0.0, 0.0]], dtype=torch.float32)
+        numeric = torch.tensor([[0.5, 1.0, 0.0] + [0.0]*9 + [0.0] + [1.0, 0.0, 0.0, 0.0] + [0.22, 0.22, 0.0, 0.0, 0.0, 2.0]], dtype=torch.float32)
         opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)
         opp_stats = torch.zeros(1, 1, NUM_STAT_FEATURES)
         own_stats = torch.zeros(1, NUM_STAT_FEATURES)
@@ -629,7 +658,7 @@ class Evaluator:
         for _ in range(20):
             hole = torch.randint(0, 52, (1, 2))
             community = torch.tensor([[-1, -1, -1, -1, -1]], dtype=torch.long)
-            numeric = torch.randn(1, 10)
+            numeric = torch.randn(1, 23)
             opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)
             opp_stats = torch.zeros(1, 1, NUM_STAT_FEATURES)
             own_stats = torch.zeros(1, NUM_STAT_FEATURES)

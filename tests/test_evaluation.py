@@ -33,12 +33,12 @@ class TestPokerAgent:
         result = agent.get_action(
             hole_cards=(0, 1),
             community_cards=[10, 20, 30],
-            numeric_features=[0.5, 1.0, 0.0, 0.0, 0.33, 0.22, 0.22, 0.0, 0.0, 0.0],
+            numeric_features=[0.5, 1.0, 0.0] + [0.0]*9 + [0.0] + [1.0, 0.0, 0.0, 0.0] + [0.22, 0.22, 0.0, 0.0, 0.0, 2.0],
             opponent_ids=[1],
         )
         assert isinstance(result, ActionResult)
         assert 0 <= result.action_type < 4
-        assert 0 <= result.bet_sizing <= 1
+        assert result.bet_sizing == -1.0 or 0 <= result.bet_sizing <= 2.0
         assert abs(result.action_probs.sum().item() - 1.0) < 1e-4
 
     def test_action_mask(self, agent):
@@ -47,7 +47,7 @@ class TestPokerAgent:
         result = agent.get_action(
             hole_cards=(0, 1),
             community_cards=[],
-            numeric_features=[0.5, 1.0, 0.0, 0.0, 0.0, 0.22, 0.22, 0.0, 0.0, 0.0],
+            numeric_features=[0.5, 1.0, 0.0] + [0.0]*9 + [0.0] + [1.0, 0.0, 0.0, 0.0] + [0.22, 0.22, 0.0, 0.0, 0.0, 2.0],
             opponent_ids=[1],
             action_mask=mask,
         )
@@ -74,7 +74,7 @@ class TestPokerAgent:
         result = agent.get_action(
             hole_cards=(0, 1),
             community_cards=[],
-            numeric_features=[0.5, 1.0, 0.0, 0.0, 0.0, 0.22, 0.22, 0.0, 0.0, 0.0],
+            numeric_features=[0.5, 1.0, 0.0] + [0.0]*9 + [0.0] + [1.0, 0.0, 0.0, 0.0] + [0.22, 0.22, 0.0, 0.0, 0.0, 2.0],
             opponent_ids=[1],
         )
         assert isinstance(result, ActionResult)
@@ -99,7 +99,7 @@ class TestPokerAgent:
         result = agent.get_action(
             hole_cards=(0, 1),
             community_cards=[10, 20, 30, 40, 45],
-            numeric_features=[1.0, 0.5, 0.3, 0.0, 1.0, 0.22, 0.11, 0.5, 0.2, 0.2],
+            numeric_features=[1.0, 0.5, 0.3] + [0.0]*9 + [0.0] + [0.0, 0.0, 0.0, 1.0] + [0.22, 0.11, 0.5, 0.2, 0.2, 0.5],
             opponent_ids=[],
         )
         assert isinstance(result, ActionResult)

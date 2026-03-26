@@ -188,7 +188,7 @@ class TestPolicyNetwork:
                 torch.randint(0, 52, (batch, 3)),
                 torch.full((batch, 2), -1, dtype=torch.long),
             ], dim=1),  # flop only
-            'numeric_features': torch.randn(batch, 10),
+            'numeric_features': torch.randn(batch, 23),
             'opponent_embeddings': torch.randn(batch, num_opp, 64),
             'opponent_stats': torch.randn(batch, num_opp, NUM_STAT_FEATURES),
             'own_stats': torch.randn(batch, NUM_STAT_FEATURES),
@@ -239,7 +239,7 @@ class TestPolicyNetwork:
             inputs = {
                 'hole_cards': torch.randint(0, 52, (batch, 2)),
                 'community_cards': torch.full((batch, 5), -1, dtype=torch.long),
-                'numeric_features': torch.randn(batch, 10),
+                'numeric_features': torch.randn(batch, 23),
                 'opponent_embeddings': torch.randn(batch, num_opp, 64),
                 'opponent_stats': torch.randn(batch, num_opp, NUM_STAT_FEATURES),
                 'own_stats': torch.randn(batch, NUM_STAT_FEATURES),

@@ -130,7 +130,7 @@ class TestInferenceEngine:
     def test_basic_inference(self, engine):
         hole = torch.tensor([[0, 1]])
         community = torch.tensor([[-1, -1, -1, -1, -1]])
-        numeric = torch.randn(1, 10).to(engine.device)
+        numeric = torch.randn(1, 23).to(engine.device)
 
         output = engine.infer(hole, community, numeric)
         assert output.action_type_probs.shape == (1, 4)
@@ -139,7 +139,7 @@ class TestInferenceEngine:
     def test_latency_tracking(self, engine):
         hole = torch.tensor([[0, 1]])
         community = torch.tensor([[-1, -1, -1, -1, -1]])
-        numeric = torch.randn(1, 10).to(engine.device)
+        numeric = torch.randn(1, 23).to(engine.device)
         engine.infer(hole, community, numeric)
         assert engine.stats.num_calls == 1
         assert engine.stats.avg_latency_ms > 0
@@ -150,7 +150,7 @@ class TestInferenceEngine:
             inputs.append({
                 'hole_cards': torch.randint(0, 52, (2,)),
                 'community_cards': torch.full((5,), -1),
-                'numeric_features': torch.randn(10).to(engine.device),
+                'numeric_features': torch.randn(23).to(engine.device),
             })
 
         outputs = engine.infer_batch(inputs)
@@ -170,7 +170,7 @@ class TestInferenceEngine:
         # Still works after optimization
         hole = torch.tensor([[0, 1]])
         community = torch.tensor([[-1, -1, -1, -1, -1]])
-        numeric = torch.randn(1, 10).to(engine.device)
+        numeric = torch.randn(1, 23).to(engine.device)
         output = engine.infer(hole, community, numeric)
         assert output.action_type_probs.shape == (1, 4)
 

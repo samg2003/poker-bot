@@ -84,9 +84,11 @@ class GameStateEncoder(nn.Module):
         )
         self.card_proj = nn.Linear(128, embed_dim)  # 2 hole cards * 64 dim
 
-        # Numeric features: pot, stack, own_bet, pos, street, num_p, active_p, current_bet, min_raise, amount_to_call
+        # Numeric features: 23-dim vector per final_state.md §3
+        # pot, stack, bet, seat_onehot[9], IP, street_onehot[4],
+        # num_p, active_p, current_bet, min_raise, atc, SPR
         self.numeric_proj = nn.Sequential(
-            nn.Linear(10, embed_dim),
+            nn.Linear(23, embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
         )

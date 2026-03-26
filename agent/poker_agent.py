@@ -31,7 +31,7 @@ from agent.config import AgentConfig
 class ActionResult:
     """Result of get_action()."""
     action_type: int              # ActionIndex enum value
-    bet_sizing: float             # [0, 1] for raise sizing
+    bet_sizing: float             # pot fraction from POT_FRACTIONS (-1 = all-in)
     action_probs: torch.Tensor    # (4,) action type probabilities
     value_estimate: float         # expected value in bb
     used_search: bool             # whether System 2 was triggered

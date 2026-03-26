@@ -363,20 +363,38 @@ class GameManager:
         own_stack = p.stack / 100.0
         own_bet = p.bet_this_street / 100.0
         rel_pos = (eng_idx - self.game_state.dealer_button) % num_engine_players
-        position = rel_pos / max(num_engine_players - 1, 1)
 
+        # 9-dim seat one-hot
+        seat_onehot = [0.0] * 9
+        seat_onehot[rel_pos] = 1.0
+
+        # IP flag
+        active_positions = []
+        for i, pp in enumerate(self.game_state.players):
+            if pp.is_active:
+                active_positions.append((i - self.game_state.dealer_button) % num_engine_players)
+        ip_flag = 1.0 if (active_positions and rel_pos == max(active_positions)) else 0.0
+
+        # 4-dim street one-hot
         street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
-        street_val = street_map.get(self.game_state.street, 0) / 3.0
+        street_idx = street_map.get(self.game_state.street, 0)
+        street_onehot = [0.0] * 4
+        street_onehot[street_idx] = 1.0
 
         num_active = sum(1 for pp in self.game_state.players if pp.is_active)
         current_bet = self.game_state.current_bet / 100.0
         min_raise = self.game_state.min_raise / 100.0
         amount_to_call = max(0.0, current_bet - own_bet)
+        spr = self.game_state.players[eng_idx].stack / max(self.game_state.pot, 0.01)
 
         numeric = torch.tensor([[
-            pot, own_stack, own_bet, position, street_val,
+            pot, own_stack, own_bet,
+            *seat_onehot,        # 9 dims
+            ip_flag,             # 1 dim
+            *street_onehot,      # 4 dims
             num_engine_players / 9.0, num_active / 9.0,
-            current_bet, min_raise, amount_to_call
+            current_bet, min_raise, amount_to_call,
+            spr,                 # 1 dim
         ]], dtype=torch.float32)
 
         legal_types = self.game_state.get_legal_actions()
