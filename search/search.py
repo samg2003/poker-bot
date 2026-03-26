@@ -303,17 +303,19 @@ class SearchEngine:
             max(0.0, max(state.bets) - state.bets[player]) / (100 * bb),  # amount_to_call
         ]], dtype=torch.float32)
 
-        opp_embed = self.opponent_encoder.encode_empty(1).unsqueeze(1)
-        opp_stats = torch.zeros(1, 1, NUM_STAT_FEATURES)
-        own_stats = torch.zeros(1, NUM_STAT_FEATURES)
+        opp_embed = self._search_opp_embed if self._search_opp_embed is not None else self.opponent_encoder.encode_empty(1).unsqueeze(1)
+        opp_stats = self._search_opp_stats if self._search_opp_stats is not None else torch.zeros(1, 1, NUM_STAT_FEATURES)
+        own_stats = self._search_own_stats if self._search_own_stats is not None else torch.zeros(1, NUM_STAT_FEATURES)
+
+        dev = next(self.policy.parameters()).device
 
         output = self.policy(
-            hole_cards=hole_cards,
-            community_cards=community,
-            numeric_features=numeric,
-            opponent_embeddings=opp_embed,
-            opponent_stats=opp_stats,
-            own_stats=own_stats,
+            hole_cards=hole_cards.to(dev),
+            community_cards=community.to(dev),
+            numeric_features=numeric.to(dev),
+            opponent_embeddings=opp_embed.to(dev),
+            opponent_stats=opp_stats.to(dev),
+            own_stats=own_stats.to(dev),
         )
 
         return output.value[0, 0].item()
@@ -375,6 +377,9 @@ class SearchEngine:
         street: int,
         hero: int,
         num_iterations: Optional[int] = None,
+        opp_embed: Optional[torch.Tensor] = None,
+        opp_stats: Optional[torch.Tensor] = None,
+        own_stats: Optional[torch.Tensor] = None,
     ) -> Tuple[List[str], List[float]]:
         """
         Run search from the current game state.
@@ -385,12 +390,21 @@ class SearchEngine:
             board: community cards
             street: current street (0-3)
             hero: our player index
+            num_iterations: CFR iterations
+            opp_embed: Optional pre-computed opponent embedded sequence
+            opp_stats: Optional pre-computed opponent statistics
+            own_stats: Optional pre-computed self statistics
 
         Returns:
             (actions, probabilities) — refined action distribution
         """
         iterations = num_iterations or self.config.num_iterations
         self.nodes.clear()
+        
+        # Cache these for evaluate_leaf during this specific search
+        self._search_opp_embed = opp_embed
+        self._search_opp_stats = opp_stats
+        self._search_own_stats = own_stats
 
         # Build initial search state
         search_state = SearchState(

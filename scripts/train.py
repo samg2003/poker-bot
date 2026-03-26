@@ -157,6 +157,11 @@ def train_nlhe(args):
         batch_chunk_size=args.batch_chunk_size,
         seed=args.seed,
     )
+    
+    if args.entropy is not None:
+        config.entropy_coef = args.entropy
+        config.entropy_coef_end = args.entropy
+
     trainer = NLHESelfPlayTrainer(config=config)
 
     checkpoint_mgr = CheckpointManager(args.checkpoint_dir)
@@ -242,6 +247,8 @@ def main():
                         help='Starting exploration rate')
     parser.add_argument('--epsilon-end', type=float, default=0.08,
                         help='Ending exploration rate')
+    parser.add_argument('--entropy', type=float, default=None,
+                        help='Constant entropy coefficient (overrides default decay)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
 

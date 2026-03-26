@@ -102,14 +102,20 @@ function App() {
       try {
         const data = await apiGet('/step')
         if (data && data.took_action) {
-          setGameState(data.state.snapshot)
+          const newGs = data.state.snapshot;
+          setGameState(newGs)
           setTimelineIdx(data.state.timeline_index)
           setTotalSteps(data.state.total_steps)
+          
           if (data.state.snapshot.last_action) {
             const actionType = data.state.snapshot.last_action.type
             playActionSound(actionType)
             const amt = data.state.snapshot.last_action.amount
             log(`[Bot] played ${actionType} ${amt != null ? amt.toFixed(2) : ''}`)
+          }
+
+          if (gs.street && newGs.street && gs.street !== newGs.street) {
+             await new Promise(r => setTimeout(r, 1500));
           }
         }
       } catch (e) {

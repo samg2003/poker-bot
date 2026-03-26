@@ -130,13 +130,29 @@ def _serialize_snapshot(snap: TimelineSnapshot):
         eng_results = game_manager.dealer.get_results()
         winners = [seat_map[i] for i in eng_results['winners'] if i < len(seat_map)]
         profits = {seat_map[i]: eng_results['profit'][i] for i in range(len(eng_results['profit'])) if i < len(seat_map)}
+        # pot_won is profit + amount invested
+        pot_won = {}
+        for i in range(len(gs.players)):
+            if i < len(seat_map):
+                pot_won[seat_map[i]] = eng_results['profit'][i] + gs.players[i].bet_total
+                
         results = {
             "winners": winners,
-            "profits": profits
+            "profits": profits,
+            "pot_won": pot_won
         }
+
+    # Calculate side pots for display
+    side_pots_info = []
+    pots = gs.calculate_side_pots()
+    if pots:
+        for p_amt, eligible in pots:
+            mapped_eligible = [seat_map[i] for i in eligible if i < len(seat_map)]
+            side_pots_info.append({"amount": p_amt, "eligible": mapped_eligible})
 
     return {
         "pot": gs.pot,
+        "side_pots": side_pots_info,
         "board": gs.board,
         "street": street_str,
         "current_player": current_table_seat,

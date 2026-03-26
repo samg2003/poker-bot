@@ -672,6 +672,9 @@ class NLHESelfPlayTrainer:
                         search_actions, search_probs = self.search_engine.search(
                             pot=game_state.pot, stacks=search_stacks, board=list(game_state.board),
                             street=cur_street, hero=pid,
+                            opp_embed=opp_embed_tensor.clone().cpu() if opp_embed_tensor is not None else None,
+                            opp_stats=opp_stats.clone().cpu(),
+                            own_stats=own_stats.clone().cpu(),
                         )
                         refined = torch.zeros(NUM_ACTION_TYPES, device=self.device)
                         for sa, sp in zip(search_actions, search_probs):

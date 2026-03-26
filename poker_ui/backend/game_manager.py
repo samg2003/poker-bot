@@ -99,22 +99,22 @@ class GameManager:
 
     def _random_personality(self) -> tuple:
         roll = self.rng.random()
-        if roll < 0.30:
+        if roll < 0.90:
             base = PersonalityModifier.gto()
             return SituationalPersonality(base=base), "GTO"
-        elif roll < 0.45:
+        elif roll < 0.92:
             base = PersonalityModifier.tag()
             return SituationalPersonality(base=base), "TAG"
-        elif roll < 0.58:
+        elif roll < 0.94:
             base = PersonalityModifier.nit()
             return SituationalPersonality(base=base), "Nit"
-        elif roll < 0.70:
+        elif roll < 0.96:
             base = PersonalityModifier.lag()
             return SituationalPersonality(base=base), "LAG"
-        elif roll < 0.80:
+        elif roll < 0.97:
             base = PersonalityModifier.maniac()
             return SituationalPersonality(base=base), "Maniac"
-        elif roll < 0.90:
+        elif roll < 0.985:
             base = PersonalityModifier.calling_station()
             return SituationalPersonality(base=base), "Station"
         else:
@@ -521,7 +521,7 @@ class GameManager:
             else:
                 min_r = self.game_state.get_min_raise_to()
                 max_r = self.game_state.get_max_raise_to()
-                rt = self.game_state.current_bet + frac * self.game_state.pot
+                rt = frac * self.game_state.pot
                 act = Action(ActionType.RAISE, amount=max(min_r, min(rt, max_r)))
         else:
             if ActionType.CHECK in legal_types: act = Action(ActionType.CHECK)

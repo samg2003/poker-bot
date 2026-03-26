@@ -28,14 +28,22 @@ export default function PokerTable({ gameState, selectedSeat, onSelectSeat }) {
     )
   }
 
-  const { pot, street, board, players, current_player, is_terminal, dealer_button, small_blind, big_blind } = gameState
+  const { pot, side_pots, street, board, players, current_player, is_terminal, dealer_button, small_blind, big_blind } = gameState
   
+  const activeBets = players.reduce((sum, p) => sum + (p.bet || 0), 0)
+  const centerPot = Math.max(0, pot - activeBets)
+
   return (
     <div className="poker-table">
       <div className="felt"></div>
       
       <div className="pot-area">
-        <span className="pot-amount">Pot: {pot.toFixed(2)} bb</span>
+        <span className="pot-amount">Main Pot: {centerPot.toFixed(2)} bb</span>
+        {activeBets > 0 && (
+          <div className="side-pots-container">
+            <span className="side-pot-amount">Side Pot: {activeBets.toFixed(2)} bb</span>
+          </div>
+        )}
         <span className="board-street">{street}</span>
       </div>
 
@@ -64,7 +72,7 @@ export default function PokerTable({ gameState, selectedSeat, onSelectSeat }) {
           const isRevealed = revealedSeats.has(p.id)
           
           const isWinner = is_terminal && gameState.results?.winners?.includes(p.id)
-          const profit = gameState.results?.profits?.[p.id] || 0
+          const potWon = gameState.results?.pot_won?.[p.id] || 0
           
           const showCards = isHero || isRevealed || street === 'SHOWDOWN'
           const displayName = isHero 
@@ -80,8 +88,8 @@ export default function PokerTable({ gameState, selectedSeat, onSelectSeat }) {
               onClick={() => onSelectSeat(p.id)}
               onDoubleClick={() => handleDoubleClick(p.id)}
             >
-              {isWinner && profit > 0 && (
-                <div className="profit-flyout">+{profit.toFixed(1)} bb</div>
+              {isWinner && potWon > 0 && (
+                <div className="profit-flyout">+{potWon.toFixed(1)} bb</div>
               )}
               <div className="seat-name">{displayName}</div>
               <div className="seat-stack">{p.stack.toFixed(2)} bb</div>

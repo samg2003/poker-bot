@@ -112,10 +112,10 @@ body {
   position: relative;
   width: 600px;
   height: 340px;
-  background: var(--felt-color);
+  background: radial-gradient(circle at center, #174d32 0%, #0c2b1a 100%);
   border-radius: 180px;
   border: 14px solid var(--felt-border);
-  box-shadow: inset 0 0 50px rgba(0,0,0,0.6), 0 20px 40px rgba(0,0,0,0.4);
+  box-shadow: inset 0 0 50px rgba(0,0,0,0.8), 0 20px 40px rgba(0,0,0,0.6), 0 0 0 14px #0a1f12;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -124,6 +124,8 @@ body {
 
 .pot-area { text-align: center; margin-bottom: 20px; z-index: 10; }
 .pot-amount { display: block; font-size: 28px; font-weight: 800; text-shadow: 0 2px 6px rgba(0,0,0,0.6); color: #f2c94c; }
+.side-pots-container { display: flex; gap: 12px; justify-content: center; margin-bottom: 6px; }
+.side-pot-amount { font-size: 14px; font-weight: 700; color: #fca311; background: rgba(0,0,0,0.5); padding: 2px 8px; border-radius: 6px; }
 .board-street { font-size: 13px; letter-spacing: 3px; color: rgba(255,255,255,0.7); font-weight: 600;}
 
 /* Cards */
@@ -174,17 +176,17 @@ body {
 }
 
 .profit-flyout {
-  position: absolute; top: -20px; left: 50%; transform: translateX(-50%);
-  color: #2ea043; font-weight: 900; font-size: 18px; text-shadow: 0 2px 4px rgba(0,0,0,0.8);
-  animation: flyUp 3s cubic-bezier(0.2, 0.8, 0.2, 1) forwards; z-index: 20;
+  position: absolute; top: -35px; left: 50%; transform: translateX(-50%);
+  color: #39d353; font-weight: 900; font-size: 26px; text-shadow: 0 4px 8px rgba(0,0,0,0.9);
+  animation: flyUp 3s cubic-bezier(0.2, 0.8, 0.2, 1) forwards; z-index: 20; white-space: nowrap;
 }
 
 @keyframes flyUp {
-  0% { opacity: 0; transform: translate(-50%, 10px) scale(0.8); }
+  0% { opacity: 0; transform: translate(-50%, 15px) scale(0.8); }
   10% { opacity: 1; transform: translate(-50%, 0px) scale(1.1); }
   20% { transform: translate(-50%, -5px) scale(1); }
-  80% { opacity: 1; transform: translate(-50%, -15px); }
-  100% { opacity: 0; transform: translate(-50%, -25px); }
+  80% { opacity: 1; transform: translate(-50%, -20px); }
+  100% { opacity: 0; transform: translate(-50%, -35px); }
 }
 
 .seat-name { font-size: 11px; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; }

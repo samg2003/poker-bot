@@ -221,25 +221,43 @@ class SituationalPersonality:
         fold_factor = 1.0 + weakness * (1.0 - mod.range_mult)  # range<1 → fold more
         probs[0] *= max(fold_factor, 0.1)
 
-        # --- Aggression adjustment ---
-        # Shift weight between call and raise, clamped to prevent negatives.
-        aggression_shift = (mod.aggression_mult - 1.0) * 0.25  # scaled
-        max_shift = probs[2].item() * 0.8    # never shift more than 80% of call prob
-        shift_amount = min(probs[2].item() * aggression_shift, max_shift)
-        shift_amount = max(shift_amount, -probs[3].item() * 0.8)  # don't zero out raise
-        probs[3] += shift_amount   # → to raise
-        probs[2] -= shift_amount   # ← from call
+        # --- Aggression adjustment (Call/Check -> Raise) ---
+        # If aggressive, shift weight from BOTH Call and Check to Raise
+        aggression_shift = (mod.aggression_mult - 1.0) * 0.35  # scaled
+
+        if aggression_shift > 0:
+            # Shift from Call
+            call_shift = probs[2].item() * min(aggression_shift, 0.9)
+            probs[3] += call_shift
+            probs[2] -= call_shift
+            
+            # Shift from Check (initiate bets!)
+            check_shift = probs[1].item() * min(aggression_shift, 0.9)
+            probs[3] += check_shift
+            probs[1] -= check_shift
+        elif aggression_shift < 0:
+            # Passive: shift from Raise to Call
+            raise_shift = probs[3].item() * min(-aggression_shift, 0.9)
+            probs[2] += raise_shift
+            probs[3] -= raise_shift
 
         # --- Fold pressure ---
         if is_facing_raise:
             probs[0] *= mod.fold_pressure
 
-        # --- Bluff adjustment (smooth) ---
-        # Scales raise probability for weak hands.
-        # At hand_strength=0: full bluff_mult effect.
-        # At hand_strength=0.5: half effect. At 1.0: no effect.
+        # --- Bluff adjustment (Absolute + Relative) ---
+        # If the base bot never bluffs (0% raise), relative scaling doesn't work.
+        # We need to inject absolute bluffing probability for Maniacs!
         bluff_scale = 1.0 + (mod.bluff_mult - 1.0) * max(0.0, 1.0 - hand_strength * 2.0)
         probs[3] *= max(bluff_scale, 0.1)
+        
+        # Absolute bluff injection for weak hands if bluff_mult > 1
+        if mod.bluff_mult > 1.0 and weakness > 0.5:
+            abs_bluff = (mod.bluff_mult - 1.0) * 0.15 * weakness
+            probs[3] += abs_bluff
+            # Steal from fold/check
+            probs[0] *= (1.0 - abs_bluff)
+            probs[1] *= (1.0 - abs_bluff)
 
         # --- Clamp and re-normalize ---
         probs = probs.clamp(min=1e-6)
@@ -359,7 +377,7 @@ def detect_situations(
 
 def sample_table_personalities(
     num_seats: int,
-    gto_fraction: float = 0.6,
+    gto_fraction: float = 0.9,
     rng: Optional[random.Random] = None,
 ) -> List[SituationalPersonality]:
     """
