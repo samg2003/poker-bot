@@ -168,9 +168,11 @@ def train_nlhe(args):
                 device=str(trainer.device),
             )
             start_epoch = meta.epoch
-            # Re-sync frozen policy with loaded weights
-            trainer._sync_frozen()
-            print(f"\n✓ Resumed from checkpoint '{tag}' (epoch {start_epoch}, reward={meta.avg_reward:+.3f})")
+            # Load opponent pool from checkpoint
+            load_dir = os.path.join(args.checkpoint_dir, tag)
+            trainer.load_pool(load_dir)
+            pool_total = len(trainer.opponent_pool_recent) + len(trainer.opponent_pool_archive)
+            print(f"\n✓ Resumed from checkpoint '{tag}' (epoch {start_epoch}, reward={meta.avg_reward:+.3f}, pool={pool_total})")
         except FileNotFoundError:
             print(f"\n✗ Checkpoint '{tag}' not found, training from scratch")
 
@@ -197,14 +199,16 @@ def train_nlhe(args):
     def _on_epoch(trainer, epoch, metrics):
         if args.save_interval > 0 and epoch % args.save_interval == 0:
             meta = _make_metadata(epoch, metrics)
-            checkpoint_mgr.save(trainer.policy, trainer.opponent_encoder, trainer.optimizer, meta)
+            save_path = checkpoint_mgr.save(trainer.policy, trainer.opponent_encoder, trainer.optimizer, meta)
+            trainer.save_pool(str(save_path))
             print(f"    ✓ Checkpoint saved at epoch {epoch}")
 
     metrics = trainer.train(num_epochs=args.epochs, epoch_callback=_on_epoch, start_epoch=start_epoch)
 
     # Final save
     meta = _make_metadata(args.epochs, metrics)
-    checkpoint_mgr.save(trainer.policy, trainer.opponent_encoder, trainer.optimizer, meta)
+    save_path = checkpoint_mgr.save(trainer.policy, trainer.opponent_encoder, trainer.optimizer, meta)
+    trainer.save_pool(str(save_path))
     checkpoint_mgr.save_best(trainer.policy, trainer.opponent_encoder, trainer.optimizer, meta)
 
     best_reward = max(metrics['epoch_reward']) if metrics['epoch_reward'] else 0.0

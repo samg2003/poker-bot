@@ -96,8 +96,9 @@ class NLHETrainingConfig:
     gae_lambda: float = 0.95     # GAE lambda parameter
     ppo_clip: float = 0.2
     ppo_epochs: int = 4
-    entropy_coef: float = 0.05   # was 0.02 — anneals to entropy_coef_end
-    entropy_coef_end: float = 0.01
+    mini_batch_size: int = 64          # mini-batch size for PPO updates
+    entropy_coef: float = 0.005   # was 0.05 — reduced 10x to not drown out policy gradient
+    entropy_coef_end: float = 0.001
     value_coef: float = 0.5
 
     # Self-play
@@ -106,11 +107,12 @@ class NLHETrainingConfig:
 
     # Frozen opponent pool
     frozen_update_interval: int = 20   # sync frozen opponent every N epochs
-    max_opponent_pool_size: int = 10   # keep last N snapshots
+    max_recent_pool: int = 10           # recent checkpoints (FIFO)
+    max_archive_pool: int = 5           # old checkpoints (random replacement)
 
-    # Exploration floor (training only, annealed)
-    exploration_floor: float = 0.05    # min probability for each legal action type
-    exploration_floor_end: float = 0.01  # floor at end of training
+    # Epsilon-greedy exploration (training only, annealed)
+    epsilon: float = 0.15              # probability of random action (start)
+    epsilon_end: float = 0.08          # probability of random action (end) — poker needs permanent mixing
 
     # Opponent modeling
     history_reset_interval: Tuple[int, int] = (300, 500)
@@ -165,19 +167,21 @@ class NLHESelfPlayTrainer:
         self.optimizer = torch.optim.Adam(all_params, lr=self.config.lr)
 
         # ── Frozen opponent (no gradients, provides stable opposition) ──
-        # Kept on CPU: individual per-opponent forward passes are faster on CPU
-        # than MPS/CUDA (avoids GPU kernel launch overhead for small batches)
-        self.frozen_policy = copy.deepcopy(self.policy).to('cpu')
+        # Template model on CPU for cloning into per-seat frozen models
+        self._frozen_template = copy.deepcopy(self.policy).to('cpu')
         self.frozen_opponent_encoder = copy.deepcopy(self.opponent_encoder).to('cpu')
-        for p in self.frozen_policy.parameters():
+        for p in self._frozen_template.parameters():
             p.requires_grad = False
         for p in self.frozen_opponent_encoder.parameters():
             p.requires_grad = False
 
-        # Opponent pool: list of state_dicts from past checkpoints
-        self.opponent_pool: List[dict] = [
-            copy.deepcopy(self.policy.state_dict())
+        # Two-tier opponent pool: recent (FIFO) + archive (old preserved)
+        self.opponent_pool_recent: List[dict] = [
+            {k: v.cpu() for k, v in self.policy.state_dict().items()}
         ]
+        self.opponent_pool_archive: List[dict] = []
+        # Per-table frozen models: {pool_idx: model} — built at table setup
+        self._frozen_models: Dict[int, 'PolicyNetwork'] = {}
 
         # ── Opponent tracking ─────────────────────────────────
         # action_histories[player_id] = list of (action_type, bet_frac, pot, stack, street)
@@ -227,28 +231,99 @@ class NLHESelfPlayTrainer:
 
     def _sync_frozen(self):
         """
-        Save current live weights to opponent pool and load a random
-        pool member into the frozen policy. Called every frozen_update_interval epochs.
+        Save current live weights to opponent pool (two-tier: recent + archive).
+        Per-seat loading happens in _play_hand_gen.
         """
-        # Save current live weights (move to CPU to avoid MPS memory buildup)
         cpu_state = {k: v.cpu() for k, v in self.policy.state_dict().items()}
-        self.opponent_pool.append(cpu_state)
-        if len(self.opponent_pool) > self.config.max_opponent_pool_size:
-            self.opponent_pool.pop(0)
 
-        # Load random pool member into frozen policy (already on CPU)
-        snapshot = self.rng.choice(self.opponent_pool)
-        self.frozen_policy.load_state_dict(snapshot)
+        # Evict oldest recent entry → 30% chance it goes to archive
+        if len(self.opponent_pool_recent) >= self.config.max_recent_pool:
+            evicted = self.opponent_pool_recent.pop(0)
+            if len(self.opponent_pool_archive) < self.config.max_archive_pool:
+                # Free slot — always archive
+                self.opponent_pool_archive.append(evicted)
+            elif self.rng.random() < 0.30:
+                # Archive full — 30% chance replace a random entry
+                idx = self.rng.randint(0, len(self.opponent_pool_archive) - 1)
+                self.opponent_pool_archive[idx] = evicted
 
-        # Also sync opponent encoder (move to CPU)
+        self.opponent_pool_recent.append(cpu_state)
+
+        # Also sync opponent encoder
         cpu_enc_state = {k: v.cpu() for k, v in self.opponent_encoder.state_dict().items()}
         self.frozen_opponent_encoder.load_state_dict(cpu_enc_state)
 
-    def _get_exploration_floor(self) -> float:
-        """Get the annealed exploration floor for the current epoch."""
+        # Reset current loaded index
+        self._frozen_models = {}  # force rebuild on next table setup
+
+    def _get_combined_pool(self) -> List[dict]:
+        """Get combined pool (recent + archive) as a single list."""
+        return self.opponent_pool_recent + self.opponent_pool_archive
+
+    def _build_table_models(self, seat_pool_idx: Dict[int, int]):
+        """Build frozen models for each unique pool index at the table."""
+        import gc
+        combined_pool = self._get_combined_pool()
+        unique_indices = set(seat_pool_idx.values())
+        # Clear old models first to free memory
+        self._frozen_models.clear()
+        # Build fresh models (avoid deepcopy — it retains MPS tensor refs)
+        for idx in unique_indices:
+            if idx < len(combined_pool):
+                model = self._make_frozen_model(combined_pool[idx])
+                self._frozen_models[idx] = model
+        gc.collect()
+
+    def _make_frozen_model(self, state_dict: dict):
+        """Create a fresh frozen model from state dict (no deepcopy)."""
+        from model.policy_network import PolicyNetwork
+        model = PolicyNetwork(
+            embed_dim=self.config.embed_dim,
+            num_cross_attn_heads=self.config.num_heads,
+            num_cross_attn_layers=self.config.num_layers,
+            opponent_embed_dim=self.config.opponent_embed_dim,
+        ).to('cpu')
+        model.load_state_dict(state_dict)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+        return model
+
+    def save_pool(self, save_dir: str):
+        """Save opponent pool to disk for checkpoint persistence."""
+        import os
+        pool_dir = os.path.join(save_dir, 'pool')
+        os.makedirs(pool_dir, exist_ok=True)
+        for i, sd in enumerate(self.opponent_pool_recent):
+            torch.save(sd, os.path.join(pool_dir, f'recent_{i:03d}.pt'))
+        for i, sd in enumerate(self.opponent_pool_archive):
+            torch.save(sd, os.path.join(pool_dir, f'archive_{i:03d}.pt'))
+
+    def load_pool(self, load_dir: str):
+        """Load opponent pool from disk."""
+        import os, glob
+        pool_dir = os.path.join(load_dir, 'pool')
+        if not os.path.exists(pool_dir):
+            return
+        # Load recent entries
+        recent_files = sorted(glob.glob(os.path.join(pool_dir, 'recent_*.pt')))
+        if recent_files:
+            self.opponent_pool_recent = [
+                torch.load(f, map_location='cpu', weights_only=True) for f in recent_files
+            ]
+        # Load archive entries
+        archive_files = sorted(glob.glob(os.path.join(pool_dir, 'archive_*.pt')))
+        if archive_files:
+            self.opponent_pool_archive = [
+                torch.load(f, map_location='cpu', weights_only=True) for f in archive_files
+            ]
+        self._frozen_models = {}  # force rebuild
+
+    def _get_epsilon(self) -> float:
+        """Get the annealed epsilon for the current epoch."""
         c = self.config
         progress = min(self.current_epoch / max(self.total_epochs, 1), 1.0)
-        return c.exploration_floor + (c.exploration_floor_end - c.exploration_floor) * progress
+        return c.epsilon + (c.epsilon_end - c.epsilon) * progress
 
     def _get_entropy_coef(self) -> float:
         """Get the annealed entropy coefficient for the current epoch."""
@@ -423,13 +498,17 @@ class NLHESelfPlayTrainer:
             self.stat_tracker.reset()
             self.hands_since_reset = 0
             self.next_reset_at = self.rng.randint(*self.config.history_reset_interval)
-            # Reshuffle personalities when we "sit down at a new table"
+            # Reshuffle personalities and per-seat weights when we "sit down at a new table"
             self.table_personalities = []
+            self._seat_pool_idx = {}
+            self._frozen_models.clear()
             self.hands_since_personality_reset = 0
 
         # Soft reset: flush personalities only (keep histories for OpponentEncoder to adapt)
         elif self.hands_since_personality_reset >= self.next_personality_reset_at:
             self.table_personalities = []
+            self._seat_pool_idx = {}
+            self._frozen_models.clear()
             self.hands_since_personality_reset = 0
 
     # ─────────────────────────────────────────────────────────
@@ -574,15 +653,36 @@ class NLHESelfPlayTrainer:
         hero_experiences: List[dict] = []  # only hero's decisions
         hero_step_idx = 0
 
-        # Sample table personalities (opponents only — hero plays raw policy)
-        gto_frac = self._get_personality_gto_fraction()
+        # Per-seat opponent assignment: each seat gets an independent pool entry
+        # Persistent across hands at the same table (cleared on table reset)
+        if not hasattr(self, '_seat_pool_idx') or len(self._seat_pool_idx) != num_p - 1:
+            self._seat_pool_idx = {}
+            for pid in range(1, num_p):
+                combined_pool = self._get_combined_pool()
+                if combined_pool:
+                    self._seat_pool_idx[pid] = self.rng.randint(0, len(combined_pool) - 1)
+                else:
+                    self._seat_pool_idx[pid] = 0
+            # Build frozen models for each unique pool index (one-time per table)
+            self._build_table_models(self._seat_pool_idx)
+        seat_pool_idx = self._seat_pool_idx
+
+        # Table-level personality decision (persistent across hands):
+        # 33% of tables = fully unperturbed (all GTO)
+        # 67% of tables = 60% GTO / 40% personality per seat
         if len(self.table_personalities) != num_p:
+            if self.current_epoch < 20 or self.rng.random() < 0.33:
+                # Fully unperturbed table
+                gto_frac = 1.0
+            else:
+                # Mixed table: 60% GTO, 40% personality
+                gto_frac = 0.60
             self.table_personalities = sample_table_personalities(
                 num_p, gto_fraction=gto_frac, rng=self.rng
             )
 
         hand_records = [HandRecord() for _ in range(num_p)]
-        floor = self._get_exploration_floor()
+        epsilon = self._get_epsilon()
 
         while not dealer.is_hand_over():
             pid = game_state.current_player_idx
@@ -648,50 +748,38 @@ class NLHESelfPlayTrainer:
                             refined = refined / refined.sum()
                             probs = 0.7 * refined + 0.3 * probs.to(self.device)
 
-                # ── Exploration floor (training only) ──
-                # Apply floor to action type probs (all on CPU since probs comes from orchestrator)
+                # ── Epsilon-greedy exploration (training only) ──
                 action_mask_cpu = encoded['action_mask'].squeeze(0).cpu()  # (4,)
-                probs_floored = probs.clone().cpu()
-                probs_floored = torch.where(
-                    action_mask_cpu,
-                    torch.max(probs_floored, torch.tensor(floor)),
-                    probs_floored,
-                )
-                probs_floored = probs_floored / probs_floored.sum()
+                legal_indices = action_mask_cpu.nonzero(as_tuple=True)[0].tolist()
 
-                # Sample action from FLOORED distribution
-                dist = Categorical(probs_floored)
-                action_idx = dist.sample().item()
+                if self.rng.random() < epsilon and len(legal_indices) > 1:
+                    # Random action — explore something the model wouldn't try
+                    action_idx = self.rng.choice(legal_indices)
+                else:
+                    # Model's policy
+                    dist = Categorical(probs)
+                    action_idx = dist.sample().item()
 
-                # Log prob from RAW model output (not floored) for PPO
+                # Always compute log_prob from model's OWN distribution for PPO
                 raw_dist = Categorical(raw_probs)
                 log_prob = raw_dist.log_prob(torch.tensor(action_idx)).item()
 
-                # Sizing with exploration floor
+                # Sizing with epsilon-greedy
                 sizing_idx = 0
                 if action_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
                     sizing_tensor = torch.tensor(sizing_probs, dtype=torch.float32)
-                    raw_sizing = sizing_tensor.clone()
-
-                    # Apply floor to 3 representative sizing buckets (exclude all-in)
                     sizing_mask_1d = encoded['sizing_mask'].squeeze(0).cpu()  # (10,)
-                    allin_bucket = len(sizing_probs) - 1
-                    legal_non_allin = [i for i, m in enumerate(sizing_mask_1d) if m and i != allin_bucket]
-                    if len(legal_non_allin) >= 4:
-                        n = len(legal_non_allin)
-                        explore = [legal_non_allin[0], legal_non_allin[n//3], legal_non_allin[2*n//3], legal_non_allin[-1]]
+                    legal_sizing = sizing_mask_1d.nonzero(as_tuple=True)[0].tolist()
+
+                    if self.rng.random() < epsilon and len(legal_sizing) > 1:
+                        # Random sizing — explore different bet amounts
+                        sizing_idx = self.rng.choice(legal_sizing)
                     else:
-                        explore = legal_non_allin
-                    for idx in explore:
-                        sizing_tensor[idx] = max(sizing_tensor[idx].item(), floor)
-                    sizing_tensor = sizing_tensor / sizing_tensor.sum()
+                        s_dist = Categorical(sizing_tensor)
+                        sizing_idx = s_dist.sample().item()
 
-                    s_dist = Categorical(sizing_tensor)
-                    sizing_idx = s_dist.sample().item()
-
-                    # Raw sizing log prob for PPO
-                    raw_s_dist = Categorical(raw_sizing)
-                    log_prob += raw_s_dist.log_prob(torch.tensor(sizing_idx)).item()
+                    # Log prob from model's sizing distribution for PPO
+                    log_prob += Categorical(sizing_tensor).log_prob(torch.tensor(sizing_idx)).item()
 
                 # Store hero experience
                 hero_experiences.append({
@@ -713,9 +801,12 @@ class NLHESelfPlayTrainer:
 
             else:
                 # ── OPPONENT: run through frozen policy (no grad, no yield) ──
+                pool_idx = seat_pool_idx.get(pid, 0)
+                frozen_model = self._frozen_models.get(pool_idx, self._frozen_template)
+
                 with torch.no_grad():
                     opp_mask = torch.zeros(1, num_p - 1, dtype=torch.bool)
-                    output = self.frozen_policy(
+                    output = frozen_model(
                         hole_cards=encoded['hole_cards'].cpu(),
                         community_cards=encoded['community_cards'].cpu(),
                         numeric_features=encoded['numeric_features'].cpu(),
@@ -726,7 +817,7 @@ class NLHESelfPlayTrainer:
                         sizing_mask=encoded['sizing_mask'].cpu(),
                         opponent_mask=opp_mask,
                     )
-                    probs = output.action_type_probs[0]  # already CPU
+                    probs = output.action_type_probs[0]
                     sizing_probs = torch.softmax(output.bet_size_logits[0], dim=-1).tolist()
 
                 # Apply personality to opponent (hero never gets personality)
@@ -993,7 +1084,8 @@ class NLHESelfPlayTrainer:
         # chosen[action] = times chosen, legal[action] = times it was legal
         chosen = {'fold': 0, 'check': 0, 'call': 0, 'raise': 0, 'allin': 0}
         legal = {'fold': 0, 'check': 0, 'call': 0, 'raise': 0, 'allin': 0}
-        deep_allin_count = 0
+        deep_raise_count = 0   # raises when hero_stack_bb > 50 (any sizing)
+        deep_allin_count = 0   # raises when hero_stack_bb > 50 AND sizing = all-in
 
         for e in experiences:
             mask = e.action_mask.squeeze(0)  # (4,)
@@ -1016,30 +1108,29 @@ class NLHESelfPlayTrainer:
             elif e.action_idx == ActionIndex.RAISE:
                 if e.sizing_idx == allin_idx:
                     chosen['allin'] += 1
-                    if e.hero_stack_bb > 50:
-                        deep_allin_count += 1
                 else:
                     chosen['raise'] += 1
+                # Track deep-stack sizing discipline
+                if e.hero_stack_bb > 50:
+                    deep_raise_count += 1
+                    if e.sizing_idx == allin_idx:
+                        deep_allin_count += 1
 
-        # Return conditional % (chosen / legal) + deep all-in %
+        # Return conditional % (chosen / legal) + deep-stack all-in rate
         rates = {}
         for k in chosen:
             rates[k] = (chosen[k] / legal[k] * 100) if legal[k] > 0 else 0.0
-        rates['deep_ai'] = (deep_allin_count / max(chosen['allin'], 1)) * 100
+        # "When deep (>50bb) and raising, what % is all-in?" — healthy = 10-20%
+        rates['deep_ai'] = (deep_allin_count / max(deep_raise_count, 1)) * 100
         return rates
-
-    # ─────────────────────────────────────────────────────────
-    # PPO loss
-    # ─────────────────────────────────────────────────────────
-
-    def _compute_ppo_loss(self, experiences: List[Experience]) -> float:
-        """Compute PPO loss from collected experience using batched operations."""
-        if not experiences:
-            return 0.0
-
-        self.policy.train()
-        self.opponent_encoder.train()
+    def _precompute_ppo_data(self, experiences: List[Experience]):
+        """Pre-compute and batch all PPO data: tensors + GAE advantages/returns.
         
+        Called ONCE before PPO epochs. Returns dict of batched tensors.
+        """
+        if not experiences:
+            return None
+
         # 1. Stack scalar/fixed-size features
         hole_cards = torch.cat([e.hole_cards.to(self.device) for e in experiences], dim=0)
         community = torch.cat([e.community_cards.to(self.device) for e in experiences], dim=0)
@@ -1048,7 +1139,7 @@ class NLHESelfPlayTrainer:
         action_masks = torch.cat([e.action_mask.to(self.device) for e in experiences], dim=0)
         sizing_masks = torch.cat([e.sizing_mask.to(self.device) for e in experiences], dim=0)
         
-        # 2. Pad opponent sequence arrays (shape is [1, num_opp, dim])
+        # 2. Pad opponent sequence arrays
         max_opps = max([e.opponent_embeddings.shape[1] for e in experiences])
         
         opp_emb_list = []
@@ -1085,10 +1176,8 @@ class NLHESelfPlayTrainer:
         action_t = torch.tensor([e.action_idx for e in experiences], device=self.device, dtype=torch.long)
         sizing_t = torch.tensor([e.sizing_idx for e in experiences], device=self.device, dtype=torch.long)
         old_log_probs = torch.tensor([e.log_prob for e in experiences], device=self.device, dtype=torch.float32)
-        old_values = torch.tensor([e.value for e in experiences], device=self.device, dtype=torch.float32)
 
-        # ── Compute GAE advantages and returns per hand trajectory ──
-        # Group experience indices by hand_id
+        # 4. Compute GAE advantages and returns ONCE (using original values)
         hand_groups: Dict[int, List[int]] = {}
         for idx, e in enumerate(experiences):
             hid = e.hand_id
@@ -1096,12 +1185,10 @@ class NLHESelfPlayTrainer:
                 hand_groups[hid] = []
             hand_groups[hid].append(idx)
 
-        # Compute GAE per hand trajectory
         gae_advantages = torch.zeros(len(experiences), device=self.device)
         gae_returns = torch.zeros(len(experiences), device=self.device)
 
         for hid, indices in hand_groups.items():
-            # Sort by step_idx within the hand
             indices.sort(key=lambda i: experiences[i].step_idx)
             trajectory = [experiences[i] for i in indices]
             advantages, returns = self._compute_gae(trajectory)
@@ -1109,10 +1196,49 @@ class NLHESelfPlayTrainer:
                 gae_advantages[global_idx] = advantages[local_idx]
                 gae_returns[global_idx] = returns[local_idx]
 
-        # No advantage normalization — V(s) already serves as the adaptive baseline.
-        # Gradient clipping at 1.0 prevents explosions.
+        # Soft advantage normalization: scale magnitude without changing sign
+        # Floor of 1.0 lets big mistakes teach louder, just not 900x louder
+        adv_std = max(gae_advantages.std().item(), 1.0)
+        gae_advantages = gae_advantages / adv_std
 
-        # 4. Batched forward pass
+        return {
+            'hole_cards': hole_cards,
+            'community': community,
+            'numeric': numeric,
+            'own_stats': own_stats,
+            'action_masks': action_masks,
+            'sizing_masks': sizing_masks,
+            'opp_embeds': opp_embeds,
+            'opp_stats': opp_stats,
+            'opp_masks': opp_masks,
+            'action_t': action_t,
+            'sizing_t': sizing_t,
+            'old_log_probs': old_log_probs,
+            'gae_advantages': gae_advantages,
+            'gae_returns': gae_returns,
+        }
+
+    def _compute_ppo_loss_minibatch(self, data: dict, indices: List[int]) -> float:
+        """Compute PPO loss on a mini-batch specified by indices."""
+        idx = torch.tensor(indices, device=self.device, dtype=torch.long)
+
+        # Slice all tensors by indices
+        hole_cards = data['hole_cards'][idx]
+        community = data['community'][idx]
+        numeric = data['numeric'][idx]
+        own_stats = data['own_stats'][idx]
+        action_masks = data['action_masks'][idx]
+        sizing_masks = data['sizing_masks'][idx]
+        opp_embeds = data['opp_embeds'][idx]
+        opp_stats = data['opp_stats'][idx]
+        opp_masks = data['opp_masks'][idx]
+        action_t = data['action_t'][idx]
+        sizing_t = data['sizing_t'][idx]
+        old_log_probs = data['old_log_probs'][idx]
+        gae_advantages = data['gae_advantages'][idx]
+        gae_returns = data['gae_returns'][idx]
+
+        # Forward pass
         output = self.policy(
             hole_cards=hole_cards,
             community_cards=community,
@@ -1125,38 +1251,68 @@ class NLHESelfPlayTrainer:
             opponent_mask=opp_masks,
         )
         
-        # 5. Compute PPO stats and loss
+        # ── Decoupled PPO: action type and sizing get independent credit ──
+        
+        # Action type PPO (all experiences)
         dist = Categorical(output.action_type_probs)
         action_log_probs = dist.log_prob(action_t)
         action_entropy = dist.entropy().mean()
 
-        # Compute sizing log probs only for RAISE actions
         is_raise = (action_t == ActionIndex.RAISE)
         
         sizing_dist = Categorical(logits=output.bet_size_logits)
         sizing_log_probs = sizing_dist.log_prob(sizing_t)
         sizing_entropy = sizing_dist.entropy()
 
-        # Total log prob combines both if action was RAISE
-        new_log_probs = action_log_probs.clone()
+        # Separate old log probs for action and sizing
+        # old_log_probs contains combined (action + sizing for raises)
+        # We need to split: for non-raises, old_action_log_prob = old_log_probs
+        # For raises, we stored action_log_prob + sizing_log_prob combined
+        # Since we can't perfectly split, use current model's ratio on each head independently
+        
+        # Action head ratio (using only action log probs)
+        # For old action log prob: approximate from combined old_log_probs
+        # For raises: old_action_lp ≈ old_log_probs - old_sizing_lp (unknown)
+        # Simpler: use the combined log_prob for action ratio on non-raise,
+        # and just the action portion for raises
+        action_ratio = torch.exp(action_log_probs - old_log_probs)
+        # For raises, the old_log_probs includes sizing, so scale ratio accordingly
         if is_raise.any():
-            new_log_probs[is_raise] += sizing_log_probs[is_raise]
+            # Approximate: for raise experiences, use action-only ratio
+            # by adding back the current sizing log prob to make them comparable
+            combined_new = action_log_probs.clone()
+            combined_new[is_raise] += sizing_log_probs[is_raise]
+            action_ratio = torch.exp(combined_new - old_log_probs)
+        
+        surr1 = action_ratio * gae_advantages
+        surr2 = torch.clamp(action_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
+        action_loss = -torch.min(surr1, surr2).mean()
+
+        # Sizing head PPO (only raise experiences, independent ratio)
+        sizing_loss = torch.tensor(0.0, device=self.device)
+        if is_raise.any():
+            raise_sizing_log = sizing_log_probs[is_raise]
+            raise_advantages = gae_advantages[is_raise]
             
+            # For sizing ratio, we need old sizing log prob
+            # Approximate: old_sizing_lp = old_log_probs - old_action_lp
+            # Use current action log prob as proxy for old action log prob
+            old_sizing_lp = old_log_probs[is_raise] - action_log_probs[is_raise].detach()
+            
+            sizing_ratio = torch.exp(raise_sizing_log - old_sizing_lp)
+            s_surr1 = sizing_ratio * raise_advantages
+            s_surr2 = torch.clamp(sizing_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * raise_advantages
+            sizing_loss = -torch.min(s_surr1, s_surr2).mean()
+        
         entropy = action_entropy + (sizing_entropy * is_raise.float()).mean()
         
-        ratio = torch.exp(new_log_probs - old_log_probs)
-        surr1 = ratio * gae_advantages
-        surr2 = torch.clamp(ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
-        
-        # Value head trained on GAE returns (not flat terminal reward)
         value_pred = output.value.squeeze(-1)
         value_loss = torch.nn.functional.smooth_l1_loss(value_pred, gae_returns)
         
-        # Use annealed entropy coefficient
         entropy_coef = self._get_entropy_coef()
         loss = (
-            policy_loss
+            action_loss
+            + 0.5 * sizing_loss  # sizing weighted slightly less
             + self.config.value_coef * value_loss
             - entropy_coef * entropy
         )
@@ -1178,6 +1334,7 @@ class NLHESelfPlayTrainer:
             start_epoch: Epoch to start from (for resumed training).
         """
         self.total_epochs = num_epochs  # for annealing schedules
+        mini_batch_size = self.config.mini_batch_size
 
         metrics = {
             'epoch_reward': [],
@@ -1188,7 +1345,8 @@ class NLHESelfPlayTrainer:
         print(f"Balanced self-play: hero-only training, frozen opponent pool")
         print(f"GAE: gamma={self.config.gamma}, lambda={self.config.gae_lambda}")
         print(f"Entropy: {self.config.entropy_coef} -> {self.config.entropy_coef_end}")
-        print(f"Exploration floor: {self.config.exploration_floor} -> {self.config.exploration_floor_end}")
+        print(f"Epsilon-greedy: {self.config.epsilon} -> {self.config.epsilon_end}")
+        print(f"Mini-batch PPO: batch_size={mini_batch_size}, ppo_epochs={self.config.ppo_epochs}")
         if start_epoch > 0:
             print(f"Resuming from epoch {start_epoch}")
 
@@ -1200,7 +1358,8 @@ class NLHESelfPlayTrainer:
             if epoch > 0 and epoch % self.config.frozen_update_interval == 0:
                 self._sync_frozen()
                 if self.config.verbose:
-                    print(f"    [Frozen sync] Pool size: {len(self.opponent_pool)}")
+                    pool_total = len(self.opponent_pool_recent) + len(self.opponent_pool_archive)
+                    print(f"    [Frozen sync] Pool: {len(self.opponent_pool_recent)} recent + {len(self.opponent_pool_archive)} archive = {pool_total}")
 
             # Batched simulation: all hands run as generators with batched GPU calls
             all_exp, total_reward = self._run_batched_epoch()
@@ -1210,20 +1369,36 @@ class NLHESelfPlayTrainer:
             # Action distribution (conditional: % chosen when legal)
             action_pcts = self._count_action_distribution(all_exp)
 
-            # PPO update (fully batched on GPU)
-            total_loss = 0.0
-            for _ in range(self.config.ppo_epochs):
-                self.optimizer.zero_grad()
-                loss_val = self._compute_ppo_loss(all_exp)
-                nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-                nn.utils.clip_grad_norm_(self.opponent_encoder.parameters(), 1.0)
-                self.optimizer.step()
-                total_loss += loss_val
+            # Pre-compute GAE and batch tensors ONCE
+            self.policy.train()
+            self.opponent_encoder.train()
+            ppo_data = self._precompute_ppo_data(all_exp)
 
-            avg_loss = total_loss / self.config.ppo_epochs
+            # Mini-batch PPO update
+            total_loss = 0.0
+            num_updates = 0
+            if ppo_data is not None:
+                n = len(all_exp)
+                all_indices = list(range(n))
+                for _ in range(self.config.ppo_epochs):
+                    self.rng.shuffle(all_indices)
+                    for start in range(0, n, mini_batch_size):
+                        mb_indices = all_indices[start:start + mini_batch_size]
+                        self.optimizer.zero_grad()
+                        loss_val = self._compute_ppo_loss_minibatch(ppo_data, mb_indices)
+                        nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+                        nn.utils.clip_grad_norm_(self.opponent_encoder.parameters(), 1.0)
+                        self.optimizer.step()
+                        total_loss += loss_val
+                        num_updates += 1
+
+            avg_loss = total_loss / max(num_updates, 1)
 
             # Free experience memory and flush device cache
             del all_exp
+            del ppo_data
+            import gc
+            gc.collect()
             if self.device.type == 'mps':
                 torch.mps.empty_cache()
             elif self.device.type == 'cuda':
@@ -1240,7 +1415,7 @@ class NLHESelfPlayTrainer:
                 print(
                     f"Epoch {epoch + 1:4d} ({epoch_duration:.1f}s, {hands_per_sec:.1f} hands/s) | "
                     f"Reward: {avg_reward:+.3f} bb | "
-                    f"Loss: {avg_loss:.4f} | "
+                    f"Loss: {avg_loss:.4f} ({num_updates} updates) | "
                     f"F/Ch/Ca/R/AI: {action_pcts['fold']:.0f}/{action_pcts['check']:.0f}/{action_pcts['call']:.0f}/{action_pcts['raise']:.0f}/{action_pcts['allin']:.0f}% "
                     f"DAI:{deep_ai:.0f}%"
                 )
