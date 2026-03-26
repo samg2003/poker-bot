@@ -21,10 +21,10 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from model.action_space import ActionIndex, NUM_ACTION_TYPES
+from model.action_space import ActionIndex, NUM_ACTION_TYPES, ACTION_FEATURE_DIM, encode_action
 from model.stat_tracker import StatTracker, NUM_STAT_FEATURES, HandRecord
 from model.opponent_encoder import OpponentEncoder
-from model.policy_network import PolicyNetwork
+from model.policy_network import PolicyNetwork, MAX_HAND_ACTIONS, PROFILE_DIM
 from training.personality import (
     PersonalityModifier, SituationalPersonality,
     detect_situations, sample_table_personalities,
@@ -32,7 +32,6 @@ from training.personality import (
 from engine.leduc_poker import LeducState, deal_leduc, CHECK, BET, FOLD, CALL, RAISE
 from engine.dealer import Dealer
 from engine.game_state import ActionType, Action, Street
-from model.action_space import encode_action
 from agent.config import AgentConfig
 
 
@@ -130,10 +129,13 @@ class Evaluator:
         return mapping.get(action.action_type, ActionIndex.FOLD)
 
     def _record_action(self, player_id: int, action_type: int,
-                       bet_frac: float, pot: float, stack: float, street: int):
+                       bet_frac: float, pot: float, stack: float, street: int,
+                       relative_position: float = 0.0, hand_boundary: float = 0.0):
         if player_id not in self.action_histories:
             self.action_histories[player_id] = []
-        token = encode_action(action_type, bet_frac, pot, stack, street)
+        token = encode_action(action_type, bet_frac, pot, stack, street,
+                              relative_position=relative_position,
+                              hand_boundary=hand_boundary)
         self.action_histories[player_id].append(token)
         if len(self.action_histories[player_id]) > 16:
             self.action_histories[player_id] = self.action_histories[player_id][-16:]
@@ -311,6 +313,9 @@ class Evaluator:
         first_bet_this_street_by = -1
         current_street = Street.PREFLOP
 
+        # Phase 5: Accumulate hand action tokens (13d) for hand history encoder
+        hand_action_tokens = []  # list of 13d tensors
+
         while not dealer.is_hand_over():
             pid = game_state.current_player_idx
             p = game_state.players[pid]
@@ -375,10 +380,23 @@ class Evaluator:
             from model.action_space import get_sizing_mask
             sizing_mask = get_sizing_mask(game_state).unsqueeze(0)
 
+            # Phase 5: Snapshot current hand action history for this decision
+            n_actions = len(hand_action_tokens)
+            ha_seq = torch.zeros(1, MAX_HAND_ACTIONS, ACTION_FEATURE_DIM)
+            ha_len = torch.tensor([min(n_actions, MAX_HAND_ACTIONS)], dtype=torch.long)
+            if n_actions > 0:
+                tokens = hand_action_tokens[-MAX_HAND_ACTIONS:]
+                ha_seq[0, :len(tokens)] = torch.stack(tokens)
+
+            # Phase 6: Actor profiles (zeros — matches training batch inference)
+            actor_prof = torch.zeros(1, MAX_HAND_ACTIONS, PROFILE_DIM)
+
             with torch.no_grad():
                 out = self.policy(
                     hole, community, numeric, opp_embed, opp_stats, own_stats,
-                    action_mask=mask, sizing_mask=sizing_mask
+                    action_mask=mask, sizing_mask=sizing_mask,
+                    hand_action_seq=ha_seq, hand_action_len=ha_len,
+                    actor_profiles_seq=actor_prof,
                 )
 
             probs = out.action_type_probs[0]
@@ -492,7 +510,12 @@ class Evaluator:
 
             dealer.apply_action(act)
 
-            # Record for history/stats
+            # Compute relative position and hand boundary for enriched tokens
+            dealer_btn = game_state.dealer_button
+            rel_pos = ((pid - dealer_btn) % num_players) / 8.0
+            is_hand_boundary = 1.0 if len(hand_action_tokens) == 0 else 0.0
+
+            # Record for cross-hand history/stats (13d tokens)
             pot_for_record = game_state.pot
             self._record_action(
                 player_id=pid,
@@ -501,7 +524,17 @@ class Evaluator:
                 pot=pot_for_record,
                 stack=p.stack,
                 street=street_map.get(pre_street, 0),
+                relative_position=rel_pos,
+                hand_boundary=is_hand_boundary,
             )
+
+            # Phase 5: Record raw action token for within-hand history
+            raw_token = encode_action(
+                self._action_to_type_idx(act), bet_frac, pot_for_record, p.stack,
+                street_map.get(pre_street, 0), relative_position=rel_pos,
+                hand_boundary=is_hand_boundary,
+            )
+            hand_action_tokens.append(raw_token)
 
             # Street transition
             if game_state.street != current_street:
