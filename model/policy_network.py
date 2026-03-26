@@ -31,7 +31,7 @@ class CardEmbedding(nn.Module):
     Separately embeds rank and suit, then combines them.
     """
 
-    def __init__(self, embed_dim: int = 64):
+    def __init__(self, embed_dim: int = 128):
         super().__init__()
         self.rank_embed = nn.Embedding(13, embed_dim)  # 2-A
         self.suit_embed = nn.Embedding(4, embed_dim)   # c/d/h/s
@@ -62,31 +62,57 @@ class CardEmbedding(nn.Module):
         return combined
 
 
+class CardTransformerBlock(nn.Module):
+    """Full transformer block with self-attention + feedforward."""
+
+    def __init__(self, embed_dim: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn_out, _ = self.attn(x, x, x)
+        x = self.norm1(x + self.dropout(attn_out))
+        x = self.norm2(x + self.dropout(self.ff(x)))
+        return x
+
+
 class GameStateEncoder(nn.Module):
     """
     Encode the current game state into a fixed-size representation.
 
-    Includes: hole cards, community cards, pot/stack info, position,
-    and action history for the current hand.
+    Cards processed by a 4-layer transformer at embed_dim with learned
+    attention-pooling. Full architecture for CUDA training.
     """
 
     def __init__(self, embed_dim: int = 128):
         super().__init__()
         self.embed_dim = embed_dim
 
-        # Card embedding (shared for hole and community cards)
-        self.card_embed = CardEmbedding(embed_dim=64)
-        self.owner_embed = nn.Embedding(2, 64)  # 0 = Hole, 1 = Community
+        # Card embedding at full embed_dim
+        self.card_embed = CardEmbedding(embed_dim=embed_dim)
+        self.owner_embed = nn.Embedding(2, embed_dim)  # 0 = Hole, 1 = Community
 
-        # Aggregate cards via attention
-        self.card_attn = nn.MultiheadAttention(
-            embed_dim=64, num_heads=4, batch_first=True,
-        )
-        self.card_proj = nn.Linear(128, embed_dim)  # 2 hole cards * 64 dim
+        # 4-layer deep card transformer
+        self.card_transformer = nn.ModuleList([
+            CardTransformerBlock(embed_dim, num_heads=4)
+            for _ in range(4)
+        ])
+
+        # Learned attention-pooling
+        self.card_query = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pool_attn = nn.MultiheadAttention(embed_dim, num_heads=4, batch_first=True)
 
         # Numeric features: 23-dim vector per final_state.md §3
-        # pot, stack, bet, seat_onehot[9], IP, street_onehot[4],
-        # num_p, active_p, current_bet, min_raise, atc, SPR
         self.numeric_proj = nn.Sequential(
             nn.Linear(23, embed_dim),
             nn.GELU(),
@@ -104,40 +130,40 @@ class GameStateEncoder(nn.Module):
         self,
         hole_cards: torch.Tensor,       # (batch, 2) card indices
         community_cards: torch.Tensor,   # (batch, 5) card indices (-1 if absent)
-        numeric_features: torch.Tensor,  # (batch, 9)
+        numeric_features: torch.Tensor,  # (batch, 23)
     ) -> torch.Tensor:
-        """
-        Returns: (batch, embed_dim) game state encoding.
-        """
-        # Embed cards and apply ownership (0=Hole, 1=Community)
-        hole_embs = self.card_embed(hole_cards) + self.owner_embed(torch.tensor(0, device=hole_cards.device))
-        comm_embs = self.card_embed(community_cards) + self.owner_embed(torch.tensor(1, device=community_cards.device))
-        
-        # Zero out absent community cards again to prevent ownership-embed noise injection
+        batch_size = hole_cards.shape[0]
+
+        # Embed cards at embed_dim and apply ownership tags
+        hole_embs = self.card_embed(hole_cards) + self.owner_embed(
+            torch.zeros(batch_size, 2, dtype=torch.long, device=hole_cards.device)
+        )
+        comm_embs = self.card_embed(community_cards) + self.owner_embed(
+            torch.ones(batch_size, 5, dtype=torch.long, device=community_cards.device)
+        )
+
+        # Zero out absent community cards
         valid_comm = (community_cards >= 0).unsqueeze(-1).float()
         comm_embs = comm_embs * valid_comm
 
-        card_embs = torch.cat([hole_embs, comm_embs], dim=1)  # (batch, 7, 64)
+        card_embs = torch.cat([hole_embs, comm_embs], dim=1)  # (batch, 7, embed_dim)
 
-        # Self-attention over cards with padding mask for absent cards
-        all_cards = torch.cat([hole_cards, community_cards], dim=1)
-        key_padding_mask = (all_cards < 0)  # True = Ignore
-        
-        card_out, _ = self.card_attn(
-            card_embs, card_embs, card_embs,
-            key_padding_mask=key_padding_mask
-        )
-        
-        # Extract and flatten precisely the 2 Hole Cards (giving the network undiluted vision of its hand interaction)
-        card_repr = card_out[:, :2, :].flatten(start_dim=1)  # (batch, 128)
-        card_repr = self.card_proj(card_repr)  # (batch, embed_dim)
+        # 4-layer transformer over all 7 cards
+        card_out = card_embs
+        for block in self.card_transformer:
+            card_out = block(card_out)
+
+        # Learned attention-pooling: query token attends to all card outputs
+        query = self.card_query.expand(batch_size, -1, -1)
+        card_repr, _ = self.pool_attn(query, card_out, card_out)
+        card_repr = card_repr.squeeze(1)  # (B, embed_dim)
 
         # Project numeric features
-        numeric_repr = self.numeric_proj(numeric_features)  # (batch, embed_dim)
+        numeric_repr = self.numeric_proj(numeric_features)
 
         # Combine
         combined = torch.cat([card_repr, numeric_repr], dim=-1)
-        return self.combine(combined)  # (batch, embed_dim)
+        return self.combine(combined)
 
 
 class PolicyNetwork(nn.Module):

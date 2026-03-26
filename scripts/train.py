@@ -17,6 +17,9 @@ import argparse
 import sys
 import os
 
+# Allow MPS to use full available memory (prevents buffer allocation failures)
+os.environ.setdefault('PYTORCH_MPS_HIGH_WATERMARK_RATIO', '0.0')
+
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

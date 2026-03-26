@@ -973,9 +973,15 @@ class NLHESelfPlayTrainer:
                     total_reward += reward
                     total_finished += 1
 
+            step_count = 0
             while pending:
                 game_indices = list(pending.keys())
                 states = [pending[i][1] for i in game_indices]
+
+                # Periodic MPS sync to prevent graph cache exhaustion
+                step_count += 1
+                if step_count % 25 == 0 and self.device.type == 'mps':
+                    torch.mps.synchronize()
 
                 # 1. BATCH OPPONENT EMBEDDING GENERATION
                 all_seqs_to_encode = []

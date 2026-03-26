@@ -1,5 +1,6 @@
 """Profile training bottlenecks — run from project root."""
 import sys, os, time, functools, subprocess
+os.environ.setdefault('PYTORCH_MPS_HIGH_WATERMARK_RATIO', '0.0')
 import torch
 import gc
 
