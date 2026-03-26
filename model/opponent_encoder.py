@@ -71,6 +71,7 @@ class OpponentEncoder(nn.Module):
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
             num_layers=num_layers,
+            enable_nested_tensor=False,  # Fixes MPS crash with padding masks
         )
 
         # Output projection: aggregate sequence → fixed embedding

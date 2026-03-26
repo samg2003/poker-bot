@@ -456,18 +456,60 @@ class NLHESelfPlayTrainer:
     def _get_all_opponent_embeddings(self, hero_id: int, num_players: int) -> torch.Tensor:
         """
         Get embeddings for all opponents (from hero's perspective).
+        Batches all uncached opponent encoder calls into a single forward pass.
         Returns: (1, num_opp, embed_dim) tensor.
         """
-        opp_embeds = []
-        for pid in range(num_players):
-            if pid == hero_id:
-                continue
-            opp_embeds.append(self._get_opponent_embedding(pid))
-
-        if not opp_embeds:
+        opp_ids = [pid for pid in range(num_players) if pid != hero_id]
+        if not opp_ids:
             return self.opponent_encoder.encode_empty(1, device=str(self.device)).unsqueeze(1)
 
-        return torch.cat(opp_embeds, dim=0).unsqueeze(0)  # (1, num_opp, embed_dim)
+        # Split into cached and uncached
+        cached_embs = {}
+        uncached = []  # (pid, history_tensors)
+        for pid in opp_ids:
+            if pid in self._opp_embed_cache:
+                cached_embs[pid] = self._opp_embed_cache[pid]
+            else:
+                history = self.action_histories.get(pid, [])
+                uncached.append((pid, history))
+
+        # Batch encode all uncached opponents in one forward pass
+        if uncached:
+            # Separate empty vs non-empty histories
+            with_history = [(pid, h) for pid, h in uncached if h]
+            without_history = [pid for pid, h in uncached if not h]
+
+            # Encode empty opponents
+            for pid in without_history:
+                emb = self.opponent_encoder.encode_empty(1, device=str(self.device))
+                self._opp_embed_cache[pid] = emb.detach()
+                cached_embs[pid] = emb
+
+            # Batch encode opponents with history
+            if with_history:
+                seqs = [torch.stack(h) for _, h in with_history]  # list of (seq_len, features)
+                max_len = max(s.shape[0] for s in seqs)
+                feat_dim = seqs[0].shape[1]
+
+                # Pad to same length and build mask
+                padded = torch.zeros(len(seqs), max_len, feat_dim, device=self.device)
+                mask = torch.ones(len(seqs), max_len, device=self.device, dtype=torch.bool)  # True = masked
+                for i, s in enumerate(seqs):
+                    s = self._to(s)
+                    padded[i, :s.shape[0]] = s
+                    mask[i, :s.shape[0]] = False  # unmask real positions
+
+                with torch.no_grad():
+                    embs = self.opponent_encoder(padded, mask=mask)  # (N, embed_dim)
+
+                for i, (pid, _) in enumerate(with_history):
+                    emb = embs[i:i+1].detach()  # (1, embed_dim)
+                    self._opp_embed_cache[pid] = emb
+                    cached_embs[pid] = emb
+
+        # Assemble in order
+        ordered = [cached_embs[pid] for pid in opp_ids]
+        return torch.cat(ordered, dim=0).unsqueeze(0)  # (1, num_opp, embed_dim)
 
     def _get_opponent_stats(self, hero_id: int, num_players: int) -> torch.Tensor:
         """Get HUD stats for all opponents. Returns (1, num_opp, stat_dim)."""

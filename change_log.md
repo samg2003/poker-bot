@@ -40,6 +40,23 @@ All notable changes to the poker AI training pipeline are documented here.
 - **After:** `DAI = deep_all_ins / total_deep_raises` ("when deep and raising, what % is all-in?")
 - **Why:** Old metric was ~85% simply because 70% of stacks are >50bb. New metric directly measures sizing discipline at deep stacks. Healthy target: 10-20%.
 
+#### Separate Action/Sizing Log Probs for Decoupled PPO
+- **Before:** Only stored combined `log_prob = action_lp + sizing_lp` — decoupled sizing ratio used current action log prob to approximate old sizing log prob, which drifted after 64 mini-batch updates causing ratio explosion (loss = 9000+)
+- **After:** Store `action_log_prob` and `sizing_log_prob` separately in Experience — decoupled loss uses exact old values, no approximation
+- **Why:** Root cause of loss spikes was the sizing ratio using stale approximations, not the advantage magnitude.
+
+### ⚡ Performance
+
+#### Frozen Model Caching
+- **Before:** `_build_table_models` rebuilt fresh PolicyNetwork instances every hand when player count changed (68% of simulation time)
+- **After:** Cache models by pool index, only build for new indices
+- **Result:** 0.53s → 0.01s per 20 hands (53x faster)
+
+#### Batched Opponent Encoder
+- **Before:** Individual forward pass per opponent per decision (3381 calls, 44% of simulation time)
+- **After:** Single batched forward pass for all opponents with padded sequences
+- **Expected:** 12 hands/s → 25-30 hands/s on MPS
+
 ### 📊 Results (First 47 Epochs with Fixes)
 
 | Metric | Before (epoch 200+) | After (epoch 47) |
