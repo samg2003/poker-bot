@@ -51,6 +51,18 @@ rsync -avz --progress \
 echo ""
 echo "✓ Checkpoint synced!"
 
+# Sync logs
+LOG_DIR="$PROJECT_DIR/logs"
+mkdir -p "$LOG_DIR"
+echo ""
+echo "Syncing logs..."
+rsync -avz --progress \
+    -e "ssh -i $PEM_PATH -o StrictHostKeyChecking=no" \
+    "$EC2_USER@$EC2_IP:~/poker-bot/eval_history.log" \
+    "$EC2_USER@$EC2_IP:~/poker-bot/train.log" \
+    "$LOG_DIR/" 2>/dev/null || echo "  (some logs not found yet)"
+echo "✓ Logs synced to $LOG_DIR/"
+
 # Show what we got
 if [ -f "$LOCAL_DIR/metadata.json" ]; then
     echo ""
