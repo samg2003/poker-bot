@@ -9,16 +9,21 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# --- Config ---
-PEM_PATH="${PEM_PATH:-$PROJECT_DIR/carte6.pem}"
-EC2_USER="${EC2_USER:-ubuntu}"
+# --- Defaults ---
+DEFAULT_PEM="$PROJECT_DIR/carte6.pem"
+DEFAULT_IP="54.219.184.157"
+DEFAULT_USER="ubuntu"
+
+# --- Config (press Enter for defaults) ---
+read -p "EC2 IP address [$DEFAULT_IP]: " EC2_IP
+EC2_IP=${EC2_IP:-$DEFAULT_IP}
+
+read -p "PEM file [$DEFAULT_PEM]: " PEM_PATH
+PEM_PATH=${PEM_PATH:-$DEFAULT_PEM}
+
+EC2_USER="$DEFAULT_USER"
 REMOTE_DIR="~/poker-bot/checkpoints/latest/"
 LOCAL_DIR="$PROJECT_DIR/checkpoints/latest/"
-
-# Get EC2 IP
-if [ -z "$EC2_IP" ]; then
-    read -p "EC2 IP address: " EC2_IP
-fi
 
 # Strip quotes
 EC2_IP=$(echo "$EC2_IP" | tr -d "'" | tr -d '"')
@@ -27,6 +32,7 @@ PEM_PATH=$(echo "$PEM_PATH" | tr -d "'" | tr -d '"')
 # Fix permissions
 chmod 400 "$PEM_PATH"
 
+echo "EC2 IP address: $EC2_IP"
 echo "============================================"
 echo "Syncing checkpoint from EC2..."
 echo "  From: $EC2_USER@$EC2_IP:$REMOTE_DIR"
