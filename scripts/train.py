@@ -140,6 +140,9 @@ def train_nlhe(args):
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         lr=args.lr,
+        ppo_epochs=args.ppo_epochs,
+        epsilon=args.epsilon_start,
+        epsilon_end=args.epsilon_end,
         hands_per_epoch=args.hands,
         log_interval=args.log_interval,
         num_players=args.num_players,
@@ -233,6 +236,12 @@ def main():
                         help='Hands per epoch')
     parser.add_argument('--lr', type=float, default=3e-4,
                         help='Learning rate')
+    parser.add_argument('--ppo-epochs', type=int, default=4,
+                        help='Number of PPO mini-batch passes per epoch')
+    parser.add_argument('--epsilon-start', type=float, default=0.15,
+                        help='Starting exploration rate')
+    parser.add_argument('--epsilon-end', type=float, default=0.08,
+                        help='Ending exploration rate')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
 
