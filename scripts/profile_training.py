@@ -46,61 +46,53 @@ def make_timer(name, orig_fn):
 trainer._get_opponent_stats = make_timer('get_opp_stats', trainer._get_opponent_stats)
 # trainer._encode_game_state doesn't exist — encoding is inline in _play_hand_gen
 
-# Run 1 epoch
+# Run 10 epochs
 print(f"Device: {trainer.device}")
-print(f"Running 100 hands...")
-print(f"Initial Mem: CPU {get_mem_mb():.1f}MB | GPU {get_gpu_mem_mb():.1f}MB")
-t0 = time.time()
-all_exp, reward = trainer._run_batched_epoch()
-sim_time = time.time() - t0
-print(f"Post-Sim Mem: CPU {get_mem_mb():.1f}MB | GPU {get_gpu_mem_mb():.1f}MB")
+print(f"Running 10 epochs (100 hands each)...")
 
-# PPO
 import torch.nn as nn
-trainer.policy.train()
-trainer.opponent_encoder.train()
-t1 = time.time()
-ppo_data = trainer._precompute_ppo_data(all_exp)
-precompute_time = time.time() - t1
+import random
 
-t2 = time.time()
-if ppo_data:
-    n = len(all_exp)
-    indices = list(range(n))
-    import random
-    for _ in range(4):
-        random.shuffle(indices)
-        for start in range(0, n, 64):
-            mb = indices[start:start+64]
-            trainer.optimizer.zero_grad()
-            trainer._compute_ppo_loss_minibatch(ppo_data, mb)
-            nn.utils.clip_grad_norm_(trainer.policy.parameters(), 1.0)
-            trainer.optimizer.step()
-ppo_time = time.time() - t2
+for epoch in range(10):
+    print(f"\n--- EPOCH {epoch+1} ---")
+    print(f"Initial Mem: CPU {get_mem_mb():.1f}MB | GPU {get_gpu_mem_mb():.1f}MB")
+    t0 = time.time()
+    
+    all_exp, reward = trainer._run_batched_epoch()
+    sim_time = time.time() - t0
+    print(f"Post-Sim Mem: CPU {get_mem_mb():.1f}MB | GPU {get_gpu_mem_mb():.1f}MB")
 
-num_exps = len(all_exp)
-# Trigger a collection to see retained memory
-del all_exp
-del ppo_data
-gc.collect()
-if torch.backends.mps.is_available():
-    torch.mps.empty_cache()
-elif torch.cuda.is_available():
-    torch.cuda.empty_cache()
-print(f"Post-PPO/GC Mem: CPU {get_mem_mb():.1f}MB | GPU {get_gpu_mem_mb():.1f}MB")
+    trainer.policy.train()
+    trainer.opponent_encoder.train()
+    t1 = time.time()
+    ppo_data = trainer._precompute_ppo_data(all_exp)
+    precompute_time = time.time() - t1
 
-print(f"\n{'='*60}")
-print(f"PROFILING RESULTS (100 hands)")
-print(f"{'='*60}")
-print(f"Total simulation:      {sim_time:.2f}s ({100/sim_time:.1f} hands/s)")
-print(f"Total PPO update:      {ppo_time:.2f}s")
-print(f"  Precompute (GAE):    {precompute_time:.2f}s")
-print(f"  Mini-batch updates:  {ppo_time:.2f}s")
-print(f"\nSimulation breakdown:")
-for name, (total, count) in sorted(timers.items(), key=lambda x: -x[1][0]):
-    avg = total/count if count else 0
-    pct = total/sim_time*100
-    print(f"  {name:30s}: {total:.3f}s ({count:5d} calls, {avg*1000:.1f}ms avg) [{pct:.0f}%]")
-other = sim_time - sum(v[0] for k,v in timers.items())
-print(f"  {'other (engine, batching)':30s}: {other:.3f}s [{other/sim_time*100:.0f}%]")
-print(f"\n{num_exps} experiences collected")
+    t2 = time.time()
+    if ppo_data:
+        n = len(all_exp)
+        indices = list(range(n))
+        for _ in range(4):
+            random.shuffle(indices)
+            for start in range(0, n, 64):
+                mb = indices[start:start+64]
+                if len(mb) < 64:
+                    continue  # Drop last incomplete batch to avoid MPS graph leak!
+                trainer.optimizer.zero_grad()
+                trainer._compute_ppo_loss_minibatch(ppo_data, mb)
+                nn.utils.clip_grad_norm_(trainer.policy.parameters(), 1.0)
+                trainer.optimizer.step()
+    ppo_time = time.time() - t2
+
+    num_exps = len(all_exp)
+    # Trigger a collection to see retained memory
+    del all_exp
+    del ppo_data
+    gc.collect()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    print(f"Post-PPO/GC Mem: CPU {get_mem_mb():.1f}MB | GPU {get_gpu_mem_mb():.1f}MB")
+    print(f"Collected {num_exps} experiences in {sim_time:.2f}s")

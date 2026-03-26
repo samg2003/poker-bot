@@ -712,14 +712,14 @@ class NLHESelfPlayTrainer:
                 log_prob = action_lp + sizing_lp
 
                 hero_experiences.append({
-                    'hole_cards': encoded['hole_cards'].detach(),
-                    'community_cards': encoded['community_cards'].detach(),
-                    'numeric_features': encoded['numeric_features'].detach(),
-                    'opponent_embeddings': opp_embed_tensor,
-                    'opponent_stats': opp_stats.detach(),
-                    'own_stats': own_stats.detach(),
-                    'action_mask': encoded['action_mask'].detach(),
-                    'sizing_mask': encoded['sizing_mask'].detach(),
+                    'hole_cards': encoded['hole_cards'].detach().cpu(),
+                    'community_cards': encoded['community_cards'].detach().cpu(),
+                    'numeric_features': encoded['numeric_features'].detach().cpu(),
+                    'opponent_embeddings': opp_embed_tensor.detach().cpu(),
+                    'opponent_stats': opp_stats.detach().cpu(),
+                    'own_stats': own_stats.detach().cpu(),
+                    'action_mask': encoded['action_mask'].detach().cpu(),
+                    'sizing_mask': encoded['sizing_mask'].detach().cpu(),
                     'action_idx': action_idx,
                     'sizing_idx': sizing_idx,
                     'log_prob': log_prob,
@@ -1070,38 +1070,39 @@ class NLHESelfPlayTrainer:
         if not experiences:
             return None
 
-        # 1. Stack scalar/fixed-size features
-        hole_cards = torch.cat([e.hole_cards.to(self.device) for e in experiences], dim=0)
-        community = torch.cat([e.community_cards.to(self.device) for e in experiences], dim=0)
-        numeric = torch.cat([e.numeric_features.to(self.device) for e in experiences], dim=0)
-        own_stats = torch.cat([e.own_stats.to(self.device) for e in experiences], dim=0)
-        action_masks = torch.cat([e.action_mask.to(self.device) for e in experiences], dim=0)
-        sizing_masks = torch.cat([e.sizing_mask.to(self.device) for e in experiences], dim=0)
+        # 1. Stack scalar/fixed-size features (keep on CPU to prevent MPS source-shape caching leak!)
+        hole_cards = torch.cat([e.hole_cards for e in experiences], dim=0)
+        community = torch.cat([e.community_cards for e in experiences], dim=0)
+        numeric = torch.cat([e.numeric_features for e in experiences], dim=0)
+        own_stats = torch.cat([e.own_stats for e in experiences], dim=0)
+        action_masks = torch.cat([e.action_mask for e in experiences], dim=0)
+        sizing_masks = torch.cat([e.sizing_mask for e in experiences], dim=0)
         
         # 2. Pad opponent sequence arrays
-        max_opps = max([e.opponent_embeddings.shape[1] for e in experiences])
+        # Always pad to hardcoded max dimension to lock tensor shapes for MPS!
+        max_opps = self.config.max_players - 1
         
         opp_emb_list = []
         opp_stat_list = []
         opp_mask_list = []
         
         for e in experiences:
-            curr_opps = e.opponent_embeddings.shape[1]
+            emb = e.opponent_embeddings
+            stat = e.opponent_stats
+            
+            curr_opps = emb.shape[1]
             pad_len = max_opps - curr_opps
             
-            emb = e.opponent_embeddings.to(self.device)
-            stat = e.opponent_stats.to(self.device)
-            
             if pad_len > 0:
-                emb_pad = torch.zeros(1, pad_len, emb.shape[2], device=self.device)
-                stat_pad = torch.zeros(1, pad_len, stat.shape[2], device=self.device)
+                emb_pad = torch.zeros(1, pad_len, emb.shape[2])
+                stat_pad = torch.zeros(1, pad_len, stat.shape[2])
                 
                 emb = torch.cat([emb, emb_pad], dim=1)
                 stat = torch.cat([stat, stat_pad], dim=1)
                 
-                mask = torch.tensor([[False]*curr_opps + [True]*pad_len], device=self.device, dtype=torch.bool)
+                mask = torch.tensor([[False]*curr_opps + [True]*pad_len], dtype=torch.bool)
             else:
-                mask = torch.tensor([[False]*curr_opps], device=self.device, dtype=torch.bool)
+                mask = torch.tensor([[False]*curr_opps], dtype=torch.bool)
                 
             opp_emb_list.append(emb)
             opp_stat_list.append(stat)
@@ -1111,12 +1112,12 @@ class NLHESelfPlayTrainer:
         opp_stats = torch.cat(opp_stat_list, dim=0)
         opp_masks = torch.cat(opp_mask_list, dim=0)
         
-        # 3. Stack targets
-        action_t = torch.tensor([e.action_idx for e in experiences], device=self.device, dtype=torch.long)
-        sizing_t = torch.tensor([e.sizing_idx for e in experiences], device=self.device, dtype=torch.long)
-        old_log_probs = torch.tensor([e.log_prob for e in experiences], device=self.device, dtype=torch.float32)
-        old_action_log_probs = torch.tensor([e.action_log_prob for e in experiences], device=self.device, dtype=torch.float32)
-        old_sizing_log_probs = torch.tensor([e.sizing_log_prob for e in experiences], device=self.device, dtype=torch.float32)
+        # 3. Stack targets (keep on CPU)
+        action_t = torch.tensor([e.action_idx for e in experiences], dtype=torch.long)
+        sizing_t = torch.tensor([e.sizing_idx for e in experiences], dtype=torch.long)
+        old_log_probs = torch.tensor([e.log_prob for e in experiences], dtype=torch.float32)
+        old_action_log_probs = torch.tensor([e.action_log_prob for e in experiences], dtype=torch.float32)
+        old_sizing_log_probs = torch.tensor([e.sizing_log_prob for e in experiences], dtype=torch.float32)
 
         # 4. Compute GAE advantages and returns ONCE (using original values)
         hand_groups: Dict[int, List[int]] = {}
@@ -1126,8 +1127,8 @@ class NLHESelfPlayTrainer:
                 hand_groups[hid] = []
             hand_groups[hid].append(idx)
 
-        gae_advantages = torch.zeros(len(experiences), device=self.device)
-        gae_returns = torch.zeros(len(experiences), device=self.device)
+        gae_advantages = torch.zeros(len(experiences))
+        gae_returns = torch.zeros(len(experiences))
 
         for hid, indices in hand_groups.items():
             indices.sort(key=lambda i: experiences[i].step_idx)
@@ -1163,25 +1164,25 @@ class NLHESelfPlayTrainer:
 
     def _compute_ppo_loss_minibatch(self, data: dict, indices: List[int]) -> float:
         """Compute PPO loss on a mini-batch specified by indices."""
-        idx = torch.tensor(indices, device=self.device, dtype=torch.long)
+        idx = torch.tensor(indices, dtype=torch.long)
 
-        # Slice all tensors by indices
-        hole_cards = data['hole_cards'][idx]
-        community = data['community'][idx]
-        numeric = data['numeric'][idx]
-        own_stats = data['own_stats'][idx]
-        action_masks = data['action_masks'][idx]
-        sizing_masks = data['sizing_masks'][idx]
-        opp_embeds = data['opp_embeds'][idx]
-        opp_stats = data['opp_stats'][idx]
-        opp_masks = data['opp_masks'][idx]
-        action_t = data['action_t'][idx]
-        sizing_t = data['sizing_t'][idx]
-        old_log_probs = data['old_log_probs'][idx]
-        old_action_log_probs = data['old_action_log_probs'][idx]
-        old_sizing_log_probs = data['old_sizing_log_probs'][idx]
-        gae_advantages = data['gae_advantages'][idx]
-        gae_returns = data['gae_returns'][idx]
+        # Slice all tensors on CPU, THEN send to device exactly shaped to avoid MPS cache bloat!
+        hole_cards = data['hole_cards'][idx].to(self.device)
+        community = data['community'][idx].to(self.device)
+        numeric = data['numeric'][idx].to(self.device)
+        own_stats = data['own_stats'][idx].to(self.device)
+        action_masks = data['action_masks'][idx].to(self.device)
+        sizing_masks = data['sizing_masks'][idx].to(self.device)
+        opp_embeds = data['opp_embeds'][idx].to(self.device)
+        opp_stats = data['opp_stats'][idx].to(self.device)
+        opp_masks = data['opp_masks'][idx].to(self.device)
+        action_t = data['action_t'][idx].to(self.device)
+        sizing_t = data['sizing_t'][idx].to(self.device)
+        old_log_probs = data['old_log_probs'][idx].to(self.device)
+        old_action_log_probs = data['old_action_log_probs'][idx].to(self.device)
+        old_sizing_log_probs = data['old_sizing_log_probs'][idx].to(self.device)
+        gae_advantages = data['gae_advantages'][idx].to(self.device)
+        gae_returns = data['gae_returns'][idx].to(self.device)
 
         # Forward pass
         output = self.policy(
@@ -1218,17 +1219,16 @@ class NLHESelfPlayTrainer:
         surr2 = torch.clamp(action_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
         action_loss = -torch.min(surr1, surr2).mean()
 
-        # Sizing head PPO (only raise experiences, independent ratio)
-        sizing_loss = torch.tensor(0.0, device=self.device)
-        if is_raise.any():
-            raise_sizing_log = sizing_log_probs[is_raise]
-            raise_advantages = gae_advantages[is_raise]
-            old_sizing_lp = old_sizing_log_probs[is_raise]
-            
-            sizing_ratio = torch.exp(raise_sizing_log - old_sizing_lp)
-            s_surr1 = sizing_ratio * raise_advantages
-            s_surr2 = torch.clamp(sizing_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * raise_advantages
-            sizing_loss = -torch.min(s_surr1, s_surr2).mean()
+        # Sizing head PPO (independent ratio)
+        sizing_ratio = torch.exp(sizing_log_probs - old_sizing_log_probs)
+        s_surr1 = sizing_ratio * gae_advantages
+        s_surr2 = torch.clamp(sizing_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
+        
+        s_loss_full = -torch.min(s_surr1, s_surr2)
+        s_loss_masked = s_loss_full * is_raise.float()
+        
+        num_raises = is_raise.sum()
+        sizing_loss = s_loss_masked.sum() / torch.clamp(num_raises.float(), min=1.0)
         
         entropy = action_entropy + (sizing_entropy * is_raise.float()).mean()
         
