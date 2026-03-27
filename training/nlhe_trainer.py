@@ -1060,7 +1060,9 @@ class NLHESelfPlayTrainer:
                 opponent_game_state=exp_dict['opponent_game_state'],
                 hand_action_seq=exp_dict['hand_action_seq'],
                 hand_action_len=exp_dict['hand_action_len'],
-                actor_profiles_seq=torch.zeros(1, MAX_HAND_ACTIONS, PROFILE_DIM),  # placeholder — profiles built in batch
+                actor_profiles_seq=exp_dict['actor_profiles_seq'],
+                hero_profile=exp_dict['hero_profile'],
+                opponent_profiles=exp_dict['opponent_profiles'],
                 action_mask=exp_dict['action_mask'],
                 sizing_mask=exp_dict['sizing_mask'],
                 action_idx=exp_dict['action_idx'],
