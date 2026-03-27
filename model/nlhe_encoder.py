@@ -104,7 +104,7 @@ class NLHEEncoder:
 
         current_bet = max(game_state.bets) / norm
         min_raise_size = game_state.min_raise / norm if hasattr(game_state, 'min_raise') else current_bet * 2
-        amount_to_call = max(0.0, current_bet - own_bet)
+        amount_to_call = min(own_stack, max(0.0, current_bet - own_bet))
         raw_pot = sum(game_state.bets)
         spr = game_state.stacks[player_idx] / max(raw_pot, 0.01)
 
