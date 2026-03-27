@@ -24,7 +24,7 @@ sys.path.insert(0, os.getcwd())
 from training.nlhe_trainer import NLHESelfPlayTrainer, NLHETrainingConfig
 
 config = NLHETrainingConfig(
-    embed_dim=256, num_layers=4, num_heads=4,
+    embed_dim=256, opponent_embed_dim=256, num_layers=4, num_heads=4,
     hands_per_epoch=100,
     min_players=2, max_players=6,
     min_bb=20, max_bb=200,

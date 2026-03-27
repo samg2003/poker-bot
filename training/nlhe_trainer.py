@@ -695,10 +695,13 @@ class NLHESelfPlayTrainer:
         hand_action_tokens = []  # list of (raw_token_13d, actor_pid)
 
         # Phase 6: Pre-compute 64d architectural profiles for the entire hand
-        player_profiles = []
         with torch.no_grad():
+            embs = []
+            stats_list = []
+            heroes = []
+            
             for p_idx in range(num_p):
-                is_hero_t = torch.tensor([[1.0]] if p_idx == 0 else [[0.0]], device=self.device)
+                heroes.append([1.0] if p_idx == 0 else [0.0])
                 
                 # Retrieve the historical opponent trace
                 emb = table.opp_embed_cache.get(p_idx, None)
@@ -710,17 +713,19 @@ class NLHESelfPlayTrainer:
                         emb = enc.detach()
                         table.opp_embed_cache[p_idx] = emb
                     else:
-                        emb = torch.zeros(1, self.config.embed_dim, device=self.device)
+                        emb = torch.zeros(1, self.config.opponent_embed_dim, device=self.device)
                 else:
                     emb = emb.to(self.device).clone().detach()
                 
-                stats = self._to(table.stat_tracker.get_stats(p_idx).unsqueeze(0))
+                embs.append(emb.squeeze(0))
+                stats_list.append(table.stat_tracker.get_stats(p_idx).to(self.device).squeeze(0))
                 
-                # Compress into the 64d cross-attention profile!
-                prof = self.policy.profile_builder(emb, stats, is_hero_t)
-                player_profiles.append(prof.squeeze(0))
-                
-        player_profiles = torch.stack(player_profiles, dim=0) # (num_p, 64)
+            # Execute 1 massively parallel GPU kernel instead of N loops
+            embs_t = torch.stack(embs, dim=0) # (num_p, 128)
+            stats_t = torch.stack(stats_list, dim=0) # (num_p, 30)
+            heroes_t = torch.tensor(heroes, device=self.device) # (num_p, 1)
+            
+            player_profiles = self.policy.profile_builder(embs_t, stats_t, heroes_t) # (num_p, 64)
         current_actor_profiles_seq = torch.zeros(1, MAX_HAND_ACTIONS, PROFILE_DIM, device=self.device)
 
         while not dealer.is_hand_over():
