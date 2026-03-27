@@ -1349,6 +1349,7 @@ class NLHESelfPlayTrainer:
         old_log_probs = torch.tensor([e.log_prob for e in experiences], dtype=torch.float32)
         old_action_log_probs = torch.tensor([e.action_log_prob for e in experiences], dtype=torch.float32)
         old_sizing_log_probs = torch.tensor([e.sizing_log_prob for e in experiences], dtype=torch.float32)
+        old_values = torch.tensor([e.value for e in experiences], dtype=torch.float32)
 
         # 4. Compute GAE advantages and returns ONCE (using original values)
         hand_groups: Dict[int, List[int]] = {}
@@ -1370,13 +1371,8 @@ class NLHESelfPlayTrainer:
                 gae_returns[global_idx] = returns[local_idx]
 
         # Reward is already normalized by effective stack at source (hero_reward /= eff_stack),
-        # so advantages and returns are in consistent "fraction of stack" units.
-        # Apply standard advantage normalization (mean-center + std-normalize)
-        # to stabilize gradient scale across batches. Only normalize advantages, NOT returns,
-        # so V(s) learns to predict the true stack-fraction-scale values.
-        adv_mean = gae_advantages.mean().item()
-        adv_std = max(gae_advantages.std().item(), 0.01)
-        gae_advantages = (gae_advantages - adv_mean) / adv_std
+        # so advantages and returns are in consistent "fraction of stack" units (~[-1, +1]).
+        # No further normalization needed — stack-fraction scale is clean and bounded.
 
         return {
             'hole_cards': hole_cards,
@@ -1397,6 +1393,7 @@ class NLHESelfPlayTrainer:
             'old_log_probs': old_log_probs,
             'old_action_log_probs': old_action_log_probs,
             'old_sizing_log_probs': old_sizing_log_probs,
+            'old_values': old_values,
             'gae_advantages': gae_advantages,
             'gae_returns': gae_returns,
         }
@@ -1494,7 +1491,7 @@ class NLHESelfPlayTrainer:
         
         loss.backward()
         
-        return loss.item()
+        return loss.item(), action_loss.item(), sizing_loss.item(), value_loss.item()
 
     # ─────────────────────────────────────────────────────────
     # Training loop
@@ -1551,6 +1548,9 @@ class NLHESelfPlayTrainer:
 
             # Mini-batch PPO update
             total_loss = 0.0
+            total_action_loss = 0.0
+            total_sizing_loss = 0.0
+            total_value_loss = 0.0
             num_updates = 0
             if ppo_data is not None:
                 n = len(all_exp)
@@ -1563,14 +1563,20 @@ class NLHESelfPlayTrainer:
                             
                         mb_indices = all_indices[start:start + mini_batch_size]
                         self.optimizer.zero_grad()
-                        loss_val = self._compute_ppo_loss_minibatch(ppo_data, mb_indices)
+                        loss_val, a_loss, s_loss, v_loss = self._compute_ppo_loss_minibatch(ppo_data, mb_indices)
                         nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
                         nn.utils.clip_grad_norm_(self.opponent_encoder.parameters(), 1.0)
                         self.optimizer.step()
                         total_loss += loss_val
+                        total_action_loss += a_loss
+                        total_sizing_loss += s_loss
+                        total_value_loss += v_loss
                         num_updates += 1
 
             avg_loss = total_loss / max(num_updates, 1)
+            avg_a = total_action_loss / max(num_updates, 1)
+            avg_s = total_sizing_loss / max(num_updates, 1)
+            avg_v = total_value_loss / max(num_updates, 1)
 
             # Free experience memory and flush device cache
             del all_exp
@@ -1593,7 +1599,7 @@ class NLHESelfPlayTrainer:
                 print(
                     f"Epoch {epoch + 1:4d} ({epoch_duration:.1f}s, {hands_per_sec:.1f} hands/s) | "
                     f"Reward: {avg_reward:+.3f} bb | "
-                    f"Loss: {avg_loss:.4f} ({num_updates} updates) | "
+                    f"Loss: {avg_loss:.4f} (A:{avg_a:.3f} S:{avg_s:.3f} V:{avg_v:.3f}) | "
                     f"F/Ch/Ca/R/AI: {action_pcts['fold']:.0f}/{action_pcts['check']:.0f}/{action_pcts['call']:.0f}/{action_pcts['raise']:.0f}/{action_pcts['allin']:.0f}% "
                     f"DAI:{deep_ai:.0f}%"
                 )
