@@ -606,14 +606,11 @@ class GameManager:
         sizing_probs = god_mode['sizing']
         legal_types = self.game_state.get_legal_actions()
 
-        from torch.distributions import Categorical
-        dist = Categorical(torch.tensor(probs))
-        a_idx = dist.sample().item()
+        a_idx = self.rng.choices(range(len(probs)), weights=probs, k=1)[0]
 
         sizing_idx = 0
         if a_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
-            s_dist = Categorical(torch.tensor(sizing_probs))
-            sizing_idx = s_dist.sample().item()
+            sizing_idx = self.rng.choices(range(len(sizing_probs)), weights=sizing_probs, k=1)[0]
 
         # Map to Engine Action
         if a_idx == ActionIndex.FOLD and ActionType.FOLD in legal_types:
