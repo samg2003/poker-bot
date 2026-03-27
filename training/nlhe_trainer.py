@@ -782,14 +782,22 @@ class NLHESelfPlayTrainer:
                 action_mask_cpu = encoded['action_mask'].squeeze(0).cpu()
                 legal_indices = action_mask_cpu.nonzero(as_tuple=True)[0].tolist()
 
+                # 1. Sample action
                 if self.rng.random() < epsilon and len(legal_indices) > 1:
                     action_idx = self.rng.choice(legal_indices)
                 else:
                     dist = Categorical(probs)
                     action_idx = dist.sample().item()
 
-                raw_dist = Categorical(raw_probs)
-                action_lp = raw_dist.log_prob(torch.tensor(action_idx)).item()
+                # 2. Compute exact behavior distribution log-prob to prevent PPO ratio explosion
+                behavior_probs = probs.clone().cpu()
+                if len(legal_indices) > 1:
+                    behavior_probs = behavior_probs * (1.0 - epsilon)
+                    for li in legal_indices:
+                        behavior_probs[li] += epsilon / len(legal_indices)
+                
+                behavior_dist = Categorical(behavior_probs)
+                action_lp = behavior_dist.log_prob(torch.tensor(action_idx)).item()
                 sizing_lp = 0.0
 
                 sizing_idx = 0
@@ -804,7 +812,15 @@ class NLHESelfPlayTrainer:
                         s_dist = Categorical(sizing_tensor)
                         sizing_idx = s_dist.sample().item()
 
-                    sizing_lp = Categorical(sizing_tensor).log_prob(torch.tensor(sizing_idx)).item()
+                    # Exact sizing behavior distribution log-prob
+                    behavior_sizing = sizing_tensor.clone().cpu()
+                    if len(legal_sizing) > 1:
+                        behavior_sizing = behavior_sizing * (1.0 - epsilon)
+                        for si in legal_sizing:
+                            behavior_sizing[si] += epsilon / len(legal_sizing)
+                    
+                    s_dist_behavior = Categorical(behavior_sizing)
+                    sizing_lp = s_dist_behavior.log_prob(torch.tensor(sizing_idx)).item()
 
                 log_prob = action_lp + sizing_lp
 
@@ -1372,7 +1388,8 @@ class NLHESelfPlayTrainer:
 
         # Reward is already normalized by effective stack at source (hero_reward /= eff_stack),
         # so advantages and returns are in consistent "fraction of stack" units (~[-1, +1]).
-        # No further normalization needed — stack-fraction scale is clean and bounded.
+        # Mean-centering ONLY (no std div) removes critic bias while preserving stack-depth severity:
+        gae_advantages = gae_advantages - gae_advantages.mean()
 
         return {
             'hole_cards': hole_cards,
@@ -1454,7 +1471,11 @@ class NLHESelfPlayTrainer:
         action_ratio = torch.exp(action_log_probs - old_action_log_probs)
         surr1 = action_ratio * gae_advantages
         surr2 = torch.clamp(action_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
-        action_loss = -torch.min(surr1, surr2).mean()
+        
+        # Dual-clip (PPO-PGA) to rigidly bound loss when A < 0 and ratio is large
+        action_surr = torch.min(surr1, surr2)
+        dual_clip_bound = torch.where(gae_advantages < 0, 3.0 * gae_advantages, torch.full_like(gae_advantages, -float('inf')))
+        action_loss = -torch.max(action_surr, dual_clip_bound).mean()
 
         # Sizing head PPO — only computed on raise experiences to avoid NaN
         # from all-masked (-inf) sizing logits on non-raise actions
@@ -1471,7 +1492,10 @@ class NLHESelfPlayTrainer:
             sizing_ratio = torch.exp(sizing_log_probs - raise_old_slp)
             s_surr1 = sizing_ratio * raise_adv
             s_surr2 = torch.clamp(sizing_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * raise_adv
-            sizing_loss = -torch.min(s_surr1, s_surr2).mean()
+            
+            s_surr = torch.min(s_surr1, s_surr2)
+            raise_dual_clip = torch.where(raise_adv < 0, 3.0 * raise_adv, torch.full_like(raise_adv, -float('inf')))
+            sizing_loss = -torch.max(s_surr, raise_dual_clip).mean()
         else:
             sizing_loss = torch.tensor(0.0, device=self.device)
             sizing_entropy = torch.tensor(0.0, device=self.device)
