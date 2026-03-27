@@ -984,11 +984,12 @@ class NLHESelfPlayTrainer:
 
         self._maybe_reset_histories(table)
 
-        hero_reward = profits[0] / max(self.config.big_blind, 1.0)
+        hero_reward_bb = profits[0] / max(self.config.big_blind, 1.0)
+        # Normalize reward by effective stack: puts everything in "fraction of stack" units
+        # so V(s), advantages, and returns are all on the same ~0-1 scale
+        hero_reward = hero_reward_bb / max(hero_effective_stack_bb, 1.5)
         hero_exp_list = []
         for exp_dict in hero_experiences:
-            # Need to get opponent embeddings back from dict, but actually, precompute calls _get_all_opponent_embeddings!
-            # Wait, precompute doesn't call it, it pulls from Experience.
             hero_exp_list.append(Experience(
                 hole_cards=exp_dict['hole_cards'],
                 community_cards=exp_dict['community_cards'],
@@ -1015,7 +1016,7 @@ class NLHESelfPlayTrainer:
                 sizing_log_prob=exp_dict['sizing_log_prob'],
             ))
 
-        return [hero_exp_list] + [[] for _ in range(num_p - 1)], hero_reward
+        return [hero_exp_list] + [[] for _ in range(num_p - 1)], hero_reward_bb
 
     def _run_batched_epoch(self) -> Tuple[List[Experience], float]:
         self.policy.eval()
@@ -1368,16 +1369,14 @@ class NLHESelfPlayTrainer:
                 gae_advantages[global_idx] = advantages[local_idx]
                 gae_returns[global_idx] = returns[local_idx]
 
-        # Per-hand stack normalization: divide advantages by effective stack
-        # so 20bb and 200bb hands contribute equally to policy gradient
-        for hid, indices in hand_groups.items():
-            eff_stack = experiences[indices[0]].effective_stack_bb
-            for idx in indices:
-                gae_advantages[idx] /= eff_stack
-
-        # Soft cross-batch normalization on top (stabilizes gradient scale)
+        # Reward is already normalized by effective stack at source (hero_reward /= eff_stack),
+        # so advantages and returns are in consistent "fraction of stack" units.
+        # Apply standard advantage normalization (mean-center + std-normalize)
+        # to stabilize gradient scale across batches. Only normalize advantages, NOT returns,
+        # so V(s) learns to predict the true stack-fraction-scale values.
+        adv_mean = gae_advantages.mean().item()
         adv_std = max(gae_advantages.std().item(), 0.01)
-        gae_advantages = gae_advantages / adv_std
+        gae_advantages = (gae_advantages - adv_mean) / adv_std
 
         return {
             'hole_cards': hole_cards,
@@ -1540,7 +1539,7 @@ class NLHESelfPlayTrainer:
             # Batched simulation: all hands run as generators with batched GPU calls
             all_exp, total_reward = self._run_batched_epoch()
 
-            avg_reward = (total_reward / self.config.hands_per_epoch) * 100.0
+            avg_reward = total_reward / self.config.hands_per_epoch
 
             # Action distribution (conditional: % chosen when legal)
             action_pcts = self._count_action_distribution(all_exp)
