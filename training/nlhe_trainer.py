@@ -701,9 +701,15 @@ class NLHESelfPlayTrainer:
                 is_hero_t = torch.tensor([[1.0]] if p_idx == 0 else [[0.0]], device=self.device)
                 
                 # Retrieve the historical opponent trace
-                emb = table.opponent_embeddings.get(p_idx, None)
+                emb = table.opp_embed_cache.get(p_idx, None)
                 if emb is None:
-                    emb = torch.zeros(1, self.config.embed_dim, device=self.device)
+                    hist = table.action_histories.get(p_idx, [])
+                    if len(hist) > 0:
+                        enc = self.opponent_encoder(torch.stack(hist).unsqueeze(0).to(self.device), torch.tensor([len(hist)]))
+                        emb = enc.detach()
+                        table.opp_embed_cache[p_idx] = emb
+                    else:
+                        emb = torch.zeros(1, self.config.embed_dim, device=self.device)
                 else:
                     emb = emb.to(self.device).clone().detach()
                 
