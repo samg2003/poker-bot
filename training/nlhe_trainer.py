@@ -685,6 +685,7 @@ class NLHESelfPlayTrainer:
         player_checked_this_street = [False] * num_p  # per-player check tracking
         first_bet_this_street_by = -1  # who made the first bet/raise this street
         current_street = Street.PREFLOP
+        preflop_folders = set()  # players who folded preflop (for saw_flop)
 
         # Phase 5: Accumulate all raw action tokens during this hand
         hand_action_tokens = []  # list of (raw_token_13d, actor_pid)
@@ -875,15 +876,18 @@ class NLHESelfPlayTrainer:
             bet_frac = action.amount / max(game_state.pot, 1e-6) if action.amount else 0.0
             pot_for_record = game_state.pot / max(game_state.big_blind, 1.0)
 
-            # Track VPIP / PFR (original)
-            if action.action_type in (ActionType.CALL, ActionType.RAISE, ActionType.ALL_IN):
-                hand_records[pid].vpip = True
-            if action.action_type in (ActionType.RAISE, ActionType.ALL_IN):
-                hand_records[pid].pfr = True
+            # Track VPIP / PFR (preflop only)
+            if pre_street == Street.PREFLOP:
+                if action.action_type in (ActionType.CALL, ActionType.RAISE, ActionType.ALL_IN):
+                    hand_records[pid].vpip = True
+                if action.action_type in (ActionType.RAISE, ActionType.ALL_IN):
+                    hand_records[pid].pfr = True
 
             # --- Preflop-specific stats ---
             if pre_street == Street.PREFLOP:
-                if action.action_type in (ActionType.RAISE, ActionType.ALL_IN):
+                if action.action_type == ActionType.FOLD:
+                    preflop_folders.add(pid)
+                elif action.action_type in (ActionType.RAISE, ActionType.ALL_IN):
                     pf_raise_count += 1
                     if pf_raise_count >= 2:
                         hand_records[pid].three_bet = True  # 3-bet (or 4-bet+)
@@ -958,8 +962,7 @@ class NLHESelfPlayTrainer:
         for pid in range(num_p):
             hand_records[pid].result = profits[pid]
             # saw_flop: player didn't fold preflop and hand went past preflop
-            pf_actions = [a for a in game_state.action_history if a.player_idx == pid]
-            hand_records[pid].saw_flop = not any(a.action_type == ActionType.FOLD for a in pf_actions) and game_state.street.value > Street.PREFLOP.value
+            hand_records[pid].saw_flop = (pid not in preflop_folders) and game_state.street.value > Street.PREFLOP.value
             hand_records[pid].was_pf_aggressor = (pf_aggressor == pid)
             hand_records[pid].went_to_showdown = (game_state.street == Street.SHOWDOWN and not game_state.players[pid].is_folded)
             hand_records[pid].won_at_showdown = (hand_records[pid].went_to_showdown and pid in (results.get('winners', [])))
@@ -1165,8 +1168,8 @@ class NLHESelfPlayTrainer:
                         padded_opp_embeds.append(oe)
                         padded_opp_stats.append(os_t)
                         padded_opp_gs.append(og)
-                        m = torch.zeros(1, max_opps, dtype=torch.bool, device=oe.device)
-                        m[0, :n_opp] = True
+                        m = torch.ones(1, max_opps, dtype=torch.bool, device=oe.device)
+                        m[0, :n_opp] = False
                         opp_masks.append(m)
 
                     batch_opp_embed = torch.cat(padded_opp_embeds, dim=0).to(self.device)
@@ -1212,7 +1215,7 @@ class NLHESelfPlayTrainer:
                         total_finished += 1
                         del pending[game_idx]
 
-        return all_exp, total_reward / max(1, num_hands)
+        return all_exp, total_reward
 
 
     def _count_action_distribution(self, experiences: List[Experience]) -> Dict[str, float]:
@@ -1429,32 +1432,34 @@ class NLHESelfPlayTrainer:
         action_entropy = dist.entropy().mean()
 
         is_raise = (action_t == ActionIndex.RAISE)
-        
-        sizing_dist = Categorical(logits=output.bet_size_logits)
-        sizing_log_probs = sizing_dist.log_prob(sizing_t)
-        sizing_entropy = sizing_dist.entropy()
 
-        # Separate old log probs stored from collection — no approximation needed
-        
         # Action head ratio
         action_ratio = torch.exp(action_log_probs - old_action_log_probs)
-        
         surr1 = action_ratio * gae_advantages
         surr2 = torch.clamp(action_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
         action_loss = -torch.min(surr1, surr2).mean()
 
-        # Sizing head PPO (independent ratio)
-        sizing_ratio = torch.exp(sizing_log_probs - old_sizing_log_probs)
-        s_surr1 = sizing_ratio * gae_advantages
-        s_surr2 = torch.clamp(sizing_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
+        # Sizing head PPO — only computed on raise experiences to avoid NaN
+        # from all-masked (-inf) sizing logits on non-raise actions
+        if is_raise.any():
+            raise_logits = output.bet_size_logits[is_raise]
+            raise_sizing_t = sizing_t[is_raise]
+            raise_old_slp = old_sizing_log_probs[is_raise]
+            raise_adv = gae_advantages[is_raise]
+
+            sizing_dist = Categorical(logits=raise_logits)
+            sizing_log_probs = sizing_dist.log_prob(raise_sizing_t)
+            sizing_entropy = sizing_dist.entropy().mean()
+
+            sizing_ratio = torch.exp(sizing_log_probs - raise_old_slp)
+            s_surr1 = sizing_ratio * raise_adv
+            s_surr2 = torch.clamp(sizing_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * raise_adv
+            sizing_loss = -torch.min(s_surr1, s_surr2).mean()
+        else:
+            sizing_loss = torch.tensor(0.0, device=self.device)
+            sizing_entropy = torch.tensor(0.0, device=self.device)
         
-        s_loss_full = -torch.min(s_surr1, s_surr2)
-        s_loss_masked = s_loss_full * is_raise.float()
-        
-        num_raises = is_raise.sum()
-        sizing_loss = s_loss_masked.sum() / torch.clamp(num_raises.float(), min=1.0)
-        
-        entropy = action_entropy + (sizing_entropy * is_raise.float()).mean()
+        entropy = action_entropy + sizing_entropy
         
         value_pred = output.value.squeeze(-1)
         value_loss = torch.nn.functional.smooth_l1_loss(value_pred, gae_returns)
