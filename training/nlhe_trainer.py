@@ -705,7 +705,8 @@ class NLHESelfPlayTrainer:
                 if emb is None:
                     hist = table.action_histories.get(p_idx, [])
                     if len(hist) > 0:
-                        enc = self.opponent_encoder(torch.stack(hist).unsqueeze(0).to(self.device), torch.tensor([len(hist)]))
+                        seq = torch.stack(hist)[-self.opponent_encoder.max_seq_len:]
+                        enc = self.opponent_encoder(seq.unsqueeze(0).to(self.device))
                         emb = enc.detach()
                         table.opp_embed_cache[p_idx] = emb
                     else:
