@@ -11,7 +11,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # --- Defaults ---
 DEFAULT_PEM="$PROJECT_DIR/carte6.pem"
-DEFAULT_IP="54.219.184.157"
+DEFAULT_IP="54.193.114.122"
 DEFAULT_USER="ubuntu"
 
 # --- Config (press Enter for defaults) ---

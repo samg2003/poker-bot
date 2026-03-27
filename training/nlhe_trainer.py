@@ -66,6 +66,7 @@ class Experience(NamedTuple):
     hand_id: int = 0                  # groups decisions into per-hand trajectories
     step_idx: int = 0                 # position within trajectory
     hero_stack_bb: float = 0.0        # hero's starting stack in bb (for deep all-in tracking)
+    effective_stack_bb: float = 1.5   # min(hero_stack, max(opp_stacks)) at hero's first decision; floor=1.5bb
     action_log_prob: float = 0.0      # action-only log prob (for decoupled PPO)
     sizing_log_prob: float = 0.0      # sizing-only log prob (for decoupled PPO, 0 if not raise)
 
@@ -653,6 +654,7 @@ class NLHESelfPlayTrainer:
         game_state = dealer.start_hand()
         hero_experiences: List[dict] = []
         hero_step_idx = 0
+        hero_effective_stack_bb = 1.5  # computed at hero's first decision
 
         # Per-seat opponent assignment
         if not table.seat_pool_idx or len(table.seat_pool_idx) != num_p - 1:
@@ -741,6 +743,18 @@ class NLHESelfPlayTrainer:
 
             if pid == 0:
                 # ── HERO ──
+                # Compute effective stack at hero's first decision
+                if hero_step_idx == 0:
+                    bb = max(self.config.big_blind, 1.0)
+                    hero_stack_bb = p.stack / bb
+                    opp_stacks_bb = [
+                        game_state.players[opid].stack / bb
+                        for opid in range(num_p)
+                        if opid != 0 and not game_state.players[opid].is_folded
+                    ]
+                    max_opp = max(opp_stacks_bb) if opp_stacks_bb else 0.0
+                    hero_effective_stack_bb = max(min(hero_stack_bb, max_opp), 1.5)
+
                 raw_probs = probs.clone()
                 if self.search_engine is not None and self.rng.random() < self.config.search_fraction:
                     street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
@@ -996,6 +1010,7 @@ class NLHESelfPlayTrainer:
                 hand_id=hand_id,
                 step_idx=exp_dict['step_idx'],
                 hero_stack_bb=stacks[0] / self.config.big_blind,
+                effective_stack_bb=hero_effective_stack_bb,
                 action_log_prob=exp_dict['action_log_prob'],
                 sizing_log_prob=exp_dict['sizing_log_prob'],
             ))
@@ -1353,9 +1368,15 @@ class NLHESelfPlayTrainer:
                 gae_advantages[global_idx] = advantages[local_idx]
                 gae_returns[global_idx] = returns[local_idx]
 
-        # Soft advantage normalization: scale magnitude without changing sign
-        # Floor of 1.0 lets big mistakes teach louder, just not 900x louder
-        adv_std = max(gae_advantages.std().item(), 1.0)
+        # Per-hand stack normalization: divide advantages by effective stack
+        # so 20bb and 200bb hands contribute equally to policy gradient
+        for hid, indices in hand_groups.items():
+            eff_stack = experiences[indices[0]].effective_stack_bb
+            for idx in indices:
+                gae_advantages[idx] /= eff_stack
+
+        # Soft cross-batch normalization on top (stabilizes gradient scale)
+        adv_std = max(gae_advantages.std().item(), 0.01)
         gae_advantages = gae_advantages / adv_std
 
         return {
