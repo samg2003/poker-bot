@@ -12,6 +12,13 @@ from __future__ import annotations
 
 from itertools import combinations
 from typing import List, Tuple
+import random
+
+try:
+    import eval7
+    HAS_EVAL7 = True
+except ImportError:
+    HAS_EVAL7 = False
 
 
 # Hand categories (higher = better)
@@ -175,3 +182,91 @@ class HandEvaluator:
     def hand_to_str(cls, rank: int) -> str:
         """Human-readable hand description."""
         return cls.get_category_name(rank)
+
+class Eval7Evaluator:
+    """Fast C++ EV and Showdown calculator binding."""
+    
+    RANK_CHARS = "23456789TJQKA"
+    SUIT_CHARS = "cdhs"
+
+    @classmethod
+    def int_to_eval7(cls, card_int: int):
+        """Convert engine integer 0-51 (2c...As) to eval7 Card."""
+        if card_int < 0 or card_int > 51:
+            return None
+        r = card_int // 4
+        s = card_int % 4
+        return eval7.Card(f"{cls.RANK_CHARS[r]}{cls.SUIT_CHARS[s]}")
+
+    @classmethod
+    def ints_to_eval7_list(cls, card_ints: List[int]):
+        return [cls.int_to_eval7(c) for c in card_ints if c >= 0]
+
+    @classmethod
+    def get_equity(cls, known_hands: List[List[int]], board: List[int], runouts: int = 1000) -> List[float]:
+        """
+        Calculates multi-way Monte Carlo EV dynamically.
+        Pass lists of integers.
+        """
+        if not HAS_EVAL7:
+            raise ImportError("eval7 not installed. Please run `pip install eval7`.")
+            
+        e7_hands = [cls.ints_to_eval7_list(h) for h in known_hands]
+        e7_board = cls.ints_to_eval7_list(board)
+        
+        wins = [0.0] * len(known_hands)
+        deck = eval7.Deck()
+        
+        # Remove dead cards
+        dead_cards = e7_board.copy()
+        for h in e7_hands:
+            dead_cards.extend(h)
+            
+        for c in dead_cards:
+            deck.cards.remove(c)
+            
+        cards_needed = 5 - len(e7_board)
+        deck_list = deck.cards
+        
+        for _ in range(runouts):
+            # Sample remaining board
+            if cards_needed > 0:
+                sim_board = e7_board + random.sample(deck_list, cards_needed)
+            else:
+                sim_board = e7_board
+                
+            best_score = -1
+            winners = []
+            for i, h in enumerate(e7_hands):
+                score = eval7.evaluate(sim_board + h)
+                if score > best_score:
+                    best_score = score
+                    winners = [i]
+                elif score == best_score:
+                    winners.append(i)
+                    
+            for w in winners:
+                wins[w] += 1.0 / len(winners)
+                
+        return [w / runouts for w in wins]
+
+    @classmethod
+    def get_showdown_winners(cls, known_hands: List[List[int]], board: List[int]) -> List[int]:
+        """Instant exact evaluation for a fully dealt board. Returns indices of winners (handles splits)."""
+        if not HAS_EVAL7:
+            raise ImportError("eval7 not installed.")
+            
+        e7_hands = [cls.ints_to_eval7_list(h) for h in known_hands]
+        e7_board = cls.ints_to_eval7_list(board)
+        
+        best_score = -1
+        winners = []
+        for i, h in enumerate(e7_hands):
+            score = eval7.evaluate(e7_board + h)
+            if score > best_score:
+                best_score = score
+                winners = [i]
+            elif score == best_score:
+                winners.append(i)
+                
+        return winners
