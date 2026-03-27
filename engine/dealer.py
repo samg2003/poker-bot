@@ -126,39 +126,46 @@ class Dealer:
         """Evaluate hands and distribute pot(s)."""
         assert self.state is not None
 
-        # Deal remaining board cards if needed (everyone all-in before river)
+        from engine.hand_evaluator import Eval7Evaluator
+
+        side_pots = self.state.calculate_side_pots()
+        if not side_pots:
+            return
+
+        # 1. Secretly calculate the A.I.'s EV *before* the RNG cards are dealt 
+        #    so we can feed it to the Trainer, without ruining the real game physics!
+        self.ev_profits = [-p.bet_total for p in self.state.players]
+        use_ev = len(self.state.board) < 5
+        
+        for pot_amount, eligible in side_pots:
+            eligible_hands = [list(self.state.players[i].hole_cards) for i in eligible]
+            if use_ev:
+                equities = Eval7Evaluator.get_equity(eligible_hands, self.state.board, runouts=1000)
+                for idx, e_idx in enumerate(eligible):
+                    self.ev_profits[e_idx] += pot_amount * equities[idx]
+            else:
+                winners_idx = Eval7Evaluator.get_showdown_winners(eligible_hands, self.state.board)
+                for w_idx in winners_idx:
+                    self.ev_profits[eligible[w_idx]] += pot_amount / len(winners_idx)
+
+        # 2. Complete the physical board (The Casino RNG)
         while len(self.state.board) < 5:
             self._next_card_idx += 1  # burn
             self.state.board.append(self.deck[self._next_card_idx])
             self._next_card_idx += 1
 
-        # Calculate side pots
-        side_pots = self.state.calculate_side_pots()
-
-        if not side_pots:
-            return
-
-        # Evaluate hands for all players in the hand
-        hand_ranks: Dict[int, int] = {}
-        for i, p in enumerate(self.state.players):
-            if p.is_in_hand:
-                cards = list(p.hole_cards) + self.state.board
-                hand_ranks[i] = self.evaluator.evaluate_7(cards)
-
-        # Distribute each pot
+        # 3. Distribute the ACTUAL, PHYSICAL chips to the players based purely 
+        #    on who actually won the dealt cards (Strict 100% Poker Rules)
         winners_all = []
         for pot_amount, eligible in side_pots:
-            # Find best hand among eligible
-            best_rank = max(hand_ranks[i] for i in eligible if i in hand_ranks)
-            pot_winners = [i for i in eligible
-                          if i in hand_ranks and hand_ranks[i] == best_rank]
-
-            # Split pot among winners
-            share = pot_amount / len(pot_winners)
-            for w in pot_winners:
-                self.state.players[w].stack += share
-                if w not in winners_all:
-                    winners_all.append(w)
+            eligible_hands = [list(self.state.players[i].hole_cards) for i in eligible]
+            winners_idx = Eval7Evaluator.get_showdown_winners(eligible_hands, self.state.board)
+            share = pot_amount / len(winners_idx)
+            for w_idx in winners_idx:
+                actual_player = eligible[w_idx]
+                self.state.players[actual_player].stack += share
+                if actual_player not in winners_all:
+                    winners_all.append(actual_player)
 
         self.state.pot = 0
         self.state.winners = winners_all
@@ -167,13 +174,19 @@ class Dealer:
         """Get hand results after showdown."""
         assert self.state is not None and self.state.is_hand_over
 
+        # Absolute physical profit
+        profit = [
+            self.state.players[i].stack - self.initial_stacks[i]
+            for i in range(self.num_players)
+        ]
+
         results = {
             'winners': self.state.winners,
             'final_stacks': [p.stack for p in self.state.players],
-            'profit': [
-                self.state.players[i].stack - self.initial_stacks[i]
-                for i in range(self.num_players)
-            ],
+            'profit': profit,
+            # Pass the secret EV mathematically calculated during showdown.
+            # If the hand never reached showdown (someone folded), EV is exactly equal to profit! 
+            'ev_profit': getattr(self, 'ev_profits', profit),
             'board': [GameState.card_to_str(c) for c in self.state.board],
         }
 

@@ -989,6 +989,11 @@ class NLHESelfPlayTrainer:
         # --- End of hand: populate remaining fields ---
         results = dealer.get_results()
         profits = results['profit']
+        
+        # The mathematically extracted EV profit computed out of Eval7
+        # Falls back to regular profit if the hand ended in a fold.
+        ev_profits = results.get('ev_profit', profits)
+
         for pid in range(num_p):
             hand_records[pid].result = profits[pid]
             # saw_flop: player didn't fold preflop and hand went past preflop
@@ -1000,7 +1005,8 @@ class NLHESelfPlayTrainer:
 
         self._maybe_reset_histories(table)
 
-        hero_reward_bb = profits[0] / max(self.config.big_blind, 1.0)
+        # Train PPO purely on the Expected Value mathematically calculated at showdown!
+        hero_reward_bb = ev_profits[0] / max(self.config.big_blind, 1.0)
         # Normalize reward by effective stack: puts everything in "fraction of stack" units
         # so V(s), advantages, and returns are all on the same ~0-1 scale
         hero_reward = hero_reward_bb / max(hero_effective_stack_bb, 1.5)

@@ -196,9 +196,6 @@ class GameState:
         # Can raise if we have more than just calling
         if p.stack > to_call:
             actions.append(ActionType.RAISE)
-
-        # All-in is always available (as a special raise/call)
-        if p.stack > 0:
             actions.append(ActionType.ALL_IN)
 
         return actions
