@@ -1488,7 +1488,7 @@ class NLHESelfPlayTrainer:
         entropy_coef = self._get_entropy_coef()
         loss = (
             action_loss
-            + 0.5 * sizing_loss  # sizing weighted slightly less
+            + sizing_loss  # equal weight — sizing quality determines raise outcomes
             + self.config.value_coef * value_loss
             - entropy_coef * entropy
         )
