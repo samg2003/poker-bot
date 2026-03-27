@@ -1381,11 +1381,13 @@ class NLHESelfPlayTrainer:
         opp_stat_list = []
         opp_gs_list = []
         opp_mask_list = []
+        opp_prof_list = []
         
         for e in experiences:
             emb = e.opponent_embeddings
             stat = e.opponent_stats
             gs = e.opponent_game_state
+            prof = e.opponent_profiles
             
             curr_opps = emb.shape[1]
             pad_len = max_opps - curr_opps
@@ -1394,10 +1396,12 @@ class NLHESelfPlayTrainer:
                 emb_pad = torch.zeros(1, pad_len, emb.shape[2])
                 stat_pad = torch.zeros(1, pad_len, stat.shape[2])
                 gs_pad = torch.zeros(1, pad_len, OPP_GAME_STATE_DIM)
+                prof_pad = torch.zeros(pad_len, prof.shape[1] if len(prof.shape) > 1 else PROFILE_DIM)
                 
                 emb = torch.cat([emb, emb_pad], dim=1)
                 stat = torch.cat([stat, stat_pad], dim=1)
                 gs = torch.cat([gs, gs_pad], dim=1)
+                prof = torch.cat([prof, prof_pad], dim=0)
                 
                 mask = torch.tensor([[False]*curr_opps + [True]*pad_len], dtype=torch.bool)
             else:
@@ -1407,18 +1411,20 @@ class NLHESelfPlayTrainer:
             opp_stat_list.append(stat)
             opp_gs_list.append(gs)
             opp_mask_list.append(mask)
+            opp_prof_list.append(prof.unsqueeze(0))
             
         opp_embeds = torch.cat(opp_emb_list, dim=0)
         opp_stats = torch.cat(opp_stat_list, dim=0)
         opp_gs = torch.cat(opp_gs_list, dim=0)
         opp_masks = torch.cat(opp_mask_list, dim=0)
+        opp_profiles = torch.cat(opp_prof_list, dim=0)
         
         # 3. Stack hand action history (already padded to MAX_HAND_ACTIONS)
         hand_action_seqs = torch.cat([e.hand_action_seq for e in experiences], dim=0)
         hand_action_lens = torch.cat([e.hand_action_len for e in experiences], dim=0)
         actor_profiles_seqs = torch.cat([e.actor_profiles_seq for e in experiences], dim=0)
         hero_profiles = torch.stack([e.hero_profile for e in experiences], dim=0)
-        opp_profiles = torch.stack([e.opponent_profiles for e in experiences], dim=0)
+        # opp_profiles already padded and stacked above
 
         # 4. Stack targets (keep on CPU)
         action_t = torch.tensor([e.action_idx for e in experiences], dtype=torch.long)
