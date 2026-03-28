@@ -159,6 +159,7 @@ def train_nlhe(args):
         verbose=args.verbose,
         batch_chunk_size=args.batch_chunk_size,
         seed=args.seed,
+        frozen_update_interval=args.save_interval,
     )
     
     if args.entropy is not None:
