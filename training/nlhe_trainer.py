@@ -720,13 +720,15 @@ class NLHESelfPlayTrainer:
                 embs.append(emb.squeeze(0))
                 stats_list.append(table.stat_tracker.get_stats(p_idx).to(self.device).squeeze(0))
                 
-            # Execute 1 massively parallel GPU kernel instead of N loops
+            # Execute impressively parallel GPU kernels for both perspectives
             embs_t = torch.stack(embs, dim=0) # (num_p, 128)
             stats_t = torch.stack(stats_list, dim=0) # (num_p, 30)
-            heroes_t = torch.tensor(heroes, device=self.device) # (num_p, 1)
             
-            player_profiles = self.policy.profile_builder(embs_t, stats_t, heroes_t) # (num_p, 64)
-        current_actor_profiles_seq = torch.zeros(1, MAX_HAND_ACTIONS, PROFILE_DIM, device=self.device)
+            heroes_ones = torch.ones(num_p, 1, device=self.device)
+            heroes_zeros = torch.zeros(num_p, 1, device=self.device)
+            
+            profiles_as_hero = self.policy.profile_builder(embs_t, stats_t, heroes_ones) # (num_p, 64)
+            profiles_as_opp = self.policy.profile_builder(embs_t, stats_t, heroes_zeros) # (num_p, 64)
 
         while not dealer.is_hand_over():
             pid = game_state.current_player_idx
@@ -757,6 +759,11 @@ class NLHESelfPlayTrainer:
                 tokens = [t for t, _ in hand_action_tokens[-MAX_HAND_ACTIONS:]]
                 ha_seq[0, :len(tokens)] = torch.stack(tokens)
 
+            # Construct subjective historical actor profiles
+            actor_profiles_seq = torch.zeros(1, MAX_HAND_ACTIONS, PROFILE_DIM, device=self.device)
+            for i, (_, apid) in enumerate(hand_action_tokens[-MAX_HAND_ACTIONS:]):
+                actor_profiles_seq[0, i] = profiles_as_hero[apid] if apid == pid else profiles_as_opp[apid]
+
             # Yield for batched inference (both hero and frozen opponents)
             probs, value, sizing_probs, opp_embed_tensor = yield {
                 'hole_cards': encoded['hole_cards'],
@@ -767,9 +774,9 @@ class NLHESelfPlayTrainer:
                 'opponent_game_state': opp_game_state,
                 'hand_action_seq': ha_seq,
                 'hand_action_len': ha_len,
-                'actor_profiles_seq': current_actor_profiles_seq.clone(),
-                'hero_profile': player_profiles[0],
-                'opponent_profiles': player_profiles[opp_ids],
+                'actor_profiles_seq': actor_profiles_seq,
+                'hero_profile': profiles_as_hero[pid],
+                'opponent_profiles': profiles_as_opp[opp_ids],
                 '_hand_action_pids': [apid for _, apid in hand_action_tokens[-MAX_HAND_ACTIONS:]],
                 'action_mask': encoded['action_mask'],
                 'sizing_mask': encoded['sizing_mask'],
@@ -873,9 +880,9 @@ class NLHESelfPlayTrainer:
                     'opponent_game_state': opp_game_state.detach().cpu(),
                     'hand_action_seq': ha_seq.detach().cpu(),
                     'hand_action_len': ha_len.detach().cpu(),
-                    'actor_profiles_seq': current_actor_profiles_seq.clone().detach().cpu(),
-                    'hero_profile': player_profiles[0].detach().cpu(),
-                    'opponent_profiles': player_profiles[opp_ids].detach().cpu(),
+                    'actor_profiles_seq': actor_profiles_seq.detach().cpu(),
+                    'hero_profile': profiles_as_hero[0].detach().cpu(),
+                    'opponent_profiles': profiles_as_opp[opp_ids].detach().cpu(),
                     '_hand_action_pids': [apid for _, apid in hand_action_tokens[-MAX_HAND_ACTIONS:]],
                     'action_mask': encoded['action_mask'].detach().cpu(),
                     'sizing_mask': encoded['sizing_mask'].detach().cpu(),
@@ -1021,8 +1028,6 @@ class NLHESelfPlayTrainer:
                 hand_boundary=is_hand_boundary,
             )
             hand_action_tokens.append((raw_token, pid))
-            if len(hand_action_tokens) <= MAX_HAND_ACTIONS:
-                current_actor_profiles_seq[0, len(hand_action_tokens) - 1] = player_profiles[pid]
 
             # Detect street transitions to reset per-street state
             if game_state.street != current_street:
