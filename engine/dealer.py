@@ -140,7 +140,7 @@ class Dealer:
         for pot_amount, eligible in side_pots:
             eligible_hands = [list(self.state.players[i].hole_cards) for i in eligible]
             if use_ev:
-                equities = Eval7Evaluator.get_equity(eligible_hands, self.state.board, runouts=1000)
+                equities = Eval7Evaluator.get_equity(eligible_hands, self.state.board, runouts=200)
                 for idx, e_idx in enumerate(eligible):
                     self.ev_profits[e_idx] += pot_amount * equities[idx]
             else:
