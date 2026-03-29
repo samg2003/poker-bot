@@ -148,7 +148,7 @@ class NLHETrainingConfig:
 
     # PPO modifications
     remove_clip: bool = False     # Use KL Penalty instead of hard clipping
-    kl_beta: float = 0.02         # Coefficient for KL penalty when clip is removed
+    kl_beta: float = 1.0          # Coefficient for KL penalty when clip is removed
 
 
 @dataclass

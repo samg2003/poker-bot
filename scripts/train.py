@@ -258,7 +258,7 @@ def main():
                         help='Constant entropy coefficient (overrides default decay)')
     parser.add_argument('--remove-clip', action='store_true',
                         help='Removes PPO hard clipping and uses KL divergence penalty instead')
-    parser.add_argument('--kl-beta', type=float, default=0.02,
+    parser.add_argument('--kl-beta', type=float, default=1.0,
                         help='KL penalty coefficient if --remove-clip is used')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
