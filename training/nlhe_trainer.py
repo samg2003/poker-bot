@@ -146,6 +146,10 @@ class NLHETrainingConfig:
     # Seed
     seed: int = 42
 
+    # PPO modifications
+    remove_clip: bool = False     # Use KL Penalty instead of hard clipping
+    kl_beta: float = 0.02         # Coefficient for KL penalty when clip is removed
+
 
 @dataclass
 class TableState:
@@ -1613,16 +1617,19 @@ class NLHESelfPlayTrainer:
 
         # Action head ratio
         action_ratio = torch.exp(action_log_probs - old_action_log_probs)
-        surr1 = action_ratio * gae_advantages
-        surr2 = torch.clamp(action_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
         
-        # Dual-clip (PPO-PGA) to rigidly bound loss when A < 0 and ratio is large
-        action_surr = torch.min(surr1, surr2)
-        dual_clip_bound = torch.where(gae_advantages < 0, 3.0 * gae_advantages, torch.full_like(gae_advantages, -float('inf')))
-        action_loss = -torch.max(action_surr, dual_clip_bound).mean()
+        if self.config.remove_clip:
+            approx_kl = old_action_log_probs - action_log_probs
+            action_surr = action_ratio * gae_advantages
+            action_loss = -action_surr.mean() + (self.config.kl_beta * approx_kl.mean())
+        else:
+            surr1 = action_ratio * gae_advantages
+            surr2 = torch.clamp(action_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
+            action_surr = torch.min(surr1, surr2)
+            dual_clip_bound = torch.where(gae_advantages < 0, 3.0 * gae_advantages, torch.full_like(gae_advantages, -float('inf')))
+            action_loss = -torch.max(action_surr, dual_clip_bound).mean()
 
         # Sizing head PPO — only computed on raise experiences to avoid NaN
-        # from all-masked (-inf) sizing logits on non-raise actions
         if is_raise.any():
             raise_logits = output.bet_size_logits[is_raise]
             raise_sizing_t = sizing_t[is_raise]
@@ -1634,12 +1641,17 @@ class NLHESelfPlayTrainer:
             sizing_entropy = sizing_dist.entropy().mean()
 
             sizing_ratio = torch.exp(sizing_log_probs - raise_old_slp)
-            s_surr1 = sizing_ratio * raise_adv
-            s_surr2 = torch.clamp(sizing_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * raise_adv
             
-            s_surr = torch.min(s_surr1, s_surr2)
-            raise_dual_clip = torch.where(raise_adv < 0, 3.0 * raise_adv, torch.full_like(raise_adv, -float('inf')))
-            sizing_loss = -torch.max(s_surr, raise_dual_clip).mean()
+            if self.config.remove_clip:
+                s_approx_kl = raise_old_slp - sizing_log_probs
+                s_surr = sizing_ratio * raise_adv
+                sizing_loss = -s_surr.mean() + (self.config.kl_beta * s_approx_kl.mean())
+            else:
+                s_surr1 = sizing_ratio * raise_adv
+                s_surr2 = torch.clamp(sizing_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * raise_adv
+                s_surr = torch.min(s_surr1, s_surr2)
+                raise_dual_clip = torch.where(raise_adv < 0, 3.0 * raise_adv, torch.full_like(raise_adv, -float('inf')))
+                sizing_loss = -torch.max(s_surr, raise_dual_clip).mean()
         else:
             sizing_loss = torch.tensor(0.0, device=self.device)
             sizing_entropy = torch.tensor(0.0, device=self.device)

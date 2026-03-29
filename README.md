@@ -149,6 +149,8 @@ Epoch   5 (21.7s, 23.0 hands/s) | Reward: +7.681 bb | Loss: 0.8669 | F/Ch/Ca/R/A
 --resume TAG            Resume training from checkpoint tag
 --checkpoint-dir DIR    Where to save checkpoints (default: checkpoints/)
 --lr FLOAT              Learning rate (default: 3e-4)
+--remove-clip           Use soft PPO-Penalty (KL divergence) instead of 0.2 hard clipping
+--kl-beta FLOAT         PPO-Penalty coefficient (default: 0.02)
 --seed N                Random seed (default: 42)
 ```
 

@@ -160,7 +160,10 @@ def train_nlhe(args):
         batch_chunk_size=args.batch_chunk_size,
         seed=args.seed,
         frozen_update_interval=args.save_interval,
+        remove_clip=args.remove_clip,
+        kl_beta=args.kl_beta,
     )
+
     
     if args.entropy is not None:
         config.entropy_coef = args.entropy
@@ -253,8 +256,13 @@ def main():
                         help='Ending exploration rate')
     parser.add_argument('--entropy', type=float, default=None,
                         help='Constant entropy coefficient (overrides default decay)')
+    parser.add_argument('--remove-clip', action='store_true',
+                        help='Removes PPO hard clipping and uses KL divergence penalty instead')
+    parser.add_argument('--kl-beta', type=float, default=0.02,
+                        help='KL penalty coefficient if --remove-clip is used')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+
 
     # Architecture
     parser.add_argument('--embed-dim', type=int, default=64,
