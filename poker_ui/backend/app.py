@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -13,6 +14,18 @@ from model.opponent_encoder import OpponentEncoder
 from deployment.checkpoint import CheckpointManager
 from engine.game_state import Action, ActionType, Street
 from poker_ui.backend.game_manager import GameManager, TimelineSnapshot
+
+def _sanitize_floats(obj):
+    """Recursively replace NaN/inf floats with 0.0 so JSON serialization works."""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0.0
+        return obj
+    elif isinstance(obj, dict):
+        return {k: _sanitize_floats(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_sanitize_floats(x) for x in obj]
+    return obj
 
 app = FastAPI(title="Goated Poker AI")
 
@@ -122,7 +135,7 @@ def _serialize_snapshot(snap: TimelineSnapshot):
     god_mode_remapped = {}
     for eng_idx, data in snap.god_mode.items():
         if eng_idx < len(seat_map):
-            god_mode_remapped[seat_map[eng_idx]] = data
+            god_mode_remapped[seat_map[eng_idx]] = _sanitize_floats(data)
 
     terminal = game_manager.dealer.is_hand_over() if game_manager.dealer else False
     results = None
@@ -212,6 +225,19 @@ def step_ai():
         
     took_action = game_manager.step_ai()
     return {"took_action": took_action, "state": get_state()}
+
+@app.get("/api/step_until_human")
+def step_until_human():
+    """Batch-run ALL AI actions until it's the human's turn or the hand is over."""
+    global game_manager
+    if not game_manager.timeline:
+        raise HTTPException(status_code=400, detail="Game not started")
+    
+    actions = game_manager.step_all_ai()
+    return {
+        "actions": actions,
+        "state": get_state(),
+    }
 
 @app.post("/api/action")
 def human_action(req: ActionRequest):

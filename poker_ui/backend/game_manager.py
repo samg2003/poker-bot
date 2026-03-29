@@ -637,6 +637,65 @@ class GameManager:
         self.process_action(act)
         return True
 
+    def step_all_ai(self) -> list:
+        """Run ALL AI actions until it's the human's turn or the hand is over.
+        
+        Returns a list of dicts, each containing:
+          - action: {type, amount}
+          - actor_seat: table seat of the player who acted
+          - street_changed: bool, whether a new street was dealt
+        """
+        actions_taken = []
+        prev_street = self.game_state.street if self.game_state else None
+
+        while True:
+            terminal = self.dealer.is_hand_over()
+            if terminal:
+                break
+
+            eng_idx = self.game_state.current_player_idx
+            seat_idx = self.seat_map[eng_idx]
+
+            # Stop when it's the human's turn
+            if seat_idx == self.human_seat:
+                break
+
+            took = self.step_ai()
+            if not took:
+                # step_ai failed (god_mode None, etc.) — force a fallback action
+                legal = self.game_state.get_legal_actions()
+                if ActionType.CHECK in legal:
+                    fallback = Action(ActionType.CHECK)
+                elif ActionType.CALL in legal:
+                    fallback = Action(ActionType.CALL)
+                else:
+                    fallback = Action(ActionType.FOLD)
+                self.process_action(fallback)
+                actions_taken.append({
+                    'action': {'type': fallback.action_type.name, 'amount': fallback.amount},
+                    'actor_seat': seat_idx,
+                    'street_changed': self.game_state.street != prev_street,
+                })
+                prev_street = self.game_state.street
+                continue
+
+            # Retrieve the last action from the timeline
+            last_snap = self.timeline[-1] if self.timeline else None
+            last_action = last_snap.action if last_snap else None
+
+            cur_street = self.game_state.street
+            actions_taken.append({
+                'action': {
+                    'type': last_action.action_type.name if last_action else 'UNKNOWN',
+                    'amount': last_action.amount if last_action else 0,
+                },
+                'actor_seat': seat_idx,
+                'street_changed': cur_street != prev_street,
+            })
+            prev_street = cur_street
+
+        return actions_taken
+
     def get_table_info(self) -> List[Dict[str, Any]]:
         """Returns info about all 9 seats for the frontend."""
         result = []

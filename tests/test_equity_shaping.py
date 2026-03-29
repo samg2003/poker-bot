@@ -56,8 +56,8 @@ class TestComputeHeroEV:
         state = dealer.start_hand()
         # Both players have posted blinds, pot is ~1.5
         ev = trainer._compute_hero_ev(state, hero_idx=0)
-        # EV should be between 0 and pot
-        assert 0 <= ev <= state.pot + 0.1
+        # EV should be between -m_sunk_cost and pot
+        assert -0.6 <= ev <= state.pot + 0.1
 
     def test_3way_side_pot(self, trainer):
         """Short stack creates a side pot. Hero's EV correctly accounts for pot layers."""
@@ -74,7 +74,8 @@ class TestComputeHeroEV:
 
         # Now compute hero EV — should correctly split across side pots
         ev = trainer._compute_hero_ev(state, hero_idx=0)
-        assert ev >= 0  # EV must be non-negative when hero hasn't folded
+        # Hero invested 20bb. Gross EV is >= 0. Net EV can be down to -20.
+        assert ev >= -21.0  # Hero max loss is their 20bb investment
 
     def test_hero_folded_ev_zero(self, trainer):
         """If hero folded, hero_ev = 0 (not eligible for any pot)."""
@@ -83,7 +84,8 @@ class TestComputeHeroEV:
         # Hero folds
         state.apply_action(Action(ActionType.FOLD))
         ev = trainer._compute_hero_ev(state, hero_idx=0)
-        assert ev == 0.0
+        # Net EV = gross EV - sunk costs. It can be down to -0.5 (SB) and up to pot - 0.5.
+        assert -0.6 <= ev <= state.pot + 0.1
 
     def test_ev_matches_dealer_showdown(self, trainer):
         """Hero EV at showdown should approximately match dealer's ev_profit."""
@@ -137,7 +139,7 @@ class TestRewardScenarios:
         # (Net effect depends on hero's actual cards — but the test verifies
         # the computation runs and returns a reasonable number)
         assert isinstance(ev_after_raise, float)
-        assert ev_after_raise >= 0
+        assert ev_after_raise > -3.0
 
     def test_fold_ev_drops_to_zero(self, trainer):
         """After hero folds, hero_ev = 0."""
@@ -145,12 +147,14 @@ class TestRewardScenarios:
         state = dealer.start_hand()
 
         ev_before = trainer._compute_hero_ev(state, hero_idx=0)
-        assert ev_before > 0  # Hero should have some equity preflop
+        # Net EV might be slightly negative if hero invested SB (0.5) but has poor equity
+        assert ev_before > -1.0  # Hero should have some gross equity, making net EV > -1.0
 
         # Hero folds
         state.apply_action(Action(ActionType.FOLD))
         ev_after = trainer._compute_hero_ev(state, hero_idx=0)
-        assert ev_after == 0.0  # Hero is out
+        # Hero is out, sunk cost is 0.5bb
+        assert ev_after == pytest.approx(-0.5, abs=0.01)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -286,12 +290,9 @@ class TestResidualTargets:
             # After all-in: pot = 100bb, hero investment = 50bb
             #
             # The V_res target in training is: terminal_reward - equity_at_decision
-            # terminal_reward = ev_profit / bb / eff_stack (normalized)
-            # equity_at_decision = hero_ev_at_decision / bb / eff_stack (normalized)
             # Both scale the same way, so we compare unnormalized:
-            # residual_target = ev_profit[0] - (hero_ev_at_decision - bet_total_at_decision)
-            hero_bet_at_decision = state.players[0].bet_total
-            residual = ev_profit[0] - (hero_ev_at_decision - hero_bet_at_decision)
+            # residual_target = ev_profit[0] - hero_ev_at_decision (which is already net EV)
+            residual = ev_profit[0] - hero_ev_at_decision
             residuals.append(abs(residual))
 
         # Average residual across many hands should be moderate

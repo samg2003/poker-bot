@@ -33,8 +33,7 @@ export default function ActionBar({ gameState, isLive, onSubmitAction }) {
   const clampRaise = (val) => Math.max(minr, Math.min(val, maxr))
 
   const presetTo = (fraction) => {
-    const potAfterCall = potSize + callAmount
-    setRaiseAmount(clampRaise(Math.round(currentBet + fraction * potAfterCall)))
+    setRaiseAmount(clampRaise(Math.round(fraction * potSize)))
   }
 
   const handleInputChange = (e) => {

@@ -66,6 +66,7 @@ function App() {
 
   const fetchTimeline = async (idx) => {
     if (idx < 0 || idx >= totalSteps) return
+    cancelledRef.current = true  // Stop any running animation
     playNavigateSound()
     const data = await apiGet(`/timeline/${idx}`)
     if (data && data.snapshot) {
@@ -78,58 +79,80 @@ function App() {
     }
   }
 
-  const stepTimeoutRef = useRef(null)
-  const isSteppingRef = useRef(false)
+  // ─── Robust AI stepping: batch on server, animate on client ───
+  const isAnimatingRef = useRef(false)
+  const cancelledRef = useRef(false)
 
-  const timelineIdxRef = useRef(timelineIdx)
-  const totalStepsRef = useRef(totalSteps)
-  const gameStateRef = useRef(gameState)
-  useEffect(() => { timelineIdxRef.current = timelineIdx }, [timelineIdx])
-  useEffect(() => { totalStepsRef.current = totalSteps }, [totalSteps])
-  useEffect(() => { gameStateRef.current = gameState }, [gameState])
+  const runAISteps = async () => {
+    // Guard: only one animation loop at a time
+    if (isAnimatingRef.current) return
+    isAnimatingRef.current = true
+    cancelledRef.current = false
 
-  const stepAI = async () => {
-    if (timelineIdxRef.current < totalStepsRef.current - 1) return
-    const gs = gameStateRef.current
-    if (!gs || gs.is_terminal) return
-    const currentSeat = gs.current_player
-    const currentPlayer = gs.players.find(p => p.id === currentSeat)
-    if (!currentPlayer || currentPlayer.is_human) return
-    if (isSteppingRef.current) return
-    
-    isSteppingRef.current = true
-    stepTimeoutRef.current = setTimeout(async () => {
-      try {
-        const data = await apiGet('/step')
-        if (data && data.took_action) {
-          const newGs = data.state.snapshot;
-          setGameState(newGs)
-          setTimelineIdx(data.state.timeline_index)
-          setTotalSteps(data.state.total_steps)
-          
-          if (data.state.snapshot.last_action) {
-            const actionType = data.state.snapshot.last_action.type
-            playActionSound(actionType)
-            const amt = data.state.snapshot.last_action.amount
-            log(`[Bot] played ${actionType} ${amt != null ? amt.toFixed(2) : ''}`)
-          }
+    try {
+      // 1. Ask server to batch-run all AI actions
+      const data = await apiGet('/step_until_human')
+      if (!data) return
 
-          if (gs.street && newGs.street && gs.street !== newGs.street) {
-             await new Promise(r => setTimeout(r, 1500));
-          }
-        } else {
-          // If the backend threw a 500 or failed to take action during AI turn,
-          // refresh the state after 2 seconds to restart the useEffect polling loop!
-          setTimeout(refreshState, 2000);
-        }
-      } catch (e) {
-        console.error('stepAI error:', e)
-        setTimeout(refreshState, 2000);
-      } finally {
-        isSteppingRef.current = false
+      const actions = data.actions || []
+      const finalState = data.state
+      if (!finalState?.snapshot) return
+
+      const newTotalSteps = finalState.total_steps
+      const startIdx = newTotalSteps - actions.length
+
+      // 2. Animate each step with delays
+      for (let i = 0; i < actions.length; i++) {
+        if (cancelledRef.current) break  // User navigated away
+
+        const tIdx = startIdx + i
+        const snapData = await apiGet(`/timeline/${tIdx}`)
+        if (!snapData?.snapshot) break
+
+        setGameState(snapData.snapshot)
+        setTimelineIdx(snapData.timeline_index)
+        setTotalSteps(newTotalSteps)
+
+        // Sound + log
+        const act = actions[i]
+        playActionSound(act.action?.type || '')
+        const amt = act.action?.amount
+        const seatPlayer = snapData.snapshot.players?.find(p => p.id === act.actor_seat)
+        const name = seatPlayer?.name || `Seat ${act.actor_seat}`
+        log(`[${name}] ${act.action?.type} ${amt != null && amt > 0 ? amt.toFixed(2) : ''}`)
+
+        // Street transition = longer delay
+        const delay = act.street_changed ? 1500 : 600
+        await new Promise(r => setTimeout(r, delay))
       }
-    }, 600)
+
+      // 3. Show final live state (unless user is browsing history)
+      if (!cancelledRef.current) {
+        setGameState(finalState.snapshot)
+        setTimelineIdx(finalState.timeline_index)
+        setTotalSteps(finalState.total_steps)
+      }
+
+    } catch (e) {
+      console.error('runAISteps error:', e)
+      await refreshState()
+    } finally {
+      isAnimatingRef.current = false
+    }
   }
+
+  // Kick off AI stepping whenever gameState changes and it's not human's turn
+  useEffect(() => {
+    if (!gameState) return
+    if (gameState.is_terminal) return
+    if (isAnimatingRef.current) return  // Don't re-trigger during animation
+
+    const currentPlayer = gameState.players?.find(p => p.id === gameState.current_player)
+    if (currentPlayer?.is_human) return
+
+    // It's an AI's turn — run the batch stepping
+    runAISteps()
+  }, [gameState?.is_terminal, gameState?.current_player, gameState?.hand_count])
 
   useEffect(() => {
     const init = async () => {
@@ -145,15 +168,6 @@ function App() {
     }
     init()
   }, [])
-
-  useEffect(() => {
-    if (gameState && !gameState.is_terminal) {
-      stepAI()
-    }
-    return () => {
-      if (stepTimeoutRef.current) clearTimeout(stepTimeoutRef.current)
-    }
-  }, [gameState, timelineIdx, totalSteps])
 
   useEffect(() => {
     const handleKeyDown = (e) => {

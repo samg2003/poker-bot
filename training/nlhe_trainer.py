@@ -363,7 +363,7 @@ class NLHESelfPlayTrainer:
             )
             hero_pos = eligible.index(hero_idx)
             hero_ev += equities[hero_pos] * pot_amount
-        return hero_ev
+        return hero_ev - game_state.players[hero_idx].bet_total
 
     def _compute_gae(self, trajectory: List[Experience]) -> Tuple[List[float], List[float]]:
         """
@@ -382,22 +382,27 @@ class NLHESelfPlayTrainer:
         if n == 0:
             return [], []
 
-        # V(s) = equity_x_pot + V_res(s)
+        # V(s) = EV_baseline(s) + V_res(s)
         values = [exp.equity_x_pot + exp.value for exp in trajectory]
         terminal_reward = trajectory[-1].reward
 
-        # Per-step rewards using equity shaping
         rewards = []
         for t in range(n):
             if t == n - 1:
-                # Terminal: ev_profit-based reward (already normalized)
                 rewards.append(terminal_reward)
             elif trajectory[t].street_idx == trajectory[t + 1].street_idx:
-                # Same street: Δ(hero_ev) between consecutive hero decisions
-                rewards.append(trajectory[t + 1].equity_x_pot - trajectory[t].equity_x_pot)
+                rewards.append(0.0)
             else:
-                # Cross-street: Δ to end-of-street EV (captures opponent responses)
-                rewards.append(trajectory[t].end_street_equity_x_pot - trajectory[t].equity_x_pot)
+                # CROSS-STREET FIX:
+                # We want PPO to give credit for (e_end - e_current).
+                # But PPO will automatically add e_next via V(s_t+1).
+                # By making the reward (e_end - e_next), PPO calculates:
+                # Advantage = reward + V(s_next) - V(s_current)
+                # Advantage = (e_end - e_next) + e_next - e_current
+                # Advantage = e_end - e_current
+                e_end = trajectory[t].end_street_equity_x_pot
+                e_next = trajectory[t + 1].equity_x_pot
+                rewards.append(e_end - e_next)
 
         # TD errors: δ_t = r_t + γ·V(s_{t+1}) - V(s_t)
         deltas = []

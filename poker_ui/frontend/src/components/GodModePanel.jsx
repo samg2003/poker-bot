@@ -38,7 +38,8 @@ export default function GodModePanel({ gameState, selectedSeat }) {
 
   // Build sorted sizing entries with bb amounts
   const pot = gameState.pot || 0
-  const currentBet = gameState.current_bet || 0
+  const minRaise = gameState.min_raise || 0
+  const maxRaise = gameState.max_raise || 0
   const totalProb = sizingProbs.reduce((a, b) => a + b, 0)
 
   const sizingEntries = sizingProbs.map((prob, idx) => {
@@ -48,10 +49,12 @@ export default function GodModePanel({ gameState, selectedSeat }) {
     
     let bbAmount
     if (frac < 0) {
-      // All-in: use the player's remaining stack + current street bet
-      bbAmount = p.stack + (p.bet || 0)
+      // All-in
+      bbAmount = (p.stack || 0) + (p.bet || 0)
     } else {
-      bbAmount = currentBet + frac * pot
+      // Matches model action space: raise_to = frac * pot
+      bbAmount = frac * pot
+      if (minRaise > 0) bbAmount = Math.max(minRaise, Math.min(bbAmount, maxRaise))
     }
     
     return { label, normalized, bbAmount, idx }
