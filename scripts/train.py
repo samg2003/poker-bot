@@ -163,6 +163,7 @@ def train_nlhe(args):
         frozen_update_interval=args.save_interval,
         remove_clip=args.remove_clip,
         kl_beta=args.kl_beta,
+        use_personalities=not args.no_personality,
     )
 
     
@@ -300,6 +301,8 @@ def main():
                         help='Max simultaneous games per sub-batch (default: 500, lower to save memory)')
     parser.add_argument('--num-workers', type=int, default=0,
                         help='Number of parallel Gym environments (default: 0 = sequential engine)')
+    parser.add_argument('--no-personality', action='store_true',
+                        help='Disable personality overlays on frozen opponents during training')
 
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',

@@ -53,7 +53,8 @@ def load_model():
     embed_dim = 256
     num_heads = 4
     num_layers = 4
-    
+    import torch
+
     policy = PolicyNetwork(
         embed_dim=embed_dim,
         opponent_embed_dim=embed_dim,
@@ -67,17 +68,22 @@ def load_model():
     )
     
     ckpt_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'checkpoints')
-    mgr = CheckpointManager(ckpt_dir)
     try:
-        mgr.load(policy, encoder, tag='latest')
+        policy.load_state_dict(
+            torch.load(os.path.join(ckpt_dir, 'latest', 'policy.pt'), map_location='cpu', weights_only=True)
+        )
+        encoder.load_state_dict(
+            torch.load(os.path.join(ckpt_dir, 'latest', 'opponent_encoder.pt'), map_location='cpu', weights_only=True)
+        )
         policy.eval()
         encoder.eval()
-        print("Model loaded successfully!")
+        print("✓ Checkpoint loaded successfully.")
     except Exception as e:
         print(f"Warning: Could not load checkpoint: {e}")
         
     game_manager = GameManager(policy, encoder, human_seat=0)
     print("Ready!")
+
 
 def _serialize_snapshot(snap: TimelineSnapshot):
     gs = snap.game_state

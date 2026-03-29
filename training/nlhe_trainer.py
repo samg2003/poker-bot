@@ -152,6 +152,9 @@ class NLHETrainingConfig:
     remove_clip: bool = False     # Use KL Penalty instead of hard clipping
     kl_beta: float = 1.0          # Coefficient for KL penalty when clip is removed
 
+    # Personality system
+    use_personalities: bool = True  # Set to False to disable personality overlays on frozen opponents
+
 
 @dataclass
 class TableState:
@@ -292,21 +295,16 @@ class NLHESelfPlayTrainer:
         return self.opponent_pool_recent + self.opponent_pool_archive
 
     def _build_table_models(self, seat_pool_idx: Dict[int, int]):
-        """Build frozen models for each unique pool index at the table.
-        
-        Caches models by pool index — only creates new models for indices
-        not already in the cache. Much faster than rebuilding every hand.
-        """
+        """Build frozen models for each unique pool index at the table."""
         combined_pool = self._get_combined_pool()
         unique_indices = set(seat_pool_idx.values())
-        # Only build models for new pool indices (cache hit = skip)
         for idx in unique_indices:
             if idx not in self._frozen_models and idx < len(combined_pool):
                 model = self._make_frozen_model(combined_pool[idx])
                 self._frozen_models[idx] = model
 
     def _make_frozen_model(self, state_dict: dict):
-        """Create a fresh frozen model from state dict (no deepcopy)."""
+        """Create a fresh frozen model from state dict."""
         from model.policy_network import PolicyNetwork
         model = PolicyNetwork(
             embed_dim=self.config.embed_dim,
@@ -725,15 +723,19 @@ class NLHESelfPlayTrainer:
         # Per-seat opponent assignment
         if not table.seat_pool_idx or len(table.seat_pool_idx) != num_p - 1:
             table.seat_pool_idx = {}
+            combined_pool = self._get_combined_pool()
             for pid in range(1, num_p):
-                combined_pool = self._get_combined_pool()
                 if combined_pool:
                     table.seat_pool_idx[pid] = self.rng.randint(0, len(combined_pool) - 1)
                 else:
                     table.seat_pool_idx[pid] = 0
 
         # Table-level personality
-        if len(table.table_personalities) != num_p:
+        if not self.config.use_personalities:
+            # Personalities disabled — all opponents play straight (no modifier)
+            if len(table.table_personalities) != num_p:
+                table.table_personalities = [None] * num_p
+        elif len(table.table_personalities) != num_p:
             if self.current_epoch < 20 or self.rng.random() < 0.33:
                 gto_frac = 1.0
             else:

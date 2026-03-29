@@ -51,7 +51,9 @@ export default function ActionBar({ gameState, isLive, onSubmitAction }) {
       
       {/* Fold / Check / Call */}
       <div className="primary-actions">
-        <button className="btn action-fold" onClick={() => onSubmitAction('FOLD')}>Fold</button>
+        {legal.includes('FOLD') && (
+          <button className="btn action-fold" onClick={() => onSubmitAction('FOLD')}>Fold</button>
+        )}
         {legal.includes('CHECK') ? (
           <button className="btn action-call" onClick={() => onSubmitAction('CHECK')}>Check</button>
         ) : (
