@@ -47,7 +47,7 @@ class CardEmbedding(nn.Module):
         """
         # Mask absent cards (index -1)
         valid = cards >= 0
-        safe_cards = cards.clamp(min=0)
+        safe_cards = cards.clamp(min=0, max=51)
 
         ranks = safe_cards // 4
         suits = safe_cards % 4

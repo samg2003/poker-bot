@@ -158,6 +158,7 @@ def train_nlhe(args):
         search_fraction=args.search_fraction,
         verbose=args.verbose,
         batch_chunk_size=args.batch_chunk_size,
+        num_workers=args.num_workers,
         seed=args.seed,
         frozen_update_interval=args.save_interval,
         remove_clip=args.remove_clip,
@@ -297,6 +298,8 @@ def main():
                         help='Fraction of hands using search (0-1, default: 0 = off)')
     parser.add_argument('--batch-chunk-size', type=int, default=500,
                         help='Max simultaneous games per sub-batch (default: 500, lower to save memory)')
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help='Number of parallel Gym environments (default: 0 = sequential engine)')
 
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',

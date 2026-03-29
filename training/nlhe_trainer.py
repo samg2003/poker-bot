@@ -21,6 +21,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import numpy as np
 from torch.distributions import Categorical
 
 from engine.game_state import GameState, Action, ActionType, Street
@@ -116,6 +117,7 @@ class NLHETrainingConfig:
     # Self-play
     hands_per_epoch: int = 512   # was 128 — increased for hero-only training
     batch_chunk_size: int = 500  # Max simultaneous games per sub-batch
+    num_workers: int = 0         # Number of Gym processes. 0 = sequential python
 
     # Frozen opponent pool
     frozen_update_interval: int = 20   # sync frozen opponent every N epochs
@@ -230,6 +232,9 @@ class NLHESelfPlayTrainer:
         # ── Metrics ───────────────────────────────────────────
         self.epoch_rewards: List[float] = []
         self.epoch_losses: List[float] = []
+        
+        # ── Vectorized Environments ───────────────────────────
+        self.envs = None
 
     @staticmethod
     def _resolve_device(device_str: str) -> torch.device:
@@ -271,6 +276,16 @@ class NLHESelfPlayTrainer:
 
         # Reset current loaded index
         self._frozen_models = {}  # force rebuild on next table setup
+
+        self._sync_workers()
+
+    def _sync_workers(self):
+        """Send latest target state dicts to the isolated CPU workers."""
+        if self.envs is not None:
+            p_sd = {k: v.cpu() for k, v in self.policy.state_dict().items()}
+            e_sd = {k: v.cpu() for k, v in self.opponent_encoder.state_dict().items()}
+            f_sds = [{k: v.cpu() for k, v in fm.state_dict().items()} for fm in self._frozen_models.values()]
+            self.envs.call('update_weights', p_sd, e_sd, f_sds)
 
     def _get_combined_pool(self) -> List[dict]:
         """Get combined pool (recent + archive) as a single list."""
@@ -1676,6 +1691,105 @@ class NLHESelfPlayTrainer:
         
         return loss.item(), action_loss.item(), sizing_loss.item(), value_loss.item()
 
+    def _run_vectorized_epoch(self) -> Tuple[List[List[Experience]], float]:
+        """Runs highly parallelized simulation via gym.vector.AsyncVectorEnv."""
+        if self.envs is None:
+            import gymnasium as gym
+            from engine.gym_env import PokerGymEnv
+            
+            def make_env():
+                return PokerGymEnv(
+                    config_dict=self.config.__dict__,
+                    policy_state_dict={k: v.cpu() for k,v in self.policy.state_dict().items()},
+                    opp_enc_state_dict={k: v.cpu() for k,v in self.opponent_encoder.state_dict().items()},
+                    frozen_pool_states=[{k: v.cpu() for k,v in fm.state_dict().items()} for fm in self._frozen_models.values()]
+                )
+            self.envs = gym.vector.AsyncVectorEnv([make_env for _ in range(self.config.num_workers)], context='spawn')
+
+        all_exp = []
+        total_reward = 0.0
+        finished_hands = 0
+        
+        obs, _ = self.envs.reset()
+        
+        while finished_hands < self.config.hands_per_epoch:
+            # 1. Batch format tensors directly onto GPU
+            batch_hole = torch.tensor(obs['hole_cards'], device=self.device)
+            batch_comm = torch.tensor(obs['community_cards'], device=self.device)
+            batch_num = torch.tensor(obs['numeric_features'], device=self.device)
+            batch_opp_stats = torch.tensor(obs['opponent_stats'], device=self.device)
+            batch_own = torch.tensor(obs['own_stats'], device=self.device)
+            batch_opp_gs = torch.tensor(obs['opponent_game_state'], device=self.device)
+            batch_ha_seq = torch.tensor(obs['hand_action_seq'], device=self.device)
+            batch_ha_len = torch.tensor(obs['hand_action_len'], device=self.device).squeeze(1)
+            batch_actor_prof = torch.tensor(obs['actor_profiles_seq'], device=self.device)
+            batch_hero_prof = torch.tensor(obs['hero_profile'], device=self.device)
+            batch_opp_profiles = torch.tensor(obs['opponent_profiles'], device=self.device)
+            batch_mask = torch.tensor(obs['action_mask'], device=self.device).to(torch.bool)
+            batch_s_mask = torch.tensor(obs['sizing_mask'], device=self.device).to(torch.bool)
+            batch_opp_embed = torch.tensor(obs['opponent_embeddings'], device=self.device)
+            
+            with torch.no_grad():
+                embed_sums = batch_opp_embed.sum(dim=-1)
+                batch_opp_mask = (embed_sums == 0)
+
+                output = self.policy(
+                    hole_cards=batch_hole, community_cards=batch_comm, numeric_features=batch_num,
+                    opponent_embeddings=batch_opp_embed, opponent_stats=batch_opp_stats, own_stats=batch_own,
+                    opponent_game_state=batch_opp_gs,
+                    action_mask=batch_mask, sizing_mask=batch_s_mask, opponent_mask=batch_opp_mask,
+                    hand_action_seq=batch_ha_seq, hand_action_len=batch_ha_len,
+                    actor_profiles_seq=batch_actor_prof,
+                    hero_profile=batch_hero_prof,
+                    opponent_profiles=batch_opp_profiles,
+                )
+                
+            probs = output.action_type_probs.cpu().numpy()
+            values = output.value.cpu().numpy() if hasattr(output, 'value') else np.zeros((self.config.num_workers, 1))
+            sizing_probs = torch.softmax(output.bet_size_logits, dim=-1).cpu().numpy()
+            
+            # Action construction for Gym: fake indices since action generation happens natively
+            actions_raw = np.zeros((self.config.num_workers, 2), dtype=np.int64)
+
+            action_dict = {
+                'action': actions_raw,
+                'probs': probs,
+                'value': values,
+                'sizing_probs': sizing_probs,
+            }
+            
+            next_obs, rewards, dones, truncated, infos = self.envs.step(action_dict)
+            obs = next_obs
+            
+            if True in dones:
+                exps_lists = infos.get('experiences', [])
+                valid_flags = infos.get('_experiences', [True] * self.config.num_workers)
+                
+                # `infos` is a dict of lists in recent Gym versions, or numpy arrays
+                if not isinstance(exps_lists, (list, tuple, np.ndarray)):
+                    exps_lists = [exps_lists]
+                if not isinstance(valid_flags, (list, tuple, np.ndarray)):
+                    valid_flags = [valid_flags]
+
+                for w_idx in range(self.config.num_workers):
+                    # Check if this specific worker finished and returned experiences
+                    if dones[w_idx] and w_idx < len(valid_flags) and valid_flags[w_idx]:
+                        exps_dicts = exps_lists[w_idx]
+                        if exps_dicts:
+                            exps = []
+                            for d in exps_dicts:
+                                for k, v in d.items():
+                                    if isinstance(v, np.ndarray):
+                                        d[k] = torch.tensor(v)
+                                exps.append(Experience(**d))
+                            all_exp.extend(exps)
+                            total_reward += exps[-1].reward if exps else 0.0
+                            finished_hands += 1
+                            if finished_hands >= self.config.hands_per_epoch:
+                                break
+
+        return all_exp, total_reward
+
     # ─────────────────────────────────────────────────────────
     # Training loop
     # ─────────────────────────────────────────────────────────
@@ -1717,7 +1831,10 @@ class NLHESelfPlayTrainer:
                     print(f"    [Frozen sync] Pool: {len(self.opponent_pool_recent)} recent + {len(self.opponent_pool_archive)} archive = {pool_total}")
 
             # Batched simulation: all hands run as generators with batched GPU calls
-            all_exp, total_reward = self._run_batched_epoch()
+            if self.config.num_workers > 0:
+                all_exp, total_reward = self._run_vectorized_epoch()
+            else:
+                all_exp, total_reward = self._run_batched_epoch()
 
             avg_reward = total_reward / self.config.hands_per_epoch
 
