@@ -70,6 +70,8 @@ def load_model():
     mgr = CheckpointManager(ckpt_dir)
     try:
         mgr.load(policy, encoder, tag='latest')
+        policy.eval()
+        encoder.eval()
         print("Model loaded successfully!")
     except Exception as e:
         print(f"Warning: Could not load checkpoint: {e}")

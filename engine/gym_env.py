@@ -63,13 +63,18 @@ class PokerGymEnv(gym.Env):
 
     def update_weights(self, policy_sd, opp_enc_sd, pool_sds):
         self.trainer.policy.load_state_dict(policy_sd)
+        self.trainer.policy.eval()
+        
         self.trainer.opponent_encoder.load_state_dict(opp_enc_sd)
+        self.trainer.opponent_encoder.eval()
+        
         for p_idx, p_state in enumerate(pool_sds):
             # Ensure the frozen model slot exists
             if p_idx not in self.trainer._frozen_models:
                 import copy
                 self.trainer._frozen_models[p_idx] = copy.deepcopy(self.trainer._frozen_template)
             self.trainer._frozen_models[p_idx].load_state_dict(p_state)
+            self.trainer._frozen_models[p_idx].eval()
 
     def _pad_obs(self, state_dict: dict) -> dict:
         """Pads generator state to gym shape (removing batch=1)."""
