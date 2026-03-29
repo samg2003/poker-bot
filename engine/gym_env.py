@@ -21,6 +21,7 @@ class PokerGymEnv(gym.Env):
         
         self.config = NLHETrainingConfig(**config_dict)
         self.config.device = 'cpu'
+        torch.set_num_threads(1)  # CRITICAL: Prevent OpenMP thread contention across N parallel workers
         self.trainer = NLHESelfPlayTrainer(self.config)
         
         # Load weights locally to avoid IPC locking issues
