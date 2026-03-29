@@ -77,9 +77,11 @@ def encode_action(
     return torch.tensor(features, dtype=torch.float32)
 
 
-def get_sizing_mask(game_state) -> torch.Tensor:
+def get_sizing_mask(game_state, spr: float = 0.0) -> torch.Tensor:
     """
     Evaluate which sizing buckets are legal given the current GameState.
+    spr: effective stack-to-pot ratio (min(hero, max_active_opp) / pot).
+         All-in is masked when spr >= 4 (not committed enough to justify shove).
     Returns: (10,) boolean mask where True = legal.
     """
     from engine.game_state import ActionType
@@ -96,7 +98,9 @@ def get_sizing_mask(game_state) -> torch.Tensor:
 
     for i, frac in enumerate(POT_FRACTIONS):
         if frac < 0:
-            mask[i] = True  # All-in is always legal if raising is legal
+            # All-in: only legal when effective SPR < 4 (committed / short stack)
+            if spr < 4.0:
+                mask[i] = True
             continue
             
         target_size = frac * pot
@@ -104,7 +108,7 @@ def get_sizing_mask(game_state) -> torch.Tensor:
             mask[i] = True
 
     if not mask.any():
-        mask[-1] = True  # Fallback to all-in
+        mask[-1] = True  # Fallback to all-in (always allow if nothing else fits)
 
     return mask
 

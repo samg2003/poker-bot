@@ -631,7 +631,14 @@ class NLHESelfPlayTrainer:
         current_bet = game_state.current_bet / norm
         min_raise = game_state.min_raise / norm
         amount_to_call = max(0.0, current_bet - own_bet)
-        spr = p.stack / max(game_state.pot, 0.01)
+        # Effective SPR: min(hero_stack, max(active_opponent_stacks)) / pot
+        active_opp_stacks = [
+            pp.stack for j, pp in enumerate(game_state.players)
+            if j != player_idx and pp.is_active
+        ]
+        max_opp_stack = max(active_opp_stacks) if active_opp_stacks else p.stack
+        effective_stack = min(p.stack, max_opp_stack)
+        spr = effective_stack / max(game_state.pot, 0.01)
 
         numeric = self._to(torch.tensor([[
             pot, own_stack, own_bet,
@@ -646,7 +653,7 @@ class NLHESelfPlayTrainer:
         action_mask = self._encode_action_mask(game_state)
         
         from model.action_space import get_sizing_mask
-        sizing_mask = self._to(get_sizing_mask(game_state).unsqueeze(0))
+        sizing_mask = self._to(get_sizing_mask(game_state, spr=spr).unsqueeze(0))
 
         return {
             'hole_cards': hole,

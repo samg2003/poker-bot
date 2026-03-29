@@ -385,7 +385,14 @@ class GameManager:
         current_bet = self.game_state.current_bet / 100.0
         min_raise = self.game_state.min_raise / 100.0
         amount_to_call = max(0.0, current_bet - own_bet)
-        spr = self.game_state.players[eng_idx].stack / max(self.game_state.pot, 0.01)
+        # Effective SPR: min(hero_stack, max(active_opponent_stacks)) / pot
+        active_opp_stacks = [
+            pp.stack for j, pp in enumerate(self.game_state.players)
+            if j != eng_idx and pp.is_active
+        ]
+        max_opp_stack = max(active_opp_stacks) if active_opp_stacks else p.stack
+        effective_stack = min(p.stack, max_opp_stack)
+        spr = effective_stack / max(self.game_state.pot, 0.01)
 
         numeric = torch.tensor([[
             pot, own_stack, own_bet,
@@ -410,7 +417,7 @@ class GameManager:
         own_stats = self.stat_tracker.get_stats(seat_info.uid).unsqueeze(0)
 
         from model.action_space import get_sizing_mask
-        sizing_mask = get_sizing_mask(self.game_state).unsqueeze(0)
+        sizing_mask = get_sizing_mask(self.game_state, spr=spr).unsqueeze(0)
 
         with torch.no_grad():
             out = self.policy(
