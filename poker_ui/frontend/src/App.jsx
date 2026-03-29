@@ -117,9 +117,14 @@ function App() {
           if (gs.street && newGs.street && gs.street !== newGs.street) {
              await new Promise(r => setTimeout(r, 1500));
           }
+        } else {
+          // If the backend threw a 500 or failed to take action during AI turn,
+          // refresh the state after 2 seconds to restart the useEffect polling loop!
+          setTimeout(refreshState, 2000);
         }
       } catch (e) {
         console.error('stepAI error:', e)
+        setTimeout(refreshState, 2000);
       } finally {
         isSteppingRef.current = false
       }
