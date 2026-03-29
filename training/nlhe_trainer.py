@@ -71,6 +71,9 @@ class Experience(NamedTuple):
     effective_stack_bb: float = 1.5   # min(hero_stack, max(opp_stacks)) at hero's first decision; floor=1.5bb
     action_log_prob: float = 0.0      # action-only log prob (for decoupled PPO)
     sizing_log_prob: float = 0.0      # sizing-only log prob (for decoupled PPO, 0 if not raise)
+    equity_x_pot: float = 0.0        # side-pot-aware hero EV at decision point
+    end_street_equity_x_pot: float = 0.0  # hero EV at end of this street
+    street_idx: int = 0              # 0=preflop, 1=flop, 2=turn, 3=river
 
 
 # ─────────────────────────────────────────────────────────────
@@ -129,6 +132,9 @@ class NLHETrainingConfig:
     # Search-guided training (expert iteration)
     search_fraction: float = 0.0     # fraction of hands to use search (0-1)
     search_iterations: int = 50      # CFR iterations per search call
+
+    # Equity-based reward decomposition
+    mc_equity_sims: int = 500         # MC runouts per equity computation during training
 
     # Device
     device: str = "auto"  # "auto", "cuda", "mps", "cpu"
@@ -337,15 +343,38 @@ class NLHESelfPlayTrainer:
         progress = min(self.current_epoch / max(self.total_epochs, 1), 1.0)
         return c.entropy_coef + (c.entropy_coef_end - c.entropy_coef) * progress
 
+    def _compute_hero_ev(self, game_state, hero_idx: int = 0) -> float:
+        """Side-pot-aware hero EV via MC equity per pot layer.
+
+        Uses calculate_side_pots() which works mid-hand. For each pot layer,
+        computes MC equity only among eligible players, then sums hero's
+        expected share across all layers.
+        """
+        from engine.hand_evaluator import Eval7Evaluator
+        side_pots = game_state.calculate_side_pots()
+        hero_ev = 0.0
+        for pot_amount, eligible in side_pots:
+            if hero_idx not in eligible:
+                continue
+            hands = [list(game_state.players[i].hole_cards) for i in eligible]
+            equities = Eval7Evaluator.get_equity(
+                hands, list(game_state.board),
+                runouts=self.config.mc_equity_sims,
+            )
+            hero_pos = eligible.index(hero_idx)
+            hero_ev += equities[hero_pos] * pot_amount
+        return hero_ev
+
     def _compute_gae(self, trajectory: List[Experience]) -> Tuple[List[float], List[float]]:
         """
-        Compute GAE advantages and returns for a single hand trajectory.
+        Compute GAE with equity-based reward shaping.
 
-        Args:
-            trajectory: List of Experience tuples for one hand, ordered by step_idx.
+        Per-step rewards:
+        - Same street: Δ(equity×pot) between consecutive hero decisions
+        - Cross-street: end_street_equity_x_pot - equity_x_pot (captures opponent responses)
+        - Terminal: ev_profit-based reward (MC equity, not binary)
 
-        Returns:
-            (advantages, returns) — parallel lists of floats, one per step.
+        V(s) = equity_x_pot + V_res(s) where V_res = value head output.
         """
         gamma = self.config.gamma
         lam = self.config.gae_lambda
@@ -353,19 +382,30 @@ class NLHESelfPlayTrainer:
         if n == 0:
             return [], []
 
-        # Collect values and the terminal reward
-        values = [exp.value for exp in trajectory]
-        terminal_reward = trajectory[-1].reward  # only last step has real reward
+        # V(s) = equity_x_pot + V_res(s)
+        values = [exp.equity_x_pot + exp.value for exp in trajectory]
+        terminal_reward = trajectory[-1].reward
+
+        # Per-step rewards using equity shaping
+        rewards = []
+        for t in range(n):
+            if t == n - 1:
+                # Terminal: ev_profit-based reward (already normalized)
+                rewards.append(terminal_reward)
+            elif trajectory[t].street_idx == trajectory[t + 1].street_idx:
+                # Same street: Δ(hero_ev) between consecutive hero decisions
+                rewards.append(trajectory[t + 1].equity_x_pot - trajectory[t].equity_x_pot)
+            else:
+                # Cross-street: Δ to end-of-street EV (captures opponent responses)
+                rewards.append(trajectory[t].end_street_equity_x_pot - trajectory[t].equity_x_pot)
 
         # TD errors: δ_t = r_t + γ·V(s_{t+1}) - V(s_t)
         deltas = []
         for t in range(n):
             if t == n - 1:
-                # Last step: r = terminal_reward, V(s_{t+1}) = 0 (hand over)
-                delta = terminal_reward - values[t]
+                delta = rewards[t] - values[t]  # V(terminal) = 0
             else:
-                # Intermediate step: r = 0, V(s_{t+1}) = values[t+1]
-                delta = gamma * values[t + 1] - values[t]
+                delta = rewards[t] + gamma * values[t + 1] - values[t]
             deltas.append(delta)
 
         # GAE: A_t = Σ (γλ)^k · δ_{t+k}, computed backward
@@ -689,6 +729,7 @@ class NLHESelfPlayTrainer:
         player_checked_this_street = [False] * num_p  # per-player check tracking
         first_bet_this_street_by = -1  # who made the first bet/raise this street
         current_street = Street.PREFLOP
+        street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3, Street.SHOWDOWN: 3}
         preflop_folders = set()  # players who folded preflop (for saw_flop)
 
         # Phase 5: Accumulate all raw action tokens during this hand
@@ -789,6 +830,9 @@ class NLHESelfPlayTrainer:
 
             if pid == 0:
                 # ── HERO ──
+                # Compute side-pot-aware hero EV before action
+                equity_x_pot = self._compute_hero_ev(game_state, hero_idx=0)
+
                 # Compute effective stack at hero's first decision
                 if hero_step_idx == 0:
                     bb = max(self.config.big_blind, 1.0)
@@ -893,6 +937,9 @@ class NLHESelfPlayTrainer:
                     'sizing_log_prob': sizing_lp,
                     'value': value,
                     'step_idx': hero_step_idx,
+                    'equity_x_pot': equity_x_pot,
+                    'end_street_equity_x_pot': equity_x_pot,  # default, overwritten at street end
+                    'street_idx': street_map.get(game_state.street, 0),
                 })
                 hero_step_idx += 1
 
@@ -1031,6 +1078,10 @@ class NLHESelfPlayTrainer:
 
             # Detect street transitions to reset per-street state
             if game_state.street != current_street:
+                # Compute end-of-street hero EV (captures opponent responses)
+                if hero_experiences:
+                    end_ev = self._compute_hero_ev(game_state, hero_idx=0)
+                    hero_experiences[-1]['end_street_equity_x_pot'] = end_ev
                 current_street = game_state.street
                 player_checked_this_street = [False] * num_p
                 first_bet_this_street_by = -1
@@ -1087,6 +1138,9 @@ class NLHESelfPlayTrainer:
                 effective_stack_bb=hero_effective_stack_bb,
                 action_log_prob=exp_dict['action_log_prob'],
                 sizing_log_prob=exp_dict['sizing_log_prob'],
+                equity_x_pot=exp_dict['equity_x_pot'] / max(self.config.big_blind, 1.0) / max(hero_effective_stack_bb, 1.5),
+                end_street_equity_x_pot=exp_dict['end_street_equity_x_pot'] / max(self.config.big_blind, 1.0) / max(hero_effective_stack_bb, 1.5),
+                street_idx=exp_dict['street_idx'],
             ))
 
         return [hero_exp_list] + [[] for _ in range(num_p - 1)], hero_reward_bb
@@ -1443,6 +1497,7 @@ class NLHESelfPlayTrainer:
         old_action_log_probs = torch.tensor([e.action_log_prob for e in experiences], dtype=torch.float32)
         old_sizing_log_probs = torch.tensor([e.sizing_log_prob for e in experiences], dtype=torch.float32)
         old_values = torch.tensor([e.value for e in experiences], dtype=torch.float32)
+        equity_x_pot = torch.tensor([e.equity_x_pot for e in experiences], dtype=torch.float32)
 
         # 4. Compute GAE advantages and returns ONCE (using original values)
         hand_groups: Dict[int, List[int]] = {}
@@ -1492,6 +1547,7 @@ class NLHESelfPlayTrainer:
             'old_values': old_values,
             'gae_advantages': gae_advantages,
             'gae_returns': gae_returns,
+            'equity_x_pot': equity_x_pot,
         }
 
     def _compute_ppo_loss_minibatch(self, data: dict, indices: List[int]) -> float:
@@ -1586,7 +1642,10 @@ class NLHESelfPlayTrainer:
         entropy = action_entropy + sizing_entropy
         
         value_pred = output.value.squeeze(-1)
-        value_loss = torch.nn.functional.smooth_l1_loss(value_pred, gae_returns)
+        # V_res residual target: GAE returns minus equity×pot baseline
+        equity_x_pot = data['equity_x_pot'][idx].to(self.device)
+        residual_returns = gae_returns - equity_x_pot
+        value_loss = torch.nn.functional.smooth_l1_loss(value_pred, residual_returns)
         
         entropy_coef = self._get_entropy_coef()
         loss = (

@@ -2,7 +2,7 @@
 # Connect to an EC2 instance via SSH
 
 DEFAULT_PEM="/Users/sambhavgupta/Desktop/code-poker-bot/carte6.pem"
-DEFAULT_IP="54.193.114.122"
+DEFAULT_IP="52.53.180.98"
 DEFAULT_USER="ubuntu"
 
 read -p "Path to PEM file [$DEFAULT_PEM]: " PEM_PATH

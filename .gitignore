@@ -1,5 +1,7 @@
-# SSH keys
+# SSH keys & data
 *.pem
+scripts/sync-checkpoint.sh
+scripts/connect-ec2.sh
 
 # Python
 __pycache__/
