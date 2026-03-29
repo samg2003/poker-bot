@@ -179,18 +179,24 @@ def train_nlhe(args):
     start_epoch = 0
     if args.resume:
         tag = args.resume
+        reset_encoder = getattr(args, 'reset_hand_encoder', False)
         try:
             meta = checkpoint_mgr.load(
                 trainer.policy, trainer.opponent_encoder,
-                trainer.optimizer, tag=tag,
+                trainer.optimizer if not reset_encoder else None,  # skip stale optimizer on migration
+                tag=tag,
                 device=str(trainer.device),
+                strict=not reset_encoder,
             )
             start_epoch = meta.epoch
-            # Load opponent pool from checkpoint
-            load_dir = os.path.join(args.checkpoint_dir, tag)
-            trainer.load_pool(load_dir)
-            pool_total = len(trainer.opponent_pool_recent) + len(trainer.opponent_pool_archive)
-            print(f"\n✓ Resumed from checkpoint '{tag}' (epoch {start_epoch}, reward={meta.avg_reward:+.3f}, pool={pool_total})")
+            if reset_encoder:
+                print(f"\n↺ --reset-hand-encoder: HandHistoryEncoder fresh-init, skipping pool load")
+            else:
+                # Load opponent pool from checkpoint
+                load_dir = os.path.join(args.checkpoint_dir, tag)
+                trainer.load_pool(load_dir)
+                pool_total = len(trainer.opponent_pool_recent) + len(trainer.opponent_pool_archive)
+            print(f"\n✓ Resumed from checkpoint '{tag}' (epoch {start_epoch}, reward={meta.avg_reward:+.3f})")
         except FileNotFoundError:
             print(f"\n✗ Checkpoint '{tag}' not found, training from scratch")
 
@@ -303,6 +309,9 @@ def main():
                         help='Number of parallel Gym environments (default: 0 = sequential engine)')
     parser.add_argument('--no-personality', action='store_true',
                         help='Disable personality overlays on frozen opponents during training')
+    parser.add_argument('--reset-hand-encoder', action='store_true',
+                        help='One-time migration: load checkpoint with strict=False to fresh-init '
+                             'HandHistoryEncoder (GRU→Transformer). Skip pool load. Use once, then resume normally.')
 
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',

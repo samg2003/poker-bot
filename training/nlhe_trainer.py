@@ -1713,7 +1713,10 @@ class NLHESelfPlayTrainer:
                     opp_enc_state_dict={k: v.cpu() for k,v in self.opponent_encoder.state_dict().items()},
                     frozen_pool_states=[{k: v.cpu() for k,v in fm.state_dict().items()} for fm in self._frozen_models.values()]
                 )
-            self.envs = gym.vector.AsyncVectorEnv([make_env for _ in range(self.config.num_workers)], context='spawn')
+            import sys
+            _ctx = 'fork' if sys.platform == 'linux' else 'spawn'  # fork=instant on Linux, spawn needed on macOS
+            self.envs = gym.vector.AsyncVectorEnv([make_env for _ in range(self.config.num_workers)], context=_ctx)
+
 
         all_exp = []
         total_reward = 0.0

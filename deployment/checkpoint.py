@@ -135,6 +135,7 @@ class CheckpointManager:
         tag: str = 'latest',
         range_estimator: Optional[RangeEstimator] = None,
         device: str = 'cpu',
+        strict: bool = True,
     ) -> CheckpointMetadata:
         """
         Load a checkpoint.
@@ -154,9 +155,12 @@ class CheckpointManager:
         if not load_dir.exists():
             raise FileNotFoundError(f"Checkpoint not found: {load_dir}")
 
-        policy.load_state_dict(
-            torch.load(load_dir / 'policy.pt', map_location=device, weights_only=True)
+        missing, unexpected = policy.load_state_dict(
+            torch.load(load_dir / 'policy.pt', map_location=device, weights_only=True),
+            strict=strict,
         )
+        if not strict and missing:
+            print(f"[Checkpoint] Fresh-init keys (expected for migrations): {len(missing)} params")
         opponent_encoder.load_state_dict(
             torch.load(load_dir / 'opponent_encoder.pt', map_location=device, weights_only=True)
         )

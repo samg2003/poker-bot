@@ -216,47 +216,73 @@ class ProfileBuilder(nn.Module):
 
 
 class HandHistoryEncoder(nn.Module):
-    """GRU encoder for intra-hand action sequences.
+    """Transformer encoder for intra-hand action sequences.
 
     Each token is [raw_action(13d) + actor_cached_profile(64d)] = 77d.
-    Outputs hand_story (embed_dim) from the final GRU hidden state.
+    Uses 2-layer full self-attention (non-causal: all tokens attend to all
+    valid tokens) + attention pooling → hand_story (embed_dim).
+
+    Advantages over GRU:
+    - Parallelizable: all tokens processed simultaneously (CPU speedup)
+    - No recency bias: river decision can directly attend to preflop 3-bet
+    - Direct attention over any pair of actions across streets
     """
 
-    def __init__(self, embed_dim: int, num_layers: int = 2, dropout: float = 0.1):
+    def __init__(self, embed_dim: int = 256, num_heads: int = 4, num_layers: int = 2,
+                 max_len: int = MAX_HAND_ACTIONS, dropout: float = 0.1):
         super().__init__()
         self.embed_dim = embed_dim
-        self.gru = nn.GRU(
-            input_size=HAND_ACTION_DIM,
-            hidden_size=embed_dim,
-            num_layers=num_layers,
+
+        # Project raw action tokens (77d) into model dimension
+        self.input_proj = nn.Linear(HAND_ACTION_DIM, embed_dim)
+
+        # Learned positional embeddings
+        self.pos_embedding = nn.Embedding(max_len + 1, embed_dim)
+
+        # Transformer encoder (pre-norm for gradient stability)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 2,
+            dropout=dropout,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
+            norm_first=True,         # pre-norm: more stable than post-norm
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers,
+                                                  enable_nested_tensor=False)
+
+
+        # Attention pooling: learned scalar per token → weighted sum
+        self.attn_pool = nn.Linear(embed_dim, 1)
         self.output_norm = nn.LayerNorm(embed_dim)
 
     def forward(
         self,
-        action_seq: torch.Tensor,     # (batch, max_seq, 77)
-        seq_lengths: torch.Tensor,    # (batch,) — actual lengths
+        action_seq: torch.Tensor,     # (batch, max_seq, HAND_ACTION_DIM)
+        seq_lengths: torch.Tensor,    # (batch,) — actual lengths, ≥ 1
     ) -> torch.Tensor:
         """Returns (batch, embed_dim) hand_story."""
-        batch_size = action_seq.shape[0]
+        B, T, _ = action_seq.shape
 
-        # Compact GRU weights for cuDNN efficiency
-        self.gru.flatten_parameters()
+        # Project tokens + add positional embeddings
+        positions = torch.arange(T, device=action_seq.device).unsqueeze(0)  # (1, T)
+        x = self.input_proj(action_seq) + self.pos_embedding(positions)     # (B, T, embed_dim)
 
-        # Clamp lengths to valid range
-        seq_lengths = seq_lengths.clamp(min=1).cpu()
+        # Padding mask: True = ignore (padded position)
+        seq_lengths = seq_lengths.clamp(min=1)
+        pad_mask = torch.arange(T, device=action_seq.device).unsqueeze(0) >= seq_lengths.unsqueeze(1)  # (B, T)
 
-        # Pack for efficient GRU processing
-        packed = nn.utils.rnn.pack_padded_sequence(
-            action_seq, seq_lengths, batch_first=True, enforce_sorted=False
-        )
-        _, hidden = self.gru(packed)  # hidden: (num_layers, batch, embed_dim)
+        # Full self-attention over valid tokens
+        x = self.transformer(x, src_key_padding_mask=pad_mask)  # (B, T, embed_dim)
 
-        # Take the final layer's hidden state
-        hand_story = hidden[-1]  # (batch, embed_dim)
-        return self.output_norm(hand_story)
+        # Attention pooling over valid tokens → (B, embed_dim)
+        attn_w = self.attn_pool(x).squeeze(-1)          # (B, T)
+        attn_w = attn_w.masked_fill(pad_mask, -1e9)     # mask padding
+        attn_w = torch.softmax(attn_w, dim=-1)           # (B, T)
+        pooled = (attn_w.unsqueeze(-1) * x).sum(dim=1)  # (B, embed_dim)
+
+        return self.output_norm(pooled)
+
 
 
 class PolicyNetwork(nn.Module):
