@@ -59,7 +59,24 @@ if __name__ == "__main__":
     import random
     import torch.nn as nn
     print(f"Device: {trainer.device}")
+    is_compiled = hasattr(trainer.policy, '_orig_mod')
+    print(f"torch.compile active: {is_compiled}")
     print(f"Running 10 epochs (100 hands each)...")
+
+    # Warm-up: one forward pass so compile JIT cost is excluded from epoch timings
+    if is_compiled:
+        print("Warming up compiled policy...")
+        _hole = torch.zeros(1, 2, dtype=torch.long)
+        _comm = torch.full((1, 5), -1, dtype=torch.long)
+        _num  = torch.zeros(1, 23)
+        _oe   = torch.zeros(1, 1, config.embed_dim)
+        _os   = torch.zeros(1, 1, 16)
+        _ow   = torch.zeros(1, 16)
+        with torch.inference_mode():
+            trainer.policy(_hole, _comm, _num, _oe, _os, _ow)
+        print("Warmup done.")
+
+
 
     for epoch in range(10):
         print(f"\n--- EPOCH {epoch+1} ---")

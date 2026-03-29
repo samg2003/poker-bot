@@ -512,7 +512,7 @@ class PolicyNetwork(nn.Module):
             bet_size_logits = bet_size_logits.masked_fill(~sizing_mask, float('-inf'))
 
         # 7. Value head (uses its own trunk, not shared features)
-        value = self.value_head(value_features)  # (batch, 1)
+        value = F.softplus(self.value_head(value_features))  # V_res ≥ 0: option value is never negative
 
         return ActionOutput(
             action_type_logits=action_logits,

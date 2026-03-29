@@ -5,6 +5,9 @@ Allows massively parallel CPU simulation using gym.vector.AsyncVectorEnv.
 Runs a single Poker Game per environment on CPU. 
 """
 
+import os
+os.environ.setdefault('OMP_NUM_THREADS', '1')  # Must be before torch import to prevent OpenMP contention
+
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -21,7 +24,6 @@ class PokerGymEnv(gym.Env):
         
         self.config = NLHETrainingConfig(**config_dict)
         self.config.device = 'cpu'
-        torch.set_num_threads(1)  # CRITICAL: Prevent OpenMP thread contention across N parallel workers
         self.trainer = NLHESelfPlayTrainer(self.config)
         
         # Load weights locally to avoid IPC locking issues

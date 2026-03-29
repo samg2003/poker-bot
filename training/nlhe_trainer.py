@@ -1738,7 +1738,7 @@ class NLHESelfPlayTrainer:
             batch_s_mask = torch.tensor(obs['sizing_mask'], device=self.device).to(torch.bool)
             batch_opp_embed = torch.tensor(obs['opponent_embeddings'], device=self.device)
             
-            with torch.no_grad():
+            with torch.inference_mode():
                 embed_sums = batch_opp_embed.sum(dim=-1)
                 batch_opp_mask = (embed_sums == 0)
 
