@@ -228,25 +228,46 @@ class Eval7Evaluator:
         cards_needed = 5 - len(e7_board)
         deck_list = deck.cards
         
-        for _ in range(runouts):
-            # Sample remaining board
-            if cards_needed > 0:
-                sim_board = e7_board + random.sample(deck_list, cards_needed)
-            else:
+        if cards_needed > 0:
+            import numpy as np
+            deck_arr = np.array(deck_list, dtype=object)
+            # Fast vectorized without-replacement sampling
+            rand_vals = np.random.rand(runouts, len(deck_list))
+            sample_indices = np.argsort(rand_vals, axis=1)[:, :cards_needed]
+            sampled_cards = deck_arr[sample_indices]
+
+            for r_idx in range(runouts):
+                sim_board = e7_board + sampled_cards[r_idx].tolist()
+                
+                best_score = -1
+                winners = []
+                for i, h in enumerate(e7_hands):
+                    score = eval7.evaluate(sim_board + h)
+                    if score > best_score:
+                        best_score = score
+                        winners = [i]
+                    elif score == best_score:
+                        winners.append(i)
+                        
+                for w in winners:
+                    wins[w] += 1.0 / len(winners)
+                    
+        else:
+            for _ in range(runouts):
                 sim_board = e7_board
                 
-            best_score = -1
-            winners = []
-            for i, h in enumerate(e7_hands):
-                score = eval7.evaluate(sim_board + h)
-                if score > best_score:
-                    best_score = score
-                    winners = [i]
-                elif score == best_score:
-                    winners.append(i)
-                    
-            for w in winners:
-                wins[w] += 1.0 / len(winners)
+                best_score = -1
+                winners = []
+                for i, h in enumerate(e7_hands):
+                    score = eval7.evaluate(sim_board + h)
+                    if score > best_score:
+                        best_score = score
+                        winners = [i]
+                    elif score == best_score:
+                        winners.append(i)
+                        
+                for w in winners:
+                    wins[w] += 1.0 / len(winners)
                 
         return [w / runouts for w in wins]
 
