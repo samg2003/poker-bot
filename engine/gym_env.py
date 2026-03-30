@@ -179,19 +179,20 @@ class PokerGymEnv(gym.Env):
             else:
                 state_dict = self.generator.send(injected_tuple)
                 
-            # Auto-play Opponents CPU
-            while 'frozen_idx' in state_dict:
-                op_idx = state_dict['frozen_idx']
-                frozen = self.trainer._frozen_models.get(op_idx, self.trainer._frozen_template)
+            # Auto-play Opponents on this worker's CPU — loop until we hit a Hero decision
+            while not state_dict.get('_is_hero', True):
+                pool_idx = state_dict.get('_pool_idx', 0)
+                frozen = self.trainer._frozen_models.get(pool_idx, self.trainer._frozen_template)
                 
                 # Pad state dynamically to local batch=1
                 obs_padded = self._pad_obs(state_dict)
                 batch = {k: torch.tensor(v).unsqueeze(0) for k, v in obs_padded.items()}
                 
-                # Create mask
-                curr_opps = state_dict['opponent_embeddings'].shape[1]
+                # Create opponent mask from actual opp count
+                opp_emb = state_dict.get('opponent_embeddings', None)
+                curr_opps = opp_emb.shape[1] if opp_emb is not None else 1
                 m = torch.ones(1, self.max_opps, dtype=torch.bool)
-                m[0, :curr_opps] = False
+                m[0, :min(curr_opps, self.max_opps)] = False
                 batch['opponent_mask'] = m
                 
                 # Cast Gym int8 masks back to torch.bool for PyTorch masked_fill
@@ -204,11 +205,11 @@ class PokerGymEnv(gym.Env):
                 opp_probs = output.action_type_probs[0]
                 opp_val = output.value[0, 0].item() if hasattr(output, 'value') else 0.0
                 opp_sizing = torch.softmax(output.bet_size_logits[0], dim=-1).tolist()
-                opp_emb_tup = state_dict['opponent_embeddings']
+                opp_emb_tup = self._stashed_opp_embed if self._stashed_opp_embed is not None else torch.zeros(1, self.max_opps, self.config.opponent_embed_dim)
                 
                 state_dict = self.generator.send((opp_probs, opp_val, opp_sizing, opp_emb_tup))
 
-            # Hit a Hero node
+            # Hit a Hero node — return obs to main process for centralized policy inference
             obs = self._pad_obs(state_dict)
             return obs, 0.0, False, False, {}
 
