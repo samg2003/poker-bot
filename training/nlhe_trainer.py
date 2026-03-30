@@ -1811,7 +1811,7 @@ class NLHESelfPlayTrainer:
             pool_archive_np = [_sd_to_np(sd) for sd in self.opponent_pool_archive]
             config_dict = {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
 
-            ctx = mp.get_context('fork')
+            ctx = mp.get_context('spawn')  # spawn avoids fork's PyTorch lock inheritance deadlock
             self._mp_pool = ctx.Pool(
                 num_workers,
                 initializer=_mp_init_worker,
