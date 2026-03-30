@@ -1848,10 +1848,12 @@ class NLHESelfPlayTrainer:
                     print(f"    [Frozen sync] Pool: {len(self.opponent_pool_recent)} recent + {len(self.opponent_pool_archive)} archive = {pool_total}")
 
             # Batched simulation: all hands run as generators with batched GPU calls
+            sim_start = time.time()
             if self.config.num_workers > 0:
-                all_exp, total_reward = self._run_vectorized_epoch()
+                all_exp, total_reward = self._run_multiprocess_epoch()
             else:
                 all_exp, total_reward = self._run_batched_epoch()
+            sim_time = time.time() - sim_start
 
             avg_reward = total_reward / self.config.hands_per_epoch
 
@@ -1859,11 +1861,14 @@ class NLHESelfPlayTrainer:
             action_pcts = self._count_action_distribution(all_exp)
 
             # Pre-compute GAE and batch tensors ONCE
+            pre_start = time.time()
             self.policy.train()
             self.opponent_encoder.train()
             ppo_data = self._precompute_ppo_data(all_exp)
+            pre_time = time.time() - pre_start
 
             # Mini-batch PPO update
+            ppo_start = time.time()
             total_loss = 0.0
             total_action_loss = 0.0
             total_sizing_loss = 0.0
@@ -1894,6 +1899,7 @@ class NLHESelfPlayTrainer:
             avg_a = total_action_loss / max(num_updates, 1)
             avg_s = total_sizing_loss / max(num_updates, 1)
             avg_v = total_value_loss / max(num_updates, 1)
+            ppo_time = time.time() - ppo_start
 
             # Free experience memory and flush device cache
             del all_exp
@@ -1920,6 +1926,8 @@ class NLHESelfPlayTrainer:
                     f"F/Ch/Ca/R/AI: {action_pcts['fold']:.0f}/{action_pcts['check']:.0f}/{action_pcts['call']:.0f}/{action_pcts['raise']:.0f}/{action_pcts['allin']:.0f}% "
                     f"DAI:{deep_ai:.0f}%"
                 )
+                if self.config.verbose:
+                    print(f"    ⏱ sim={sim_time:.1f}s pre={pre_time:.1f}s ppo={ppo_time:.1f}s ({num_updates} steps)", flush=True)
 
             if epoch_callback:
                 epoch_callback(self, epoch + 1, metrics)
