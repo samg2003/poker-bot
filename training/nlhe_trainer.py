@@ -1435,7 +1435,7 @@ class NLHESelfPlayTrainer:
 
                     # Phase 5+6: Batch hand action sequences & profiles
                     batch_ha_seq = torch.cat([s.get('hand_action_seq', torch.zeros(1, MAX_HAND_ACTIONS, ACTION_FEATURE_DIM)) for s in sub_states], dim=0).to(self.device)
-                    batch_ha_len = torch.cat([s.get('hand_action_len', torch.ones(1, dtype=torch.long)) for s in sub_states], dim=0)
+                    batch_ha_len = torch.cat([s.get('hand_action_len', torch.ones(1, dtype=torch.long)) for s in sub_states], dim=0).to(self.device)
                     batch_actor_prof = torch.cat([s.get('actor_profiles_seq', torch.zeros(1, MAX_HAND_ACTIONS, PROFILE_DIM)) for s in sub_states], dim=0).to(self.device)
                     
                     batch_hero_prof = torch.stack([s.get('hero_profile', torch.zeros(PROFILE_DIM)) for s in sub_states], dim=0).to(self.device)
