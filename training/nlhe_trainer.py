@@ -1780,6 +1780,7 @@ class NLHESelfPlayTrainer:
         )
         
         loss.backward()
+
         
         return loss.item(), action_loss.item(), sizing_loss.item(), value_loss.item()
 

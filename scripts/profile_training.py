@@ -84,7 +84,7 @@ if __name__ == "__main__":
         t0 = time.time()
         
         if config.num_workers > 0:
-            all_exp, reward = trainer._run_vectorized_epoch()
+            all_exp, reward = trainer._run_multiprocess_epoch()
         else:
             all_exp, reward = trainer._run_batched_epoch()
         sim_time = time.time() - t0
