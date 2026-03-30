@@ -1402,6 +1402,9 @@ class NLHESelfPlayTrainer:
                         total_reward += reward
                         total_finished += 1
                         del pending[game_idx]
+                        if self.config.verbose and total_finished % 100 == 0:
+                            elapsed = time.time() - epoch_start
+                            print(f"      [{total_finished}/{num_hands} hands, {elapsed:.0f}s]", flush=True)
 
         return all_exp, total_reward
 
@@ -1797,6 +1800,8 @@ class NLHESelfPlayTrainer:
                             all_exp.extend(exps)
                             total_reward += exps[-1].reward if exps else 0.0
                             finished_hands += 1
+                            if self.config.verbose and finished_hands % 100 == 0:
+                                print(f"      [{finished_hands}/{self.config.hands_per_epoch} hands]", flush=True)
                             if finished_hands >= self.config.hands_per_epoch:
                                 break
 
