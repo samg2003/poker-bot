@@ -1811,14 +1811,30 @@ class NLHESelfPlayTrainer:
             pool_archive_np = [_sd_to_np(sd) for sd in self.opponent_pool_archive]
             config_dict = {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
 
+            # Set thread limits BEFORE spawn so children inherit them
+            import os
+            old_omp = os.environ.get('OMP_NUM_THREADS')
+            os.environ['OMP_NUM_THREADS'] = '1'
+            os.environ['MKL_NUM_THREADS'] = '1'
+            os.environ['OPENBLAS_NUM_THREADS'] = '1'
+
             ctx = mp.get_context('spawn')  # spawn avoids fork's PyTorch lock inheritance deadlock
             self._mp_pool = ctx.Pool(
                 num_workers,
                 initializer=_mp_init_worker,
                 initargs=(config_dict, policy_np, opp_enc_np, pool_recent_np, pool_archive_np),
             )
+
+            # Restore parent's thread count for PPO phase
+            if old_omp is not None:
+                os.environ['OMP_NUM_THREADS'] = old_omp
+            else:
+                os.environ.pop('OMP_NUM_THREADS', None)
+                os.environ.pop('MKL_NUM_THREADS', None)
+                os.environ.pop('OPENBLAS_NUM_THREADS', None)
+
             if self.config.verbose:
-                print(f"      [MP] Created pool with {num_workers} workers", flush=True)
+                print(f"      [MP] Created pool with {num_workers} workers (1 thread each)", flush=True)
 
         # Lightweight args per worker — NO state dicts (those are in the initializer)
         args_list = []
