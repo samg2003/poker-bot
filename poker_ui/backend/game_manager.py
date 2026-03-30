@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from engine.dealer import Dealer
 from engine.game_state import GameState, Action, ActionType, Street
-from model.policy_network import PolicyNetwork
+from model.policy_network import PolicyNetwork, OPP_GAME_STATE_DIM, PROFILE_DIM, MAX_HAND_ACTIONS, ACTION_FEATURE_DIM
 from model.opponent_encoder import OpponentEncoder
 from model.stat_tracker import StatTracker, NUM_STAT_FEATURES, HandRecord
 from model.action_space import ActionIndex, NUM_ACTION_TYPES, encode_action
@@ -273,6 +273,29 @@ class GameManager:
         self._first_bet_this_street_by = -1
         self._current_street = Street.PREFLOP
 
+        # ── Hand action history tokens (mirrors training) ──
+        self._hand_action_tokens = []  # list of (raw_token_tensor, eng_idx)
+
+        # ── Build per-player profiles via profile_builder ──
+        active_uids = [self.seats[s].uid for s in self.seat_map]
+        embs = []
+        stats_list = []
+        for eng_i, seat_i in enumerate(self.seat_map):
+            uid = self.seats[seat_i].uid
+            emb = self._get_opponent_embedding(uid)
+            embs.append(emb.squeeze(0))
+            stats_list.append(self.stat_tracker.get_stats(uid).squeeze(0))
+
+        embs_t = torch.stack(embs, dim=0)        # (num_p, embed_dim)
+        stats_t = torch.stack(stats_list, dim=0)  # (num_p, stat_dim)
+        with torch.no_grad():
+            self._profiles_as_hero = self.policy.profile_builder(
+                embs_t, stats_t, torch.ones(num_engine_players, 1)
+            ).detach()  # (num_p, 64)
+            self._profiles_as_opp = self.policy.profile_builder(
+                embs_t, stats_t, torch.zeros(num_engine_players, 1)
+            ).detach()  # (num_p, 64)
+
         # Sync stacks back (blinds have been posted)
         for eng_idx, seat_idx in enumerate(self.seat_map):
             self.seats[seat_idx].stack = self.game_state.players[eng_idx].stack
@@ -309,45 +332,66 @@ class GameManager:
         self._current_embed_cache.clear()
 
     def _evaluate_seat(self, eng_idx: int) -> Dict[str, Any]:
-        """Runs the neural network as if it was in the given engine seat."""
+        """Runs the neural network as if it was in the given engine seat.
+
+        Mirrors the training inference path exactly — passes all 13+ inputs
+        including hand action history, player profiles, and opponent game state.
+        """
+        from model.action_space import get_sizing_mask
+        from training.state_encoder import encode_state, get_opponent_stats, get_opponent_game_state
+        from model.policy_network import MAX_HAND_ACTIONS, ACTION_FEATURE_DIM, PROFILE_DIM
+        import math
+
         p = self.game_state.players[eng_idx]
         seat_idx = self.seat_map[eng_idx]
         seat_info = self.seats[seat_idx]
         num_engine_players = len(self.seat_map)
         active_uids = [self.seats[s].uid for s in self.seat_map]
 
-        hole = torch.tensor([list(p.hole_cards)], dtype=torch.long)
-        board = list(self.game_state.board)
-        while len(board) < 5: board.append(-1)
-        community = torch.tensor([board[:5]], dtype=torch.long)
+        # ── 1. Encode state (uses same function as training) ──
+        encoded = encode_state(self.game_state, eng_idx, device=torch.device('cpu'))
 
-        pot = self.game_state.pot / 100.0
-        own_stack = p.stack / 100.0
-        own_bet = p.bet_this_street / 100.0
-        rel_pos = (eng_idx - self.game_state.dealer_button) % num_engine_players
+        # ── 2. Opponent embeddings + stats (existing) ──
+        opp_embed = self._get_all_opponent_embeddings(seat_info.uid, active_uids)
+        opp_stats = self._get_opponent_stats(seat_info.uid, active_uids)
+        own_stats = self.stat_tracker.get_stats(seat_info.uid).unsqueeze(0)
 
-        # 9-dim seat one-hot
-        seat_onehot = [0.0] * 9
-        seat_onehot[rel_pos] = 1.0
+        # ── 3. Opponent game state (NEW — was missing) ──
+        opp_game_state = get_opponent_game_state(
+            self.game_state, eng_idx, num_engine_players, device=torch.device('cpu')
+        )
 
-        # IP flag
-        active_positions = []
-        for i, pp in enumerate(self.game_state.players):
-            if pp.is_active:
-                active_positions.append((i - self.game_state.dealer_button) % num_engine_players)
-        ip_flag = 1.0 if (active_positions and rel_pos == max(active_positions)) else 0.0
+        # ── 4. Opponent mask for padding ──
+        num_opps = opp_embed.shape[1]
+        opp_mask = torch.zeros(1, num_opps, dtype=torch.bool)
 
-        # 4-dim street one-hot
-        street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
-        street_idx = street_map.get(self.game_state.street, 0)
-        street_onehot = [0.0] * 4
-        street_onehot[street_idx] = 1.0
+        # ── 5. Hand action history (NEW — was missing) ──
+        n_actions = len(self._hand_action_tokens)
+        ha_seq = torch.zeros(1, MAX_HAND_ACTIONS, ACTION_FEATURE_DIM)
+        ha_len = torch.tensor([min(n_actions, MAX_HAND_ACTIONS)], dtype=torch.long)
+        if n_actions > 0:
+            tokens = [t for t, _ in self._hand_action_tokens[-MAX_HAND_ACTIONS:]]
+            ha_seq[0, :len(tokens)] = torch.stack(tokens)
 
-        num_active = sum(1 for pp in self.game_state.players if pp.is_active)
-        current_bet = self.game_state.current_bet / 100.0
-        min_raise = self.game_state.min_raise / 100.0
-        amount_to_call = max(0.0, current_bet - own_bet)
-        # Effective SPR: min(hero_stack, max(active_opponent_stacks)) / pot
+        # ── 6. Actor profiles for hand history tokens (NEW — was missing) ──
+        actor_profiles_seq = torch.zeros(1, MAX_HAND_ACTIONS, PROFILE_DIM)
+        if hasattr(self, '_profiles_as_hero') and hasattr(self, '_profiles_as_opp'):
+            for i, (_, apid) in enumerate(self._hand_action_tokens[-MAX_HAND_ACTIONS:]):
+                if apid == eng_idx:
+                    actor_profiles_seq[0, i] = self._profiles_as_hero[apid]
+                else:
+                    actor_profiles_seq[0, i] = self._profiles_as_opp[apid]
+
+        # ── 7. Hero + opponent profiles (NEW — was missing) ──
+        hero_profile = None
+        opponent_profiles = None
+        if hasattr(self, '_profiles_as_hero') and hasattr(self, '_profiles_as_opp'):
+            hero_profile = self._profiles_as_hero[eng_idx].unsqueeze(0)
+            opp_ids = [opid for opid in range(num_engine_players) if opid != eng_idx]
+            opponent_profiles = self._profiles_as_opp[opp_ids].unsqueeze(0)
+
+        # ── 8. Sizing mask ──
+        bb = max(self.game_state.big_blind, 1.0)
         active_opp_stacks = [
             pp.stack for j, pp in enumerate(self.game_state.players)
             if j != eng_idx and pp.is_active
@@ -355,35 +399,26 @@ class GameManager:
         max_opp_stack = max(active_opp_stacks) if active_opp_stacks else p.stack
         effective_stack = min(p.stack, max_opp_stack)
         spr = effective_stack / max(self.game_state.pot, 0.01)
-
-        numeric = torch.tensor([[
-            pot, own_stack, own_bet,
-            *seat_onehot,        # 9 dims
-            ip_flag,             # 1 dim
-            *street_onehot,      # 4 dims
-            num_engine_players / 9.0, num_active / 9.0,
-            current_bet, min_raise, amount_to_call,
-            spr,                 # 1 dim
-        ]], dtype=torch.float32)
-
-        legal_types = self.game_state.get_legal_actions()
-        mask = torch.zeros(1, NUM_ACTION_TYPES, dtype=torch.bool)
-        for at in legal_types:
-            if at == ActionType.FOLD: mask[0, ActionIndex.FOLD] = True
-            elif at == ActionType.CHECK: mask[0, ActionIndex.CHECK] = True
-            elif at == ActionType.CALL: mask[0, ActionIndex.CALL] = True
-            elif at in (ActionType.RAISE, ActionType.ALL_IN): mask[0, ActionIndex.RAISE] = True
-
-        opp_embed = self._get_all_opponent_embeddings(seat_info.uid, active_uids)
-        opp_stats = self._get_opponent_stats(seat_info.uid, active_uids)
-        own_stats = self.stat_tracker.get_stats(seat_info.uid).unsqueeze(0)
-
-        from model.action_space import get_sizing_mask
         sizing_mask = get_sizing_mask(self.game_state, spr=spr).unsqueeze(0)
 
+        # ── Forward pass with ALL inputs ──
         with torch.no_grad():
             out = self.policy(
-                hole, community, numeric, opp_embed, opp_stats, own_stats, action_mask=mask, sizing_mask=sizing_mask
+                hole_cards=encoded['hole_cards'],
+                community_cards=encoded['community_cards'],
+                numeric_features=encoded['numeric_features'],
+                opponent_embeddings=opp_embed,
+                opponent_stats=opp_stats,
+                own_stats=own_stats,
+                opponent_game_state=opp_game_state,
+                opponent_mask=opp_mask,
+                action_mask=encoded['action_mask'],
+                sizing_mask=sizing_mask,
+                hand_action_seq=ha_seq,
+                hand_action_len=ha_len,
+                actor_profiles_seq=actor_profiles_seq,
+                hero_profile=hero_profile,
+                opponent_profiles=opponent_profiles,
             )
 
         probs = out.action_type_probs[0].tolist()
@@ -391,21 +426,18 @@ class GameManager:
         sizing_probs = torch.softmax(sizing_logits, dim=-1).tolist()
         ev = out.value[0, 0].item()
 
-
-
-        import math
+        # Compute per-action EVs using soft-Q approximation
+        legal_types = self.game_state.get_legal_actions()
         action_evs = {}
-        T = 0.5  # Soft-Q temperature
-        bb = max(self.game_state.big_blind, 1.0)
-        
+        T = 0.5
+
         for i, name in enumerate(["FOLD", "CHECK", "CALL", "RAISE"]):
             prob = probs[i]
-            # Verify if action is legal
             is_legal = any(at.name == name for at in legal_types)
             if name == "RAISE" and not is_legal and any(at.name == "ALL_IN" for at in legal_types):
                 name = "ALL_IN"
                 is_legal = True
-                
+
             if is_legal:
                 if name == "FOLD":
                     action_evs[name] = -(p.bet_total / bb)
@@ -485,7 +517,18 @@ class GameManager:
 
         # Record History (keyed by uid)
         pot_base = self.game_state.pot
-        self._record_action(seat_info.uid, self._action_to_type_idx(action), bet_frac, pot_base, p.stack, street_map.get(pre_street, 0))
+        pot_for_record = pot_base / max(self.game_state.big_blind, 1.0)
+        self._record_action(seat_info.uid, self._action_to_type_idx(action), bet_frac, pot_for_record, p.stack, street_map.get(pre_street, 0))
+
+        # Record raw hand action token (mirrors training _play_hand_gen)
+        dealer_btn = self.game_state.dealer_button
+        rel_pos = ((eng_idx - dealer_btn) % num_engine_players) / 8.0
+        raw_token = encode_action(
+            self._action_to_type_idx(action), bet_frac, pot_for_record, p.stack,
+            street_map.get(pre_street, 0), relative_position=rel_pos,
+            hand_boundary=0.0,
+        )
+        self._hand_action_tokens.append((raw_token, eng_idx))
 
         # Street transition
         if self.game_state.street != self._current_street:
