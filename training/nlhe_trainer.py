@@ -184,7 +184,7 @@ class NLHETrainingConfig:
     gae_lambda: float = 0.95     # GAE lambda parameter
     ppo_clip: float = 0.2
     ppo_epochs: int = 4
-    mini_batch_size: int = 64          # mini-batch size for PPO updates
+    mini_batch_size: int = 256         # mini-batch size for PPO updates
     entropy_coef: float = 0.005   # was 0.05 — reduced 10x to not drown out policy gradient
     entropy_coef_end: float = 0.001
     value_coef: float = 0.5
