@@ -34,6 +34,9 @@ from model.opponent_encoder import OpponentEncoder
 from model.policy_network import PolicyNetwork, OPP_GAME_STATE_DIM, PROFILE_DIM, MAX_HAND_ACTIONS
 from model.stat_tracker import StatTracker, HandRecord, NUM_STAT_FEATURES
 from model.nlhe_encoder import NLHEEncoder
+from training.opponent_pool import OpponentPool
+from training.ppo_updater import compute_gae, precompute_ppo_data, compute_ppo_loss, count_action_distribution
+from training.state_encoder import encode_state, encode_action_mask, get_opponent_stats, get_opponent_game_state, compute_hero_ev
 
 
 # ─────────────────────────────────────────────────────────────
@@ -126,9 +129,7 @@ class NLHETrainingConfig:
     # Opponent modeling
     history_reset_interval: Tuple[int, int] = (300, 500)
 
-    # Search-guided training (expert iteration)
-    search_fraction: float = 0.0     # fraction of hands to use search (0-1)
-    search_iterations: int = 50      # CFR iterations per search call
+
 
     # Equity-based reward decomposition
     mc_equity_sims: int = 500         # MC runouts per equity computation during training
@@ -190,26 +191,22 @@ class NLHESelfPlayTrainer:
         all_params = list(self.policy.parameters()) + list(self.opponent_encoder.parameters())
         self.optimizer = torch.optim.Adam(all_params, lr=self.config.lr)
 
-        # ── Frozen opponent (no gradients, provides stable opposition) ──
-        # Template model on CPU for cloning into per-seat frozen models
-        self._frozen_template = copy.deepcopy(self.policy) # Now kept on original device or moved dynamically
-        self.frozen_opponent_encoder = copy.deepcopy(self.opponent_encoder)
-        for p in self._frozen_template.parameters():
-            p.requires_grad = False
-        for p in self.frozen_opponent_encoder.parameters():
-            p.requires_grad = False
+        # ── Opponent pool ─────────────────────────────────────
+        self.pool = OpponentPool(
+            embed_dim=self.config.embed_dim,
+            opponent_embed_dim=self.config.opponent_embed_dim,
+            num_heads=self.config.num_heads,
+            num_layers=self.config.num_layers,
+            max_recent=self.config.max_recent_pool,
+            max_archive=self.config.max_archive_pool,
+            rng=self.rng,
+        )
+        # Seed pool with initial weights
+        self.pool.sync(self.policy.state_dict(), self.opponent_encoder.state_dict())
 
-        # Two-tier opponent pool: recent (FIFO) + archive (old preserved)
-        self.opponent_pool_recent: List[dict] = [
-            {k: v.cpu() for k, v in self.policy.state_dict().items()}
-        ]
-        self.opponent_pool_archive: List[dict] = []
-        # Per-table frozen models: {pool_idx: model}
-        self._frozen_models: Dict[int, 'PolicyNetwork'] = {}
-
-        # Personality curriculum
+        # Epoch tracking
         self.current_epoch = 0
-        self.total_epochs = 1  # set by train() for annealing schedules
+        self.total_epochs = 1
 
         # ── Hand counter for unique hand IDs ──────────────────
         self._hand_counter = 0
@@ -234,94 +231,16 @@ class NLHESelfPlayTrainer:
         return tensor.to(self.device)
 
     def _sync_frozen(self):
-        """
-        Save current live weights to opponent pool (two-tier: recent + archive).
-        """
-        cpu_state = {k: v.cpu() for k, v in self.policy.state_dict().items()}
-
-        # Evict oldest recent entry → 30% chance it goes to archive
-        if len(self.opponent_pool_recent) >= self.config.max_recent_pool:
-            evicted = self.opponent_pool_recent.pop(0)
-            if len(self.opponent_pool_archive) < self.config.max_archive_pool:
-                # Free slot — always archive
-                self.opponent_pool_archive.append(evicted)
-            elif self.rng.random() < 0.30:
-                # Archive full — 30% chance replace a random entry
-                idx = self.rng.randint(0, len(self.opponent_pool_archive) - 1)
-                self.opponent_pool_archive[idx] = evicted
-
-        self.opponent_pool_recent.append(cpu_state)
-
-        # Also sync opponent encoder
-        cpu_enc_state = {k: v.cpu() for k, v in self.opponent_encoder.state_dict().items()}
-        self.frozen_opponent_encoder.load_state_dict(cpu_enc_state)
-
-        # Reset current loaded index
-        self._frozen_models = {}  # force rebuild on next table setup
-
-        self._sync_workers()
-
-    def _sync_workers(self):
-        """Placeholder for future worker sync."""
-        pass
-
-    def _get_combined_pool(self) -> List[dict]:
-        """Get combined pool (recent + archive) as a single list."""
-        return self.opponent_pool_recent + self.opponent_pool_archive
-
-    def _build_table_models(self, seat_pool_idx: Dict[int, int]):
-        """Build frozen models for each unique pool index at the table."""
-        combined_pool = self._get_combined_pool()
-        unique_indices = set(seat_pool_idx.values())
-        for idx in unique_indices:
-            if idx not in self._frozen_models and idx < len(combined_pool):
-                model = self._make_frozen_model(combined_pool[idx])
-                self._frozen_models[idx] = model
-
-    def _make_frozen_model(self, state_dict: dict):
-        """Create a fresh frozen model from state dict."""
-        from model.policy_network import PolicyNetwork
-        model = PolicyNetwork(
-            embed_dim=self.config.embed_dim,
-            num_cross_attn_heads=self.config.num_heads,
-            num_cross_attn_layers=self.config.num_layers,
-            opponent_embed_dim=self.config.opponent_embed_dim,
-        ).to('cpu')
-        model.load_state_dict(state_dict)
-        model.eval()
-        for p in model.parameters():
-            p.requires_grad = False
-        return model
+        """Sync current live weights to opponent pool."""
+        self.pool.sync(self.policy.state_dict(), self.opponent_encoder.state_dict())
 
     def save_pool(self, save_dir: str):
-        """Save opponent pool to disk for checkpoint persistence."""
-        import os
-        pool_dir = os.path.join(save_dir, 'pool')
-        os.makedirs(pool_dir, exist_ok=True)
-        for i, sd in enumerate(self.opponent_pool_recent):
-            torch.save(sd, os.path.join(pool_dir, f'recent_{i:03d}.pt'))
-        for i, sd in enumerate(self.opponent_pool_archive):
-            torch.save(sd, os.path.join(pool_dir, f'archive_{i:03d}.pt'))
+        """Save opponent pool to disk."""
+        self.pool.save(save_dir)
 
     def load_pool(self, load_dir: str):
         """Load opponent pool from disk."""
-        import os, glob
-        pool_dir = os.path.join(load_dir, 'pool')
-        if not os.path.exists(pool_dir):
-            return
-        # Load recent entries
-        recent_files = sorted(glob.glob(os.path.join(pool_dir, 'recent_*.pt')))
-        if recent_files:
-            self.opponent_pool_recent = [
-                torch.load(f, map_location='cpu', weights_only=True) for f in recent_files
-            ]
-        # Load archive entries
-        archive_files = sorted(glob.glob(os.path.join(pool_dir, 'archive_*.pt')))
-        if archive_files:
-            self.opponent_pool_archive = [
-                torch.load(f, map_location='cpu', weights_only=True) for f in archive_files
-            ]
-        self._frozen_models = {}  # force rebuild
+        self.pool.load(load_dir)
 
     def _get_epsilon(self) -> float:
         """Get the annealed epsilon for the current epoch."""
@@ -335,87 +254,18 @@ class NLHESelfPlayTrainer:
         progress = min(self.current_epoch / max(self.total_epochs, 1), 1.0)
         return c.entropy_coef + (c.entropy_coef_end - c.entropy_coef) * progress
 
-    def _compute_hero_ev(self, game_state, hero_idx: int = 0) -> float:
-        """Side-pot-aware hero EV via MC equity per pot layer.
 
-        Uses calculate_side_pots() which works mid-hand. For each pot layer,
-        computes MC equity only among eligible players, then sums hero's
-        expected share across all layers.
-        """
-        from engine.hand_evaluator import Eval7Evaluator
-        side_pots = game_state.calculate_side_pots()
-        hero_ev = 0.0
-        for pot_amount, eligible in side_pots:
-            if hero_idx not in eligible:
-                continue
-            hands = [list(game_state.players[i].hole_cards) for i in eligible]
-            equities = Eval7Evaluator.get_equity(
-                hands, list(game_state.board),
-                runouts=self.config.mc_equity_sims,
-            )
-            hero_pos = eligible.index(hero_idx)
-            hero_ev += equities[hero_pos] * pot_amount
-        return hero_ev - game_state.players[hero_idx].bet_total
+    def _maybe_reset_histories(self, table: 'TableState'):
+        """Periodically reset opponent histories (simulate new table)."""
+        table.hands_since_reset += 1
 
-    def _compute_gae(self, trajectory: List[Experience]) -> Tuple[List[float], List[float]]:
-        """
-        Compute GAE with equity-based reward shaping.
-
-        Per-step rewards:
-        - Same street: Δ(equity×pot) between consecutive hero decisions
-        - Cross-street: end_street_equity_x_pot - equity_x_pot (captures opponent responses)
-        - Terminal: ev_profit-based reward (MC equity, not binary)
-
-        V(s) = equity_x_pot + V_res(s) where V_res = value head output.
-        """
-        gamma = self.config.gamma
-        lam = self.config.gae_lambda
-        n = len(trajectory)
-        if n == 0:
-            return [], []
-
-        # V(s) = EV_baseline(s) + V_res(s)
-        values = [exp.equity_x_pot + exp.value for exp in trajectory]
-        terminal_reward = trajectory[-1].reward
-
-        rewards = []
-        for t in range(n):
-            if t == n - 1:
-                rewards.append(terminal_reward)
-            elif trajectory[t].street_idx == trajectory[t + 1].street_idx:
-                rewards.append(0.0)
-            else:
-                # CROSS-STREET FIX:
-                # We want PPO to give credit for (e_end - e_current).
-                # But PPO will automatically add e_next via V(s_t+1).
-                # By making the reward (e_end - e_next), PPO calculates:
-                # Advantage = reward + V(s_next) - V(s_current)
-                # Advantage = (e_end - e_next) + e_next - e_current
-                # Advantage = e_end - e_current
-                e_end = trajectory[t].end_street_equity_x_pot
-                e_next = trajectory[t + 1].equity_x_pot
-                rewards.append(e_end - e_next)
-
-        # TD errors: δ_t = r_t + γ·V(s_{t+1}) - V(s_t)
-        deltas = []
-        for t in range(n):
-            if t == n - 1:
-                delta = rewards[t] - values[t]  # V(terminal) = 0
-            else:
-                delta = rewards[t] + gamma * values[t + 1] - values[t]
-            deltas.append(delta)
-
-        # GAE: A_t = Σ (γλ)^k · δ_{t+k}, computed backward
-        advantages = [0.0] * n
-        gae = 0.0
-        for t in reversed(range(n)):
-            gae = deltas[t] + gamma * lam * gae
-            advantages[t] = gae
-
-        # Returns: G_t = A_t + V(s_t) (proper targets for value head)
-        returns = [advantages[t] + values[t] for t in range(n)]
-
-        return advantages, returns
+        # Hard reset: total flush of histories and stats
+        if table.hands_since_reset >= table.next_reset_at:
+            table.action_histories.clear()
+            table.stat_tracker.reset()
+            table.hands_since_reset = 0
+            table.next_reset_at = self.rng.randint(*self.config.history_reset_interval)
+            table.seat_pool_idx = {}
 
     # ─────────────────────────────────────────────────────────
     # Table sampling
@@ -477,149 +327,7 @@ class NLHESelfPlayTrainer:
 
 
 
-    def _get_opponent_stats(self, table: TableState, hero_id: int, num_players: int) -> torch.Tensor:
-        """Get HUD stats for all opponents. Returns (1, num_opp, stat_dim)."""
-        stats = []
-        for pid in range(num_players):
-            if pid == hero_id:
-                continue
-            stats.append(table.stat_tracker.get_stats(pid))
 
-        if not stats:
-            return torch.zeros(1, 1, NUM_STAT_FEATURES, device=self.device)
-
-        return torch.stack(stats).unsqueeze(0).to(self.device)  # (1, num_opp, stat_dim)
-
-    def _get_opponent_game_state(self, game_state: GameState, hero_id: int, num_players: int) -> torch.Tensor:
-        """Build per-opponent game state: seat_onehot(9) + stack + bet + pot_committed + active + all_in.
-        Returns (1, num_opp, 14)."""
-        bb = max(game_state.big_blind, 1.0)
-        pot = max(game_state.pot, 1.0)
-        opp_states = []
-        for pid in range(num_players):
-            if pid == hero_id:
-                continue
-            p = game_state.players[pid]
-            seat_oh = [0.0] * 9
-            seat_oh[min(pid, 8)] = 1.0
-            opp_states.append(torch.tensor(
-                seat_oh + [
-                    p.stack / (100.0 * bb),
-                    p.bet_this_street / pot if pot > 0 else 0.0,
-                    p.bet_total / (100.0 * bb),
-                    float(p.is_active),
-                    float(p.is_all_in),
-                ], dtype=torch.float32
-            ))
-        if not opp_states:
-            return torch.zeros(1, 1, OPP_GAME_STATE_DIM, device=self.device)
-        return torch.stack(opp_states).unsqueeze(0).to(self.device)
-
-    def _maybe_reset_histories(self, table: TableState):
-        """Periodically reset opponent histories (simulate new table)."""
-        table.hands_since_reset += 1
-
-        # Hard reset: total flush of histories and stats
-        if table.hands_since_reset >= table.next_reset_at:
-            table.action_histories.clear()
-            table.stat_tracker.reset()
-            table.hands_since_reset = 0
-            table.next_reset_at = self.rng.randint(*self.config.history_reset_interval)
-            table.seat_pool_idx = {}
-
-    # ─────────────────────────────────────────────────────────
-    # State encoding
-    # ─────────────────────────────────────────────────────────
-
-    def _encode_action_mask(self, game_state: GameState) -> torch.Tensor:
-        """Encode legal actions as (1, 4) bool tensor on device."""
-        legal_types = game_state.get_legal_actions()
-        mask = torch.zeros(1, NUM_ACTION_TYPES, dtype=torch.bool, device=self.device)
-
-        for at in legal_types:
-            if at == ActionType.FOLD:
-                mask[0, ActionIndex.FOLD] = True
-            elif at == ActionType.CHECK:
-                mask[0, ActionIndex.CHECK] = True
-            elif at == ActionType.CALL:
-                mask[0, ActionIndex.CALL] = True
-            elif at == ActionType.RAISE:
-                mask[0, ActionIndex.RAISE] = True
-            elif at == ActionType.ALL_IN:
-                mask[0, ActionIndex.RAISE] = True
-
-        return mask
-
-    def _encode_state(self, game_state: GameState, player_idx: int) -> dict:
-        """Encode game state to device tensors."""
-        p = game_state.players[player_idx]
-
-        hole = self._to(torch.tensor([list(p.hole_cards)], dtype=torch.long))
-        board = list(game_state.board)
-        while len(board) < 5:
-            board.append(-1)
-        community = self._to(torch.tensor([board[:5]], dtype=torch.long))
-
-        bb = game_state.big_blind
-        norm = 100.0 * bb
-        pot = game_state.pot / norm
-        own_stack = p.stack / norm
-        own_bet = p.bet_this_street / norm
-
-        # 9-dim seat one-hot (relative position from BTN)
-        rel_pos = (player_idx - game_state.dealer_button) % game_state.num_players
-        seat_onehot = [0.0] * 9
-        seat_onehot[rel_pos] = 1.0
-
-        # IP flag: hero acts last postflop?
-        # Approximate: highest relative position among active players = in position
-        active_positions = []
-        for i, pp in enumerate(game_state.players):
-            if pp.is_active:
-                active_positions.append((i - game_state.dealer_button) % game_state.num_players)
-        ip_flag = 1.0 if (active_positions and rel_pos == max(active_positions)) else 0.0
-
-        # 4-dim street one-hot
-        street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
-        street_idx = street_map.get(game_state.street, 0)
-        street_onehot = [0.0] * 4
-        street_onehot[street_idx] = 1.0
-
-        num_active = sum(1 for pp in game_state.players if pp.is_active)
-        current_bet = game_state.current_bet / norm
-        min_raise = game_state.min_raise / norm
-        amount_to_call = max(0.0, current_bet - own_bet)
-        # Effective SPR: min(hero_stack, max(active_opponent_stacks)) / pot
-        active_opp_stacks = [
-            pp.stack for j, pp in enumerate(game_state.players)
-            if j != player_idx and pp.is_active
-        ]
-        max_opp_stack = max(active_opp_stacks) if active_opp_stacks else p.stack
-        effective_stack = min(p.stack, max_opp_stack)
-        spr = effective_stack / max(game_state.pot, 0.01)
-
-        numeric = self._to(torch.tensor([[
-            pot, own_stack, own_bet,
-            *seat_onehot,        # 9 dims
-            ip_flag,             # 1 dim
-            *street_onehot,      # 4 dims
-            game_state.num_players / 9.0, num_active / 9.0,
-            current_bet, min_raise, amount_to_call,
-            spr,                 # 1 dim
-        ]], dtype=torch.float32))
-
-        action_mask = self._encode_action_mask(game_state)
-        
-        from model.action_space import get_sizing_mask
-        sizing_mask = self._to(get_sizing_mask(game_state, spr=spr).unsqueeze(0))
-
-        return {
-            'hole_cards': hole,
-            'community_cards': community,
-            'numeric_features': numeric,
-            'action_mask': action_mask,
-            'sizing_mask': sizing_mask,
-        }
 
     def _decode_action(self, action_idx: int, sizing_idx: int,
                        game_state: GameState) -> Action:
@@ -688,7 +396,7 @@ class NLHESelfPlayTrainer:
         # Per-seat opponent assignment
         if not table.seat_pool_idx or len(table.seat_pool_idx) != num_p - 1:
             table.seat_pool_idx = {}
-            combined_pool = self._get_combined_pool()
+            combined_pool = self.pool.get_combined()
             for pid in range(1, num_p):
                 if combined_pool:
                     table.seat_pool_idx[pid] = self.rng.randint(0, len(combined_pool) - 1)
@@ -757,10 +465,10 @@ class NLHESelfPlayTrainer:
             if not p.is_active:
                 break
 
-            encoded = self._encode_state(game_state, pid)
-            opp_stats = self._get_opponent_stats(table, pid, num_p)
+            encoded = encode_state(game_state, pid, self.device)
+            opp_stats = get_opponent_stats(table.stat_tracker, pid, num_p, self.device)
             own_stats = self._to(table.stat_tracker.get_stats(pid).unsqueeze(0))
-            opp_game_state = self._get_opponent_game_state(game_state, pid, num_p)
+            opp_game_state = get_opponent_game_state(game_state, pid, num_p, self.device)
 
             opp_ids = [opid for opid in range(num_p) if opid != pid]
             uncached = []
@@ -810,7 +518,7 @@ class NLHESelfPlayTrainer:
             if pid == 0:
                 # ── HERO ──
                 # Compute side-pot-aware hero EV before action
-                equity_x_pot = self._compute_hero_ev(game_state, hero_idx=0)
+                equity_x_pot = compute_hero_ev(game_state, hero_idx=0, mc_sims=self.config.mc_equity_sims)
 
                 # Compute effective stack at hero's first decision
                 if hero_step_idx == 0:
@@ -997,7 +705,7 @@ class NLHESelfPlayTrainer:
             if game_state.street != current_street:
                 # Compute end-of-street hero EV (captures opponent responses)
                 if hero_experiences:
-                    end_ev = self._compute_hero_ev(game_state, hero_idx=0)
+                    end_ev = compute_hero_ev(game_state, hero_idx=0, mc_sims=self.config.mc_equity_sims)
                     hero_experiences[-1]['end_street_equity_x_pot'] = end_ev
                 current_street = game_state.street
                 player_checked_this_street = [False] * num_p
@@ -1083,15 +791,15 @@ class NLHESelfPlayTrainer:
 
             # Build all frozen models needed for this table if not existing!
             for i in range(chunk_n):
-                combined_pool = self._get_combined_pool()
+                combined_pool = self.pool.get_combined()
                 for pool_idx in tables[i].seat_pool_idx.values():
-                    if pool_idx not in self._frozen_models:
+                    if pool_idx not in self.pool._frozen_models:
                         if combined_pool and pool_idx < len(combined_pool):
                             fm = copy.deepcopy(self.policy).to(self.device)
                             fm.load_state_dict(combined_pool[pool_idx])
                             for p in fm.parameters(): p.requires_grad = False
                             fm.eval()
-                            self._frozen_models[pool_idx] = fm
+                            self.pool._frozen_models[pool_idx] = fm
 
             games = [self._play_hand_gen(tables[i]) for i in range(chunk_n)]
             pending = {}
@@ -1239,7 +947,7 @@ class NLHESelfPlayTrainer:
 
                     # Phase 5+6: Batch hand action sequences & profiles
                     batch_ha_seq = torch.cat([s.get('hand_action_seq', torch.zeros(1, MAX_HAND_ACTIONS, ACTION_FEATURE_DIM)) for s in sub_states], dim=0).to(self.device)
-                    batch_ha_len = torch.cat([s.get('hand_action_len', torch.ones(1, dtype=torch.long)) for s in sub_states], dim=0)
+                    batch_ha_len = torch.cat([s.get('hand_action_len', torch.ones(1, dtype=torch.long)) for s in sub_states], dim=0).to(self.device)
                     batch_actor_prof = torch.cat([s.get('actor_profiles_seq', torch.zeros(1, MAX_HAND_ACTIONS, PROFILE_DIM)) for s in sub_states], dim=0).to(self.device)
                     
                     batch_hero_prof = torch.stack([s.get('hero_profile', torch.zeros(PROFILE_DIM)) for s in sub_states], dim=0).to(self.device)
@@ -1252,7 +960,7 @@ class NLHESelfPlayTrainer:
                         padded_opp_profiles.append(op.unsqueeze(0))
                     batch_opp_profiles = torch.cat(padded_opp_profiles, dim=0).to(self.device)
 
-                    target_model = self.policy if model_id == 'hero' else self._frozen_models.get(model_id, self._frozen_template)
+                    target_model = self.policy if model_id == 'hero' else self.pool._frozen_models.get(model_id, self.policy)
                     
                     with torch.no_grad():
                         output = target_model(
@@ -1290,53 +998,6 @@ class NLHESelfPlayTrainer:
         return all_exp, total_reward
 
 
-    def _count_action_distribution(self, experiences: List[Experience]) -> Dict[str, float]:
-        """Compute action choice rates WHEN each action was legal (conditional %)."""
-        from model.action_space import POT_FRACTIONS
-        allin_idx = len(POT_FRACTIONS) - 1
-
-        # chosen[action] = times chosen, legal[action] = times it was legal
-        chosen = {'fold': 0, 'check': 0, 'call': 0, 'raise': 0, 'allin': 0}
-        legal = {'fold': 0, 'check': 0, 'call': 0, 'raise': 0, 'allin': 0}
-        deep_raise_count = 0   # raises when hero_stack_bb > 50 (any sizing)
-        deep_allin_count = 0   # raises when hero_stack_bb > 50 AND sizing = all-in
-
-        for e in experiences:
-            mask = e.action_mask.squeeze(0)  # (4,)
-            if mask[ActionIndex.FOLD]:
-                legal['fold'] += 1
-            if mask[ActionIndex.CHECK]:
-                legal['check'] += 1
-            if mask[ActionIndex.CALL]:
-                legal['call'] += 1
-            if mask[ActionIndex.RAISE]:
-                legal['raise'] += 1
-                legal['allin'] += 1  # all-in is a subset of raise legality
-
-            if e.action_idx == ActionIndex.FOLD:
-                chosen['fold'] += 1
-            elif e.action_idx == ActionIndex.CHECK:
-                chosen['check'] += 1
-            elif e.action_idx == ActionIndex.CALL:
-                chosen['call'] += 1
-            elif e.action_idx == ActionIndex.RAISE:
-                if e.sizing_idx == allin_idx:
-                    chosen['allin'] += 1
-                else:
-                    chosen['raise'] += 1
-                # Track deep-stack sizing discipline
-                if e.hero_stack_bb > 50:
-                    deep_raise_count += 1
-                    if e.sizing_idx == allin_idx:
-                        deep_allin_count += 1
-
-        # Return conditional % (chosen / legal) + deep-stack all-in rate
-        rates = {}
-        for k in chosen:
-            rates[k] = (chosen[k] / legal[k] * 100) if legal[k] > 0 else 0.0
-        # "When deep (>50bb) and raising, what % is all-in?" — healthy = 10-20%
-        rates['deep_ai'] = (deep_allin_count / max(deep_raise_count, 1)) * 100
-        return rates
 
     def _precompute_ppo_data(self, experiences: List[Experience]):
         """Pre-compute and batch all PPO data: tensors + GAE advantages/returns.
@@ -1430,7 +1091,7 @@ class NLHESelfPlayTrainer:
         for hid, indices in hand_groups.items():
             indices.sort(key=lambda i: experiences[i].step_idx)
             trajectory = [experiences[i] for i in indices]
-            advantages, returns = self._compute_gae(trajectory)
+            advantages, returns = compute_gae(trajectory, self.config.gamma, self.config.gae_lambda)
             for local_idx, global_idx in enumerate(indices):
                 gae_advantages[global_idx] = advantages[local_idx]
                 gae_returns[global_idx] = returns[local_idx]
@@ -1468,121 +1129,18 @@ class NLHESelfPlayTrainer:
         }
 
     def _compute_ppo_loss_minibatch(self, data: dict, indices: List[int]) -> float:
-        """Compute PPO loss on a mini-batch specified by indices."""
-        idx = torch.tensor(indices, dtype=torch.long)
-
-        # Slice all tensors on CPU, THEN send to device exactly shaped to avoid MPS cache bloat!
-        hole_cards = data['hole_cards'][idx].to(self.device)
-        community = data['community'][idx].to(self.device)
-        numeric = data['numeric'][idx].to(self.device)
-        own_stats = data['own_stats'][idx].to(self.device)
-        action_masks = data['action_masks'][idx].to(self.device)
-        sizing_masks = data['sizing_masks'][idx].to(self.device)
-        opp_embeds = data['opp_embeds'][idx].to(self.device)
-        opp_stats = data['opp_stats'][idx].to(self.device)
-        opp_gs = data['opp_gs'][idx].to(self.device)
-        opp_masks = data['opp_masks'][idx].to(self.device)
-        hand_action_seqs = data['hand_action_seqs'][idx].to(self.device)
-        hand_action_lens = data['hand_action_lens'][idx]
-        actor_profiles_seqs = data['actor_profiles_seqs'][idx].to(self.device)
-        hero_profiles = data['hero_profiles'][idx].to(self.device)
-        opp_profiles = data['opp_profiles'][idx].to(self.device)
-        action_t = data['action_t'][idx].to(self.device)
-        sizing_t = data['sizing_t'][idx].to(self.device)
-        old_log_probs = data['old_log_probs'][idx].to(self.device)
-        old_action_log_probs = data['old_action_log_probs'][idx].to(self.device)
-        old_sizing_log_probs = data['old_sizing_log_probs'][idx].to(self.device)
-        gae_advantages = data['gae_advantages'][idx].to(self.device)
-        gae_returns = data['gae_returns'][idx].to(self.device)
-
-        # Forward pass
-        output = self.policy(
-            hole_cards=hole_cards,
-            community_cards=community,
-            numeric_features=numeric,
-            opponent_embeddings=opp_embeds,
-            opponent_stats=opp_stats,
-            own_stats=own_stats,
-            opponent_game_state=opp_gs,
-            action_mask=action_masks,
-            sizing_mask=sizing_masks,
-            opponent_mask=opp_masks,
-            hand_action_seq=hand_action_seqs,
-            hand_action_len=hand_action_lens,
-            actor_profiles_seq=actor_profiles_seqs,
-            hero_profile=hero_profiles,
-            opponent_profiles=opp_profiles,
+        """Compute PPO loss on a mini-batch."""
+        return compute_ppo_loss(
+            policy=self.policy,
+            data=data,
+            indices=indices,
+            device=self.device,
+            ppo_clip=self.config.ppo_clip,
+            value_coef=self.config.value_coef,
+            entropy_coef=self._get_entropy_coef(),
+            remove_clip=self.config.remove_clip,
+            kl_beta=self.config.kl_beta,
         )
-        
-        # ── Decoupled PPO: action type and sizing get independent credit ──
-        
-        # Action type PPO (all experiences)
-        dist = Categorical(output.action_type_probs)
-        action_log_probs = dist.log_prob(action_t)
-        action_entropy = dist.entropy().mean()
-
-        is_raise = (action_t == ActionIndex.RAISE)
-
-        # Action head ratio
-        action_ratio = torch.exp(action_log_probs - old_action_log_probs)
-        
-        if self.config.remove_clip:
-            approx_kl = old_action_log_probs - action_log_probs
-            action_surr = action_ratio * gae_advantages
-            action_loss = -action_surr.mean() + (self.config.kl_beta * approx_kl.mean())
-        else:
-            surr1 = action_ratio * gae_advantages
-            surr2 = torch.clamp(action_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * gae_advantages
-            action_surr = torch.min(surr1, surr2)
-            dual_clip_bound = torch.where(gae_advantages < 0, 3.0 * gae_advantages, torch.full_like(gae_advantages, -float('inf')))
-            action_loss = -torch.max(action_surr, dual_clip_bound).mean()
-
-        # Sizing head PPO — only computed on raise experiences to avoid NaN
-        if is_raise.any():
-            raise_logits = output.bet_size_logits[is_raise]
-            raise_sizing_t = sizing_t[is_raise]
-            raise_old_slp = old_sizing_log_probs[is_raise]
-            raise_adv = gae_advantages[is_raise]
-
-            sizing_dist = Categorical(logits=raise_logits)
-            sizing_log_probs = sizing_dist.log_prob(raise_sizing_t)
-            sizing_entropy = sizing_dist.entropy().mean()
-
-            sizing_ratio = torch.exp(sizing_log_probs - raise_old_slp)
-            
-            if self.config.remove_clip:
-                s_approx_kl = raise_old_slp - sizing_log_probs
-                s_surr = sizing_ratio * raise_adv
-                sizing_loss = -s_surr.mean() + (self.config.kl_beta * s_approx_kl.mean())
-            else:
-                s_surr1 = sizing_ratio * raise_adv
-                s_surr2 = torch.clamp(sizing_ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * raise_adv
-                s_surr = torch.min(s_surr1, s_surr2)
-                raise_dual_clip = torch.where(raise_adv < 0, 3.0 * raise_adv, torch.full_like(raise_adv, -float('inf')))
-                sizing_loss = -torch.max(s_surr, raise_dual_clip).mean()
-        else:
-            sizing_loss = torch.tensor(0.0, device=self.device)
-            sizing_entropy = torch.tensor(0.0, device=self.device)
-        
-        entropy = action_entropy + sizing_entropy
-        
-        value_pred = output.value.squeeze(-1)
-        # V_res residual target: GAE returns minus equity×pot baseline
-        equity_x_pot = data['equity_x_pot'][idx].to(self.device)
-        residual_returns = gae_returns - equity_x_pot
-        value_loss = torch.nn.functional.smooth_l1_loss(value_pred, residual_returns)
-        
-        entropy_coef = self._get_entropy_coef()
-        loss = (
-            action_loss
-            + sizing_loss  # equal weight — sizing quality determines raise outcomes
-            + self.config.value_coef * value_loss
-            - entropy_coef * entropy
-        )
-        
-        loss.backward()
-        
-        return loss.item(), action_loss.item(), sizing_loss.item(), value_loss.item()
 
 
 
@@ -1623,8 +1181,8 @@ class NLHESelfPlayTrainer:
             if epoch > 0 and epoch % self.config.frozen_update_interval == 0:
                 self._sync_frozen()
                 if self.config.verbose:
-                    pool_total = len(self.opponent_pool_recent) + len(self.opponent_pool_archive)
-                    print(f"    [Frozen sync] Pool: {len(self.opponent_pool_recent)} recent + {len(self.opponent_pool_archive)} archive = {pool_total}")
+                    pool_total = len(self.pool.recent) + len(self.pool.archive)
+                    print(f"    [Frozen sync] Pool: {len(self.pool.recent)} recent + {len(self.pool.archive)} archive = {pool_total}")
 
             # Batched simulation: all hands run as generators with batched GPU calls
             if self.config.num_workers > 0 and epoch == start_epoch:
@@ -1634,7 +1192,7 @@ class NLHESelfPlayTrainer:
             avg_reward = total_reward / self.config.hands_per_epoch
 
             # Action distribution (conditional: % chosen when legal)
-            action_pcts = self._count_action_distribution(all_exp)
+            action_pcts = count_action_distribution(all_exp)
 
             # Pre-compute GAE and batch tensors ONCE
             self.policy.train()

@@ -280,23 +280,7 @@ class TestDevicePlacement:
         assert trainer.device in [torch.device("cpu"), torch.device("cuda"), torch.device("mps")]
 
 
-class TestSearchGuided:
-    """Tests for search-guided expert iteration."""
 
-    def test_search_training_runs(self):
-        """Training with search fraction > 0 completes."""
-        config = NLHETrainingConfig(
-            embed_dim=32, opponent_embed_dim=32,
-            num_heads=2, num_layers=1,
-            num_players=2, starting_bb=20,
-            hands_per_epoch=4, ppo_epochs=1,
-            log_interval=100, device="cpu",
-            search_fraction=0.5,
-            search_iterations=5, seed=42
-        )
-        trainer = NLHESelfPlayTrainer(config=config)
-        metrics = trainer.train(num_epochs=2)
-        assert len(metrics['epoch_reward']) == 2
 
 
 if __name__ == '__main__':

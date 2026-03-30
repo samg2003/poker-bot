@@ -21,6 +21,8 @@ import pytest
 from engine.game_state import GameState, Action, ActionType, Street
 from engine.dealer import Dealer
 from engine.hand_evaluator import Eval7Evaluator
+from training.state_encoder import compute_hero_ev
+from training.ppo_updater import compute_gae
 
 
 def _get_trainer():
@@ -103,7 +105,7 @@ class TestAllInEquityDirection:
         state = dealer.start_hand()
         _set_hole_cards(state, ['As', 'Ah'], ['7d', '2c'])
 
-        hero_ev = trainer._compute_hero_ev(state, hero_idx=0)
+        hero_ev = compute_hero_ev(state, hero_idx=0)
         # AA vs 72o ≈ 87% equity. Main pot = 1.0bb. Gross EV ≈ 0.87.
         # Net EV = 0.87 - 0.5 (hero SB sunk cost) ≈ 0.37
         assert hero_ev > 0.30, f"AA should dominate, got net hero_ev={hero_ev:.2f}"
@@ -114,7 +116,7 @@ class TestAllInEquityDirection:
         state = dealer.start_hand()
         _set_hole_cards(state, ['7d', '2c'], ['As', 'Ah'])
 
-        hero_ev = trainer._compute_hero_ev(state, hero_idx=0)
+        hero_ev = compute_hero_ev(state, hero_idx=0)
         assert hero_ev < 0.2 * state.pot, f"72o should be dominated, got hero_ev={hero_ev:.2f}"
 
     def test_allin_terminal_negative_for_worse_hand(self, trainer):
@@ -160,7 +162,7 @@ class TestFoldLosesEquity:
         state = dealer.start_hand()
         _set_hole_cards(state, ['As', 'Ah'], ['7d', '2c'])
 
-        ev_before = trainer._compute_hero_ev(state, hero_idx=0)
+        ev_before = compute_hero_ev(state, hero_idx=0)
         # Net EV of AA preflop for SB is ~0.37
         assert ev_before > 0.3, "AA should have high net equity preflop"
 
@@ -168,7 +170,7 @@ class TestFoldLosesEquity:
         results = dealer.get_results()
         assert results['profit'][0] == pytest.approx(-0.5, abs=0.01)
 
-        ev_after = trainer._compute_hero_ev(state, hero_idx=0)
+        ev_after = compute_hero_ev(state, hero_idx=0)
         # Sunk cost is 0.5, equity is 0 → Net EV = -0.5
         assert ev_after == pytest.approx(-0.5, abs=0.01), "After fold, hero_ev must equal negative sunk cost"
 
@@ -209,7 +211,7 @@ class TestValueBetDelta:
 
         # Now on flop: A72. Hero has set of aces.
         assert state.street == Street.FLOP
-        ev_before_bet = trainer._compute_hero_ev(state, hero_idx=0)
+        ev_before_bet = compute_hero_ev(state, hero_idx=0)
         pot_before = state.pot
 
         # BB acts first postflop in HU
@@ -217,11 +219,11 @@ class TestValueBetDelta:
         # Hero is SB=0=dealer in HU, so hero acts first postflop
         dealer.apply_action(Action(ActionType.RAISE, amount=1.0))  # hero bets 1bb
 
-        ev_after_hero_bet = trainer._compute_hero_ev(state, hero_idx=0)
+        ev_after_hero_bet = compute_hero_ev(state, hero_idx=0)
 
         dealer.apply_action(Action(ActionType.CALL))  # villain calls
 
-        ev_after_call = trainer._compute_hero_ev(state, hero_idx=0)
+        ev_after_call = compute_hero_ev(state, hero_idx=0)
 
         # Key assertion: hero's EV increased because villain put money in drawing dead
         delta = ev_after_call - ev_before_bet
@@ -250,7 +252,7 @@ class TestBadCallPunishment:
         dealer.apply_action(Action(ActionType.CHECK))
 
         assert state.street == Street.FLOP
-        ev_before = trainer._compute_hero_ev(state, hero_idx=0)
+        ev_before = compute_hero_ev(state, hero_idx=0)
         # 72o vs AA on K93 → hero < 5%, pot=2bb → ev < 0.1
         equity_pct_before = ev_before / state.pot if state.pot > 0 else 0
         assert equity_pct_before < 0.15, f"72o should have tiny equity, got {equity_pct_before*100:.1f}%"
@@ -352,7 +354,7 @@ class TestFullRewardPipeline:
                        equity_x_pot=0.112, end_street_equity_x_pot=0.112, street_idx=2),
         ]
 
-        advantages, returns = trainer._compute_gae(traj)
+        advantages, returns = compute_gae(traj)
 
         # Step 0 cross-street reward = 0.112 - 0.048 = 0.064 (good bet got called)
         step0_reward = traj[0].end_street_equity_x_pot - traj[0].equity_x_pot
@@ -390,7 +392,7 @@ class TestFullRewardPipeline:
                        equity_x_pot=0.006, end_street_equity_x_pot=0.006, street_idx=0),
         ]
 
-        advantages, returns = trainer._compute_gae(traj)
+        advantages, returns = compute_gae(traj)
         assert advantages[0] < 0, f"Fold should have negative advantage, got {advantages[0]}"
         assert returns[0] < 0, f"Fold should have negative return, got {returns[0]}"
 
@@ -411,8 +413,8 @@ class TestEquityConsistency:
         state = dealer.start_hand()
         _set_hole_cards(state, ['As', 'Ah'], ['Kd', 'Qc'])
 
-        ev0 = trainer._compute_hero_ev(state, hero_idx=0)
-        ev1 = trainer._compute_hero_ev(state, hero_idx=1)
+        ev0 = compute_hero_ev(state, hero_idx=0)
+        ev1 = compute_hero_ev(state, hero_idx=1)
         sunk_total = state.players[0].bet_total + state.players[1].bet_total
         total_gross = ev0 + ev1 + sunk_total
         
@@ -425,7 +427,7 @@ class TestEquityConsistency:
         state = dealer.start_hand()
         _set_all_cards(state, ['As', 'Ah'], ['Kd', 'Qc'], ['7h', '2d'])
 
-        evs = [trainer._compute_hero_ev(state, hero_idx=i) for i in range(3)]
+        evs = [compute_hero_ev(state, hero_idx=i) for i in range(3)]
         sunk_total = sum(p.bet_total for p in state.players)
         total_gross = sum(evs) + sunk_total
         assert total_gross == pytest.approx(state.pot, rel=0.05), \
@@ -443,7 +445,7 @@ class TestEquityConsistency:
         state = dealer.start_hand()
         _set_hole_cards(state, ['As', 'Ah'], ['7d', '2c'])
 
-        hero_ev = trainer._compute_hero_ev(state, hero_idx=0)
+        hero_ev = compute_hero_ev(state, hero_idx=0)
         # Gross EV = 87% * 1.0bb = 0.87. Sunk = 0.5. Net = 0.37
         assert hero_ev > 0.30, f"AA should dominate, got net hero_ev={hero_ev:.2f}"
 
@@ -457,7 +459,7 @@ class TestEquityConsistency:
         state = dealer.start_hand()
         _set_hole_cards(state, ['Ah', 'Kh'], ['Qs', 'Qd'])
 
-        hero_ev = trainer._compute_hero_ev(state, hero_idx=0)
+        hero_ev = compute_hero_ev(state, hero_idx=0)
         # AKs vs QQ ≈ 46%. Main pot = 1.0bb. Gross ≈ 0.46. Net ≈ -0.04
         assert -0.2 < hero_ev < 0.2, f"AKs vs QQ should be near neutral net EV, got {hero_ev:.2f}"
 
@@ -473,7 +475,7 @@ class TestEquityConsistency:
         dealer.apply_action(Action(ActionType.CHECK))  # BB
 
         assert state.street == Street.FLOP
-        ev = trainer._compute_hero_ev(state, hero_idx=0)
+        ev = compute_hero_ev(state, hero_idx=0)
         # Gross EV = 97% of 2.0bb (if both called 1.0) = 1.94bb
         # Net EV = 1.94 - 1.0 (sunk) = 0.94
         assert ev > 0.8, f"Set of aces should dominate, got net ev={ev:.2f}"
@@ -489,7 +491,7 @@ class TestEquityConsistency:
         dealer.apply_action(Action(ActionType.CHECK))
 
         assert state.street == Street.FLOP
-        ev = trainer._compute_hero_ev(state, hero_idx=0)
+        ev = compute_hero_ev(state, hero_idx=0)
         # Equity ~35-55% of 2.0bb pot = ~0.7 to 1.1. Sunk = 1.0. Net = -0.3 to +0.2
         assert -0.4 < ev < 0.3, f"Flush draw should be near neutral net EV initially, got {ev:.2f}"
 
@@ -508,7 +510,7 @@ class TestEquityConsistency:
         dealer.apply_action(Action(ActionType.CHECK))
         # Turn
         assert state.street == Street.TURN
-        ev = trainer._compute_hero_ev(state, hero_idx=0)
+        ev = compute_hero_ev(state, hero_idx=0)
         # Made flush equity >90% of pot=2.0bb = ~1.8bb. Sunk=1.0. Net=0.8
         assert ev > 0.6, f"Made flush should dominate net EV, got {ev:.2f}"
 

@@ -15,12 +15,6 @@ class AgentConfig:
     num_heads: int = 2
     num_layers: int = 2
 
-    # Search (System 2)
-    enable_search: bool = True
-    search_min_pot_bb: float = 20.0
-    search_entropy_threshold: float = 1.0
-    search_iterations: int = 100
-
     # Training
     lr: float = 3e-4
     ppo_clip: float = 0.2
@@ -41,6 +35,5 @@ class AgentConfig:
     def __repr__(self):
         return (
             f"AgentConfig(embed={self.embed_dim}, opp_embed={self.opponent_embed_dim}, "
-            f"heads={self.num_heads}, layers={self.num_layers}, "
-            f"search={self.enable_search})"
+            f"heads={self.num_heads}, layers={self.num_layers})"
         )

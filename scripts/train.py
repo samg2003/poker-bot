@@ -45,14 +45,12 @@ def train_nlhe(args):
     else:
         stacks_str = f"{args.starting_bb}bb (fixed)"
 
-    search_str = f"{args.search_fraction*100:.0f}% hands" if args.search_fraction > 0 else "off"
 
     print(f"\n{'='*50}")
     print(f"Training on NLHE")
     print(f"  Players: {players_str}")
     print(f"  Stacks:  {stacks_str}")
     print(f"  Device:  {args.device}")
-    print(f"  Search:  {search_str}")
     print(f"  Epochs:  {args.epochs} | Hands/epoch: {args.hands}")
     print(f"{'='*50}\n")
 
@@ -74,7 +72,7 @@ def train_nlhe(args):
         min_bb=args.min_bb,
         max_bb=args.max_bb,
         device=args.device,
-        search_fraction=args.search_fraction,
+        mc_equity_sims=args.mc_equity_sims,
         verbose=args.verbose,
         batch_chunk_size=args.batch_chunk_size,
         num_workers=args.num_workers,
@@ -114,7 +112,7 @@ def train_nlhe(args):
                 # Load opponent pool from checkpoint
                 load_dir = os.path.join(args.checkpoint_dir, tag)
                 trainer.load_pool(load_dir)
-                pool_total = len(trainer.opponent_pool_recent) + len(trainer.opponent_pool_archive)
+                pool_total = len(trainer.pool.recent) + len(trainer.pool.archive)
             print(f"\n✓ Resumed from checkpoint '{tag}' (epoch {start_epoch}, reward={meta.avg_reward:+.3f})")
         except FileNotFoundError:
             print(f"\n✗ Checkpoint '{tag}' not found, training from scratch")
@@ -215,8 +213,8 @@ def main():
                         help='Device: auto, cuda, mps, cpu (default: auto)')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable verbose output with timing and progress updates')
-    parser.add_argument('--search-fraction', type=float, default=0.0,
-                        help='Fraction of hands using search (0-1, default: 0 = off)')
+    parser.add_argument('--mc-equity-sims', type=int, default=500,
+                        help='MC equity simulations per decision (default: 500, lower=faster)')
     parser.add_argument('--batch-chunk-size', type=int, default=500,
                         help='Max simultaneous games per sub-batch (default: 500, lower to save memory)')
     parser.add_argument('--num-workers', type=int, default=0,

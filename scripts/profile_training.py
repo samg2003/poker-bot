@@ -52,8 +52,7 @@ def make_timer(name, orig_fn):
         return result
     return wrapper
 
-trainer._get_opponent_stats = make_timer('get_opp_stats', trainer._get_opponent_stats)
-# trainer._encode_game_state doesn't exist — encoding is inline in _play_hand_gen
+# Monkey-patching removed — extracted methods now in training/state_encoder.py
 
 if __name__ == "__main__":
     import random

@@ -14,6 +14,8 @@ import torch
 from engine.game_state import GameState, Action, ActionType, Street
 from engine.dealer import Dealer
 from engine.hand_evaluator import Eval7Evaluator
+from training.state_encoder import compute_hero_ev
+from training.ppo_updater import compute_gae
 
 
 # ─────────────────────────────────────────────────────────────
@@ -55,7 +57,7 @@ class TestComputeHeroEV:
         dealer = Dealer(num_players=2, stacks=[100, 100], big_blind=1.0, seed=42)
         state = dealer.start_hand()
         # Both players have posted blinds, pot is ~1.5
-        ev = trainer._compute_hero_ev(state, hero_idx=0)
+        ev = compute_hero_ev(state, hero_idx=0)
         # EV should be between -m_sunk_cost and pot
         assert -0.6 <= ev <= state.pot + 0.1
 
@@ -73,7 +75,7 @@ class TestComputeHeroEV:
         state.apply_action(Action(ActionType.CALL))  # P2 calls
 
         # Now compute hero EV — should correctly split across side pots
-        ev = trainer._compute_hero_ev(state, hero_idx=0)
+        ev = compute_hero_ev(state, hero_idx=0)
         # Hero invested 20bb. Gross EV is >= 0. Net EV can be down to -20.
         assert ev >= -21.0  # Hero max loss is their 20bb investment
 
@@ -83,7 +85,7 @@ class TestComputeHeroEV:
         state = dealer.start_hand()
         # Hero folds
         state.apply_action(Action(ActionType.FOLD))
-        ev = trainer._compute_hero_ev(state, hero_idx=0)
+        ev = compute_hero_ev(state, hero_idx=0)
         # Net EV = gross EV - sunk costs. It can be down to -0.5 (SB) and up to pot - 0.5.
         assert -0.6 <= ev <= state.pot + 0.1
 
@@ -127,12 +129,12 @@ class TestRewardScenarios:
         dealer = Dealer(num_players=2, stacks=[100, 100], big_blind=1.0, seed=42)
         state = dealer.start_hand()
 
-        ev_before = trainer._compute_hero_ev(state, hero_idx=0)
+        ev_before = compute_hero_ev(state, hero_idx=0)
 
         # Hero raises (SB acts first heads-up preflop)
         state.apply_action(Action(ActionType.RAISE, amount=3.0))
         
-        ev_after_raise = trainer._compute_hero_ev(state, hero_idx=0)
+        ev_after_raise = compute_hero_ev(state, hero_idx=0)
 
         # After hero raises, pot is bigger. If hero has decent hand, EV should
         # go up because they put money in while having equity in a bigger pot.
@@ -146,13 +148,13 @@ class TestRewardScenarios:
         dealer = Dealer(num_players=2, stacks=[100, 100], big_blind=1.0, seed=42)
         state = dealer.start_hand()
 
-        ev_before = trainer._compute_hero_ev(state, hero_idx=0)
+        ev_before = compute_hero_ev(state, hero_idx=0)
         # Net EV might be slightly negative if hero invested SB (0.5) but has poor equity
         assert ev_before > -1.0  # Hero should have some gross equity, making net EV > -1.0
 
         # Hero folds
         state.apply_action(Action(ActionType.FOLD))
-        ev_after = trainer._compute_hero_ev(state, hero_idx=0)
+        ev_after = compute_hero_ev(state, hero_idx=0)
         # Hero is out, sunk cost is 0.5bb
         assert ev_after == pytest.approx(-0.5, abs=0.01)
 
@@ -202,7 +204,7 @@ class TestGAEWithEquityShaping:
                        equity_x_pot=0.6, end_street_equity_x_pot=0.6, street_idx=1),
         ]
 
-        advantages, returns = trainer._compute_gae(traj)
+        advantages, returns = compute_gae(traj)
 
         assert len(advantages) == 3
         assert len(returns) == 3
@@ -242,7 +244,7 @@ class TestGAEWithEquityShaping:
                        equity_x_pot=0.4, end_street_equity_x_pot=0.4, street_idx=2),
         ]
 
-        advantages, returns = trainer._compute_gae(traj)
+        advantages, returns = compute_gae(traj)
 
         # Cross-street reward for step 0 = 0.5 - 0.3 = 0.2 (end_street - decision)
         # This captures the fact that opponent called hero's bet while behind
@@ -272,7 +274,7 @@ class TestResidualTargets:
             state = dealer.start_hand()
 
             # Compute hero EV at decision point (BEFORE all-in)
-            hero_ev_at_decision = trainer._compute_hero_ev(state, hero_idx=0)
+            hero_ev_at_decision = compute_hero_ev(state, hero_idx=0)
 
             # Both all-in
             dealer.apply_action(Action(ActionType.ALL_IN))  # SB
