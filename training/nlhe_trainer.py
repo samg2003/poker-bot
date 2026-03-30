@@ -77,6 +77,67 @@ class Experience(NamedTuple):
     street_idx: int = 0              # 0=preflop, 1=flop, 2=turn, 3=river
 
 
+def _mp_play_chunk(args):
+    """Top-level worker function for multiprocessing.Pool.
+    
+    Plays a chunk of hands completely independently — no per-decision IPC.
+    Returns (serialized_experiences, total_reward).
+    """
+    import os
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+    (config_dict, policy_sd, opp_enc_sd,
+     pool_recent, pool_archive,
+     num_hands, seed, epoch, total_epochs) = args
+
+    config = NLHETrainingConfig(**config_dict)
+    config.device = 'cpu'
+    config.num_workers = 0  # Use _run_batched_epoch internally
+    config.hands_per_epoch = num_hands
+    config.batch_chunk_size = min(config.batch_chunk_size, num_hands)
+    config.verbose = False
+    config.seed = seed
+
+    trainer = NLHESelfPlayTrainer(config)
+    trainer.rng = random.Random(seed)
+    torch.manual_seed(seed)
+    trainer.current_epoch = epoch
+    trainer.total_epochs = total_epochs
+    trainer._hand_counter = seed * 100000
+
+    # Load model weights
+    trainer.policy.load_state_dict(policy_sd)
+    trainer.policy.eval()
+    trainer.opponent_encoder.load_state_dict(opp_enc_sd)
+    trainer.opponent_encoder.eval()
+    trainer._frozen_template.load_state_dict(policy_sd)
+    trainer._frozen_template.eval()
+    trainer.frozen_opponent_encoder.load_state_dict(opp_enc_sd)
+    trainer.frozen_opponent_encoder.eval()
+    trainer.opponent_pool_recent = pool_recent
+    trainer.opponent_pool_archive = pool_archive
+    trainer._frozen_models = {}  # Rebuilt lazily by _run_batched_epoch
+
+    exps, reward = trainer._run_batched_epoch()
+
+    # Serialize tensors to numpy for fast IPC
+    serialized = []
+    for exp in exps:
+        d = exp._asdict()
+        for k, v in d.items():
+            if isinstance(v, torch.Tensor):
+                d[k] = v.detach().cpu().numpy()
+        serialized.append(d)
+
+    return serialized, reward
+
+
 # ─────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────
@@ -1702,6 +1763,63 @@ class NLHESelfPlayTrainer:
         loss.backward()
         
         return loss.item(), action_loss.item(), sizing_loss.item(), value_loss.item()
+
+    # ──────────────────────────────────────────────────────────
+    # Multiprocess parallel hand simulation
+    # ──────────────────────────────────────────────────────────
+
+    def _run_multiprocess_epoch(self) -> Tuple[List[Experience], float]:
+        """Parallel hand simulation using multiprocessing.Pool with fork.
+        
+        Each worker plays a chunk of hands COMPLETELY independently
+        (no per-decision IPC). Returns aggregated experiences for PPO.
+        """
+        import multiprocessing as mp
+
+        num_workers = self.config.num_workers
+        hands_total = self.config.hands_per_epoch
+        hands_per_worker = hands_total // num_workers
+        remainder = hands_total % num_workers
+
+        # Snapshot model state dicts for workers
+        policy_sd = {k: v.cpu() for k, v in self.policy.state_dict().items()}
+        opp_enc_sd = {k: v.cpu() for k, v in self.opponent_encoder.state_dict().items()}
+
+        # Build args for each worker
+        args_list = []
+        for i in range(num_workers):
+            n = hands_per_worker + (1 if i < remainder else 0)
+            if n == 0:
+                continue
+            args_list.append((
+                {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')},
+                policy_sd, opp_enc_sd,
+                self.opponent_pool_recent, self.opponent_pool_archive,
+                n,
+                self.config.seed + i + self.current_epoch * num_workers,
+                self.current_epoch, self.total_epochs,
+            ))
+
+        # Use fork context for zero-copy parent memory sharing
+        ctx = mp.get_context('fork')
+        with ctx.Pool(min(num_workers, len(args_list))) as pool:
+            results = pool.map(_mp_play_chunk, args_list)
+
+        # Reconstruct Experience objects from serialized dicts
+        all_exp: List[Experience] = []
+        total_reward = 0.0
+        for serialized_exps, reward in results:
+            for d in serialized_exps:
+                for k, v in d.items():
+                    if isinstance(v, np.ndarray):
+                        d[k] = torch.from_numpy(v)
+                all_exp.append(Experience(**d))
+            total_reward += reward
+
+        if self.config.verbose:
+            print(f"      [MP] {len(all_exp)} experiences from {len(args_list)} workers", flush=True)
+
+        return all_exp, total_reward
 
     def _run_vectorized_epoch(self) -> Tuple[List[List[Experience]], float]:
         """Runs highly parallelized simulation via gym.vector.AsyncVectorEnv."""
