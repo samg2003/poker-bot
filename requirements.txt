@@ -5,8 +5,29 @@ numpy<2.0.0
 Cython>=3.2.4
 eval7>=0.1.9 
 gymnasium>=1.2.3
-# pip3 install --no-build-isolation eval7
-# pip3 install torch==2.0.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-# pip3 install "numpy<2" --force-reinstall
 
 # nproc
+
+# sudo apt install python3.12-venv -y
+# python3 -m venv ~/venv
+# source ~/venv/bin/activate
+# pip install torch numpy gymnasium Cython
+# pip install --no-build-isolation eval7
+
+
+
+# On the EC2 instance, check if workers are actually doing work or blocked on I/O
+# top -H -p $(pgrep -f train.py | head -1)
+# Look for states: S (sleeping/blocked) vs R (running)
+
+# Check if any workers are in uninterruptible sleep (D state = blocked on I/O)
+# ps aux | grep python | awk '{print $8}' | sort | uniq -c
+
+# vmstat 1 10  # watch 'si'/'so' (swap) and 'wa' (iowait)
+# # Also watch 'cs' (context switches) - should not be millions/sec
+
+# Watch network/memory during startup
+# watch -n1 'free -h && cat /proc/meminfo | grep -E "Cached|Buffers|Dirty"'
+
+# Check if workers are spawning, wait 30s then run:
+# watch -n2 'ps aux | grep python | grep -v grep | wc -l'

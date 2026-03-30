@@ -15,12 +15,17 @@ import torch
 from typing import Dict, Any, Tuple
 
 from training.nlhe_trainer import NLHETrainingConfig, NLHESelfPlayTrainer, TableState, OPP_GAME_STATE_DIM, PROFILE_DIM, ACTION_FEATURE_DIM, MAX_HAND_ACTIONS
+from model.action_space import NUM_ACTION_TYPES
 
 class PokerGymEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, config_dict: dict, policy_state_dict: dict, opp_enc_state_dict: dict, frozen_pool_states: list):
         super().__init__()
+        # Restrict THIS worker to 1 thread — must be called after fork since
+        # the env var set before torch loads has no effect on already-init'd OpenMP.
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
         
         self.config = NLHETrainingConfig(**config_dict)
         self.config.device = 'cpu'
@@ -39,8 +44,8 @@ class PokerGymEnv(gym.Env):
         
         # Action space: Dict allowing PyTorch log_probs to flow back from Central GPU
         self.action_space = spaces.Dict({
-            'action': spaces.MultiDiscrete([5, 10]),
-            'probs': spaces.Box(low=0, high=1, shape=(5,), dtype=np.float32),
+            'action': spaces.MultiDiscrete([NUM_ACTION_TYPES, 10]),
+            'probs': spaces.Box(low=0, high=1, shape=(NUM_ACTION_TYPES,), dtype=np.float32),
             'value': spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
             'sizing_probs': spaces.Box(low=0, high=1, shape=(10,), dtype=np.float32)
         })
