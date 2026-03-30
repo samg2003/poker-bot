@@ -1682,7 +1682,7 @@ class NLHESelfPlayTrainer:
         opp_gs = data['opp_gs'][idx].to(self.device)
         opp_masks = data['opp_masks'][idx].to(self.device)
         hand_action_seqs = data['hand_action_seqs'][idx].to(self.device)
-        hand_action_lens = data['hand_action_lens'][idx]
+        hand_action_lens = data['hand_action_lens'][idx].to(self.device)
         actor_profiles_seqs = data['actor_profiles_seqs'][idx].to(self.device)
         hero_profiles = data['hero_profiles'][idx].to(self.device)
         opp_profiles = data['opp_profiles'][idx].to(self.device)
