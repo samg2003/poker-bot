@@ -83,55 +83,19 @@ def _mp_play_chunk(args):
     Plays a chunk of hands completely independently — no per-decision IPC.
     Returns (serialized_experiences, total_reward).
     """
-    import os
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['MKL_NUM_THREADS'] = '1'
-    torch.set_num_threads(1)
-    try:
-        torch.set_num_interop_threads(1)
-    except RuntimeError:
-        pass
+    num_hands, seed, epoch, total_epochs = args
+    global _mp_worker_trainer
 
-    (config_dict, policy_np, opp_enc_np,
-     pool_recent_np, pool_archive_np,
-     num_hands, seed, epoch, total_epochs) = args
-
-    # Convert numpy state dicts back to torch tensors
-    def _np_to_sd(npd):
-        return {k: torch.from_numpy(v) for k, v in npd.items()}
-
-    policy_sd = _np_to_sd(policy_np)
-    opp_enc_sd = _np_to_sd(opp_enc_np)
-
-    config = NLHETrainingConfig(**config_dict)
-    config.device = 'cpu'
-    config.num_workers = 0  # Use _run_batched_epoch internally
-    config.hands_per_epoch = num_hands
-    config.batch_chunk_size = min(config.batch_chunk_size, num_hands)
-    config.verbose = False
-    config.seed = seed
-
-    trainer = NLHESelfPlayTrainer(config)
-    trainer.rng = random.Random(seed)
+    t = _mp_worker_trainer
+    t.rng = random.Random(seed)
     torch.manual_seed(seed)
-    trainer.current_epoch = epoch
-    trainer.total_epochs = total_epochs
-    trainer._hand_counter = seed * 100000
+    t.current_epoch = epoch
+    t.total_epochs = total_epochs
+    t._hand_counter = seed * 100000
+    t.config.hands_per_epoch = num_hands
+    t.config.batch_chunk_size = min(500, num_hands)
 
-    # Load model weights
-    trainer.policy.load_state_dict(policy_sd)
-    trainer.policy.eval()
-    trainer.opponent_encoder.load_state_dict(opp_enc_sd)
-    trainer.opponent_encoder.eval()
-    trainer._frozen_template.load_state_dict(policy_sd)
-    trainer._frozen_template.eval()
-    trainer.frozen_opponent_encoder.load_state_dict(opp_enc_sd)
-    trainer.frozen_opponent_encoder.eval()
-    trainer.opponent_pool_recent = [_np_to_sd(sd) for sd in pool_recent_np]
-    trainer.opponent_pool_archive = [_np_to_sd(sd) for sd in pool_archive_np]
-    trainer._frozen_models = {}  # Rebuilt lazily by _run_batched_epoch
-
-    exps, reward = trainer._run_batched_epoch()
+    exps, reward = t._run_batched_epoch()
 
     # Serialize tensors to numpy for fast IPC
     serialized = []
@@ -143,6 +107,49 @@ def _mp_play_chunk(args):
         serialized.append(d)
 
     return serialized, reward
+
+
+# Global for Pool workers — set by _mp_init_worker
+_mp_worker_trainer = None
+
+
+def _mp_init_worker(config_dict, policy_np, opp_enc_np, pool_recent_np, pool_archive_np):
+    """Pool initializer: runs ONCE per worker process. Sets up trainer with model weights."""
+    global _mp_worker_trainer
+    import os
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+    def _np_to_sd(npd):
+        return {k: torch.from_numpy(v.copy()) for k, v in npd.items()}
+
+    policy_sd = _np_to_sd(policy_np)
+    opp_enc_sd = _np_to_sd(opp_enc_np)
+
+    config = NLHETrainingConfig(**config_dict)
+    config.device = 'cpu'
+    config.num_workers = 0
+    config.verbose = False
+
+    trainer = NLHESelfPlayTrainer(config)
+    trainer.policy.load_state_dict(policy_sd)
+    trainer.policy.eval()
+    trainer.opponent_encoder.load_state_dict(opp_enc_sd)
+    trainer.opponent_encoder.eval()
+    trainer._frozen_template.load_state_dict(policy_sd)
+    trainer._frozen_template.eval()
+    trainer.frozen_opponent_encoder.load_state_dict(opp_enc_sd)
+    trainer.frozen_opponent_encoder.eval()
+    trainer.opponent_pool_recent = [_np_to_sd(sd) for sd in pool_recent_np]
+    trainer.opponent_pool_archive = [_np_to_sd(sd) for sd in pool_archive_np]
+    trainer._frozen_models = {}
+
+    _mp_worker_trainer = trainer
 
 
 # ─────────────────────────────────────────────────────────────
@@ -357,6 +364,11 @@ class NLHESelfPlayTrainer:
             e_sd = {k: v.cpu() for k, v in self.opponent_encoder.state_dict().items()}
             f_sds = [{k: v.cpu() for k, v in fm.state_dict().items()} for fm in self._frozen_models.values()]
             self.envs.call('update_weights', p_sd, e_sd, f_sds)
+        # Invalidate multiprocess pool so it recreates with fresh weights
+        if hasattr(self, '_mp_pool') and self._mp_pool is not None:
+            self._mp_pool.terminate()
+            self._mp_pool.join()
+            self._mp_pool = None
 
     def _get_combined_pool(self) -> List[dict]:
         """Get combined pool (recent + archive) as a single list."""
@@ -1788,34 +1800,39 @@ class NLHESelfPlayTrainer:
         hands_per_worker = hands_total // num_workers
         remainder = hands_total % num_workers
 
-        # Snapshot model state dicts as NUMPY (avoids torch pickle using file descriptors)
-        def _sd_to_np(sd):
-            return {k: v.cpu().numpy() for k, v in sd.items()}
+        # Create or recreate persistent pool
+        if not hasattr(self, '_mp_pool') or self._mp_pool is None:
+            def _sd_to_np(sd):
+                return {k: v.cpu().numpy() for k, v in sd.items()}
 
-        policy_np = _sd_to_np(self.policy.state_dict())
-        opp_enc_np = _sd_to_np(self.opponent_encoder.state_dict())
-        pool_recent_np = [_sd_to_np(sd) for sd in self.opponent_pool_recent]
-        pool_archive_np = [_sd_to_np(sd) for sd in self.opponent_pool_archive]
+            policy_np = _sd_to_np(self.policy.state_dict())
+            opp_enc_np = _sd_to_np(self.opponent_encoder.state_dict())
+            pool_recent_np = [_sd_to_np(sd) for sd in self.opponent_pool_recent]
+            pool_archive_np = [_sd_to_np(sd) for sd in self.opponent_pool_archive]
+            config_dict = {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
 
-        # Build args for each worker
+            ctx = mp.get_context('fork')
+            self._mp_pool = ctx.Pool(
+                num_workers,
+                initializer=_mp_init_worker,
+                initargs=(config_dict, policy_np, opp_enc_np, pool_recent_np, pool_archive_np),
+            )
+            if self.config.verbose:
+                print(f"      [MP] Created pool with {num_workers} workers", flush=True)
+
+        # Lightweight args per worker — NO state dicts (those are in the initializer)
         args_list = []
         for i in range(num_workers):
             n = hands_per_worker + (1 if i < remainder else 0)
             if n == 0:
                 continue
             args_list.append((
-                {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')},
-                policy_np, opp_enc_np,
-                pool_recent_np, pool_archive_np,
                 n,
                 self.config.seed + i + self.current_epoch * num_workers,
                 self.current_epoch, self.total_epochs,
             ))
 
-        # Use fork context for zero-copy parent memory sharing
-        ctx = mp.get_context('fork')
-        with ctx.Pool(min(num_workers, len(args_list))) as pool:
-            results = pool.map(_mp_play_chunk, args_list)
+        results = self._mp_pool.map(_mp_play_chunk, args_list)
 
         # Reconstruct Experience objects from serialized dicts
         all_exp: List[Experience] = []
