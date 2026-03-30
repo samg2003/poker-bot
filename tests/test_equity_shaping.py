@@ -204,7 +204,7 @@ class TestGAEWithEquityShaping:
                        equity_x_pot=0.6, end_street_equity_x_pot=0.6, street_idx=1),
         ]
 
-        advantages, returns = compute_gae(traj)
+        advantages, returns, _ = compute_gae(traj)
 
         assert len(advantages) == 3
         assert len(returns) == 3
@@ -244,7 +244,7 @@ class TestGAEWithEquityShaping:
                        equity_x_pot=0.4, end_street_equity_x_pot=0.4, street_idx=2),
         ]
 
-        advantages, returns = compute_gae(traj)
+        advantages, returns, _ = compute_gae(traj)
 
         # Cross-street reward for step 0 = 0.5 - 0.3 = 0.2 (end_street - decision)
         # This captures the fact that opponent called hero's bet while behind

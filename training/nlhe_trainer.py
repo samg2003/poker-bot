@@ -73,6 +73,7 @@ class Experience(NamedTuple):
     equity_x_pot: float = 0.0        # side-pot-aware hero EV at decision point
     end_street_equity_x_pot: float = 0.0  # hero EV at end of this street
     street_idx: int = 0              # 0=preflop, 1=flop, 2=turn, 3=river
+    v_res_end_of_street: float = 0.0 # V_res at end of street (before new card)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -103,8 +104,9 @@ class NLHETrainingConfig:
 
     # Training
     lr: float = 3e-4
-    gamma: float = 0.99          # was 1.0 — temporal discount for GAE
+    gamma: float = 1.0           # no temporal discount — poker hands are finite episodes
     gae_lambda: float = 0.95     # GAE lambda parameter
+    v_res_alpha: float = 1.0     # scales V_res influence on advantages (0=pure equity, 1=full V_res)
     ppo_clip: float = 0.2
     ppo_epochs: int = 4
     mini_batch_size: int = 64          # mini-batch size for PPO updates
@@ -711,6 +713,45 @@ class NLHESelfPlayTrainer:
                 if hero_experiences:
                     end_ev = compute_hero_ev(game_state, hero_idx=0, mc_sims=self.config.mc_equity_sims, runout_cache=equity_cache)
                     hero_experiences[-1]['end_street_equity_x_pot'] = end_ev
+
+                    # Compute V_res at end of street (BEFORE new card)
+                    # Value-only forward pass — we only use the value head output
+                    last_exp = hero_experiences[-1]
+                    end_encoded = encode_state(game_state, 0, self.device)
+                    end_opp_stats = get_opponent_stats(table.stat_tracker, 0, num_p, self.device)
+                    end_own_stats = self._to(table.stat_tracker.get_stats(0).unsqueeze(0))
+                    end_opp_gs = get_opponent_game_state(game_state, 0, num_p, self.device)
+
+                    # Reuse tensors from the last hero experience, ensuring correct shapes
+                    opp_embed_t = last_exp.get('_opp_embed_tensor', torch.zeros(1, 1, self.config.opponent_embed_dim, device=self.device))
+                    if opp_embed_t.dim() == 2:
+                        opp_embed_t = opp_embed_t.unsqueeze(0)
+                    opp_prof_t = last_exp.get('opponent_profiles', torch.zeros(1, PROFILE_DIM, device=self.device))
+                    if opp_prof_t.dim() == 2:
+                        opp_prof_t = opp_prof_t.unsqueeze(0)
+                    hero_prof_t = last_exp.get('hero_profile', torch.zeros(PROFILE_DIM, device=self.device))
+                    if hero_prof_t.dim() == 1:
+                        hero_prof_t = hero_prof_t.unsqueeze(0)
+
+                    with torch.no_grad():
+                        end_out = self.policy(
+                            hole_cards=end_encoded['hole_cards'],
+                            community_cards=end_encoded['community_cards'],
+                            numeric_features=end_encoded['numeric_features'],
+                            opponent_embeddings=opp_embed_t,
+                            opponent_stats=end_opp_stats,
+                            own_stats=end_own_stats,
+                            opponent_game_state=end_opp_gs,
+                            action_mask=end_encoded['action_mask'],
+                            sizing_mask=last_exp.get('sizing_mask', torch.ones(1, 10, dtype=torch.bool)),
+                            hand_action_seq=last_exp.get('hand_action_seq', torch.zeros(1, MAX_HAND_ACTIONS, ACTION_FEATURE_DIM)),
+                            hand_action_len=last_exp.get('hand_action_len', torch.zeros(1, dtype=torch.long)),
+                            actor_profiles_seq=last_exp.get('actor_profiles_seq', torch.zeros(1, MAX_HAND_ACTIONS, PROFILE_DIM, device=self.device)),
+                            hero_profile=hero_prof_t,
+                            opponent_profiles=opp_prof_t,
+                        )
+                    hero_experiences[-1]['v_res_end_of_street'] = end_out.value[0, 0].item()
+
                 current_street = game_state.street
                 player_checked_this_street = [False] * num_p
                 first_bet_this_street_by = -1
@@ -770,6 +811,7 @@ class NLHESelfPlayTrainer:
                 equity_x_pot=exp_dict['equity_x_pot'] / max(self.config.big_blind, 1.0) / max(hero_effective_stack_bb, 1.5),
                 end_street_equity_x_pot=exp_dict['end_street_equity_x_pot'] / max(self.config.big_blind, 1.0) / max(hero_effective_stack_bb, 1.5),
                 street_idx=exp_dict['street_idx'],
+                v_res_end_of_street=exp_dict.get('v_res_end_of_street', 0.0),
             ))
 
         return [hero_exp_list] + [[] for _ in range(num_p - 1)], hero_reward_bb
@@ -1095,10 +1137,10 @@ class NLHESelfPlayTrainer:
         for hid, indices in hand_groups.items():
             indices.sort(key=lambda i: experiences[i].step_idx)
             trajectory = [experiences[i] for i in indices]
-            advantages, returns = compute_gae(trajectory, self.config.gamma, self.config.gae_lambda)
+            advantages, full_returns, _ = compute_gae(trajectory, self.config.gamma, self.config.gae_lambda, self.config.v_res_alpha)
             for local_idx, global_idx in enumerate(indices):
                 gae_advantages[global_idx] = advantages[local_idx]
-                gae_returns[global_idx] = returns[local_idx]
+                gae_returns[global_idx] = full_returns[local_idx]
 
         # Reward is already normalized by effective stack at source (hero_reward /= eff_stack),
         # so advantages and returns are in consistent "fraction of stack" units (~[-1, +1]).

@@ -17,59 +17,84 @@ from model.action_space import ActionIndex, POT_FRACTIONS
 
 def compute_gae(
     trajectory: list,
-    gamma: float = 0.99,
+    gamma: float = 1.0,
     gae_lambda: float = 0.95,
-) -> Tuple[List[float], List[float]]:
-    """Compute GAE with equity-based reward shaping.
+    v_res_alpha: float = 1.0,
+) -> Tuple[List[float], List[float], List[float]]:
+    """Compute GAE with street-scoped reward shaping.
 
-    Per-step rewards:
-    - Same street: 0 (no change)
-    - Cross-street: end_street_equity_x_pot - next_equity_x_pot
-    - Terminal: ev_profit-based reward (MC equity, not binary)
+    Key design choices (poker-specific):
+    - r=0 for all intermediate steps (cost embedded in equity_x_pot via -bet_total)
+    - At street boundaries: bootstrap from V(end_of_street) instead of V(next_street)
+      to prevent new-card variance from contaminating current street's advantages
+    - GAE lambda chain resets at street boundaries — each street's advantages
+      accumulate independently (no river variance in preflop advantages)
+    - v_res_alpha scales V_res influence on policy: 0.0=pure equity, 1.0=full V_res
+    - Value training always uses alpha=1.0 (full V_res) regardless of v_res_alpha
 
-    V(s) = equity_x_pot + V_res(s) where V_res = value head output.
-
-    Returns (advantages, returns).
+    V(s) = equity_x_pot(s) + alpha * V_res(s)
+    Returns (advantages, returns_for_value_training, returns_alpha_scaled).
     """
     n = len(trajectory)
     if n == 0:
-        return [], []
+        return [], [], []
 
-    # V(s) = EV_baseline(s) + V_res(s)
-    values = [exp.equity_x_pot + exp.value for exp in trajectory]
+    # Alpha-scaled values for advantages (policy)
+    alpha = v_res_alpha
+    values = [exp.equity_x_pot + alpha * exp.value for exp in trajectory]
+    # Full values for value training (always alpha=1)
+    full_values = [exp.equity_x_pot + exp.value for exp in trajectory]
     terminal_reward = trajectory[-1].reward
 
-    rewards = []
-    for t in range(n):
-        if t == n - 1:
-            rewards.append(terminal_reward)
-        elif trajectory[t].street_idx == trajectory[t + 1].street_idx:
-            rewards.append(0.0)
-        else:
-            e_end = trajectory[t].end_street_equity_x_pot
-            e_next = trajectory[t + 1].equity_x_pot
-            rewards.append(e_end - e_next)
-
-    # TD errors: δ_t = r_t + γ·V(s_{t+1}) - V(s_t)
+    # TD errors with street-scoped bootstrapping (using alpha-scaled values for policy)
     deltas = []
     for t in range(n):
         if t == n - 1:
-            delta = rewards[t] - values[t]
+            # Terminal: actual profit
+            deltas.append(terminal_reward - values[t])
+        elif trajectory[t].street_idx != trajectory[t + 1].street_idx:
+            # Street boundary: bootstrap from V(end_of_street) BEFORE new card
+            v_end = trajectory[t].end_street_equity_x_pot + alpha * trajectory[t].v_res_end_of_street
+            deltas.append(v_end - values[t])
         else:
-            delta = rewards[t] + gamma * values[t + 1] - values[t]
-        deltas.append(delta)
+            # Same street: r=0, normal TD bootstrap
+            deltas.append(gamma * values[t + 1] - values[t])
 
-    # GAE: A_t = Σ (γλ)^k · δ_{t+k}, computed backward
+    # Full TD errors for value training (alpha=1)
+    full_deltas = []
+    for t in range(n):
+        if t == n - 1:
+            full_deltas.append(terminal_reward - full_values[t])
+        elif trajectory[t].street_idx != trajectory[t + 1].street_idx:
+            v_end_full = trajectory[t].end_street_equity_x_pot + trajectory[t].v_res_end_of_street
+            full_deltas.append(v_end_full - full_values[t])
+        else:
+            full_deltas.append(gamma * full_values[t + 1] - full_values[t])
+
+    # GAE with per-street reset for policy advantages
     advantages = [0.0] * n
     gae = 0.0
     for t in reversed(range(n)):
-        gae = deltas[t] + gamma * gae_lambda * gae
+        if t == n - 1 or trajectory[t].street_idx != trajectory[t + 1].street_idx:
+            gae = deltas[t]
+        else:
+            gae = deltas[t] + gamma * gae_lambda * gae
         advantages[t] = gae
 
-    # Returns: G_t = A_t + V(s_t)
-    returns = [advantages[t] + values[t] for t in range(n)]
+    # GAE with per-street reset for value training (alpha=1)
+    full_advantages = [0.0] * n
+    full_gae = 0.0
+    for t in reversed(range(n)):
+        if t == n - 1 or trajectory[t].street_idx != trajectory[t + 1].street_idx:
+            full_gae = full_deltas[t]
+        else:
+            full_gae = full_deltas[t] + gamma * gae_lambda * full_gae
+        full_advantages[t] = full_gae
 
-    return advantages, returns
+    # Returns for value training: G_t = A_t + V(s_t) with alpha=1
+    full_returns = [full_advantages[t] + full_values[t] for t in range(n)]
+
+    return advantages, full_returns, [advantages[t] + values[t] for t in range(n)]
 
 
 def precompute_ppo_data(experiences: list, device: torch.device) -> dict:

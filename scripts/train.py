@@ -80,6 +80,7 @@ def train_nlhe(args):
         frozen_update_interval=args.save_interval,
         remove_clip=args.remove_clip,
         kl_beta=args.kl_beta,
+        v_res_alpha=args.v_res_alpha,
 
     )
 
@@ -182,6 +183,8 @@ def main():
                         help='KL penalty coefficient if --remove-clip is used')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--v-res-alpha', type=float, default=1.0,
+                        help='V_res influence on advantages (0=pure equity, 1=full V_res)')
 
 
     # Architecture

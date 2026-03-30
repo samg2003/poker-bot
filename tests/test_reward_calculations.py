@@ -354,7 +354,7 @@ class TestFullRewardPipeline:
                        equity_x_pot=0.112, end_street_equity_x_pot=0.112, street_idx=2),
         ]
 
-        advantages, returns = compute_gae(traj)
+        advantages, returns, _ = compute_gae(traj)
 
         # Step 0 cross-street reward = 0.112 - 0.048 = 0.064 (good bet got called)
         step0_reward = traj[0].end_street_equity_x_pot - traj[0].equity_x_pot
@@ -392,7 +392,7 @@ class TestFullRewardPipeline:
                        equity_x_pot=0.006, end_street_equity_x_pot=0.006, street_idx=0),
         ]
 
-        advantages, returns = compute_gae(traj)
+        advantages, returns, _ = compute_gae(traj)
         assert advantages[0] < 0, f"Fold should have negative advantage, got {advantages[0]}"
         assert returns[0] < 0, f"Fold should have negative return, got {returns[0]}"
 
