@@ -291,3 +291,118 @@ class Eval7Evaluator:
                 winners.append(i)
                 
         return winners
+
+
+class RunoutCache:
+    """Cache pre-simulated runout scores for a fixed board + set of hands.
+
+    Simulate N runouts once when the street/board changes. For each runout,
+    store every player's eval7 hand score. Then equity for any subset of
+    eligible players is derived instantly by finding the max score among
+    the eligible set per runout — no re-sampling or re-evaluation needed.
+
+    Usage:
+        cache = RunoutCache()
+        # Called once per street (when board changes):
+        cache.update(all_hands, board, runouts=500)
+        # Called many times per street (nearly free):
+        equities = cache.get_equity(eligible=[0, 1, 2])
+        equities = cache.get_equity(eligible=[0, 2])  # player 1 folded
+    """
+
+    def __init__(self):
+        self._board_key = None       # tuple of board cards (cache invalidation key)
+        self._hands_key = None       # tuple of hole cards (cache invalidation key)
+        self._scores = None          # list[list[int]]: scores[runout_idx][player_idx]
+        self._num_players = 0
+        self._runouts = 0
+
+    def update(self, hands: List[List[int]], board: List[int], runouts: int = 500):
+        """Simulate runouts and cache per-player scores.
+
+        Only re-simulates if board or hands have changed since last call.
+        """
+        board_key = tuple(sorted(c for c in board if c >= 0))
+        hands_key = tuple(tuple(h) for h in hands)
+
+        if board_key == self._board_key and hands_key == self._hands_key:
+            return  # Cache hit — board and hands unchanged
+
+        if not HAS_EVAL7:
+            raise ImportError("eval7 not installed.")
+
+        self._board_key = board_key
+        self._hands_key = hands_key
+        self._num_players = len(hands)
+        self._runouts = runouts
+
+        e7_hands = [Eval7Evaluator.ints_to_eval7_list(h) for h in hands]
+        e7_board = Eval7Evaluator.ints_to_eval7_list(board)
+
+        # Build deck minus dead cards
+        deck = eval7.Deck()
+        dead_cards = e7_board.copy()
+        for h in e7_hands:
+            dead_cards.extend(h)
+        for c in dead_cards:
+            deck.cards.remove(c)
+
+        cards_needed = 5 - len(e7_board)
+        deck_list = deck.cards
+
+        scores = []
+
+        if cards_needed > 0:
+            import numpy as np
+            deck_arr = np.array(deck_list, dtype=object)
+            rand_vals = np.random.rand(runouts, len(deck_list))
+            sample_indices = np.argsort(rand_vals, axis=1)[:, :cards_needed]
+            sampled_cards = deck_arr[sample_indices]
+
+            for r_idx in range(runouts):
+                sim_board = e7_board + sampled_cards[r_idx].tolist()
+                row = [eval7.evaluate(sim_board + h) for h in e7_hands]
+                scores.append(row)
+        else:
+            # River — single evaluation, repeat for consistency
+            row = [eval7.evaluate(e7_board + h) for h in e7_hands]
+            scores = [row]  # Only 1 unique evaluation needed
+            self._runouts = 1
+
+        self._scores = scores
+
+    def get_equity(self, eligible: List[int]) -> List[float]:
+        """Compute equity for a subset of eligible players from cached scores.
+
+        Returns equities indexed by position in `eligible` list.
+        Nearly free — just integer comparisons over cached scores.
+        """
+        if self._scores is None:
+            return [1.0 / len(eligible)] * len(eligible)
+
+        n = len(eligible)
+        wins = [0.0] * n
+        num_runouts = len(self._scores)
+
+        for scores_row in self._scores:
+            best_score = -1
+            winners = []
+            for local_idx, player_idx in enumerate(eligible):
+                s = scores_row[player_idx]
+                if s > best_score:
+                    best_score = s
+                    winners = [local_idx]
+                elif s == best_score:
+                    winners.append(local_idx)
+
+            share = 1.0 / len(winners)
+            for w in winners:
+                wins[w] += share
+
+        return [w / num_runouts for w in wins]
+
+    def invalidate(self):
+        """Force re-simulation on next update call."""
+        self._board_key = None
+        self._hands_key = None
+        self._scores = None

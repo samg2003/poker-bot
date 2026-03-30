@@ -163,24 +163,42 @@ def get_opponent_game_state(
     return torch.stack(opp_states).unsqueeze(0).to(device)
 
 
-def compute_hero_ev(game_state: GameState, hero_idx: int, mc_sims: int = 500) -> float:
+def compute_hero_ev(game_state: GameState, hero_idx: int, mc_sims: int = 500,
+                    runout_cache: 'RunoutCache | None' = None) -> float:
     """Side-pot-aware hero EV via MC equity per pot layer.
 
-    Uses calculate_side_pots() which works mid-hand. For each pot layer,
-    computes MC equity only among eligible players, then sums hero's
-    expected share across all layers.
+    If a RunoutCache is provided, uses cached per-runout scores instead of
+    re-sampling. The cache is updated (once per street) with ALL players'
+    hands and the current board, then equity is derived for each pot layer's
+    eligible subset from cached scores — nearly free.
     """
-    from engine.hand_evaluator import Eval7Evaluator
+    from engine.hand_evaluator import Eval7Evaluator, RunoutCache as _RC
+
     side_pots = game_state.calculate_side_pots()
+
+    # Update cache once for this board+hands combo (no-op if unchanged)
+    if runout_cache is not None:
+        all_hands = [list(game_state.players[i].hole_cards)
+                     for i in range(game_state.num_players)]
+        runout_cache.update(all_hands, list(game_state.board), runouts=mc_sims)
+
     hero_ev = 0.0
     for pot_amount, eligible in side_pots:
         if hero_idx not in eligible:
             continue
-        hands = [list(game_state.players[i].hole_cards) for i in eligible]
-        equities = Eval7Evaluator.get_equity(
-            hands, list(game_state.board),
-            runouts=mc_sims,
-        )
+
+        if runout_cache is not None:
+            # Derive equity from cached scores — near-instant
+            equities = runout_cache.get_equity(eligible)
+        else:
+            # Fallback: full MC simulation
+            hands = [list(game_state.players[i].hole_cards) for i in eligible]
+            equities = Eval7Evaluator.get_equity(
+                hands, list(game_state.board), runouts=mc_sims,
+            )
+
         hero_pos = eligible.index(hero_idx)
         hero_ev += equities[hero_pos] * pot_amount
+
     return hero_ev - game_state.players[hero_idx].bet_total
+

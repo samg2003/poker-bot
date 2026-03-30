@@ -393,6 +393,10 @@ class NLHESelfPlayTrainer:
         hero_step_idx = 0
         hero_effective_stack_bb = 1.5  # computed at hero's first decision
 
+        # Per-hand runout cache: simulate once per street, reuse across actions
+        from engine.hand_evaluator import RunoutCache
+        equity_cache = RunoutCache()
+
         # Per-seat opponent assignment
         if not table.seat_pool_idx or len(table.seat_pool_idx) != num_p - 1:
             table.seat_pool_idx = {}
@@ -518,7 +522,7 @@ class NLHESelfPlayTrainer:
             if pid == 0:
                 # ── HERO ──
                 # Compute side-pot-aware hero EV before action
-                equity_x_pot = compute_hero_ev(game_state, hero_idx=0, mc_sims=self.config.mc_equity_sims)
+                equity_x_pot = compute_hero_ev(game_state, hero_idx=0, mc_sims=self.config.mc_equity_sims, runout_cache=equity_cache)
 
                 # Compute effective stack at hero's first decision
                 if hero_step_idx == 0:
@@ -705,7 +709,7 @@ class NLHESelfPlayTrainer:
             if game_state.street != current_street:
                 # Compute end-of-street hero EV (captures opponent responses)
                 if hero_experiences:
-                    end_ev = compute_hero_ev(game_state, hero_idx=0, mc_sims=self.config.mc_equity_sims)
+                    end_ev = compute_hero_ev(game_state, hero_idx=0, mc_sims=self.config.mc_equity_sims, runout_cache=equity_cache)
                     hero_experiences[-1]['end_street_equity_x_pot'] = end_ev
                 current_street = game_state.street
                 player_checked_this_street = [False] * num_p
