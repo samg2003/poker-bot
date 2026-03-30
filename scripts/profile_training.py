@@ -84,9 +84,8 @@ if __name__ == "__main__":
         t0 = time.time()
         
         if config.num_workers > 0:
-            all_exp, reward = trainer._run_multiprocess_epoch()
-        else:
-            all_exp, reward = trainer._run_batched_epoch()
+            print("    [Warning] --num-workers > 0 ignored (vectorized env removed), using batched epoch")
+        all_exp, reward = trainer._run_batched_epoch()
         sim_time = time.time() - t0
         print(f"Post-Sim Mem: CPU {get_mem_mb():.1f}MB | GPU {get_gpu_mem_mb():.1f}MB")
 

@@ -27,90 +27,9 @@ import torch
 from datetime import datetime
 
 
-from training.curriculum import CurriculumTrainer, CurriculumConfig, CurriculumStage
-from training.self_play_trainer import LeducSelfPlayTrainer, TrainingConfig
 from training.nlhe_trainer import NLHESelfPlayTrainer, NLHETrainingConfig
 from deployment.checkpoint import CheckpointManager, CheckpointMetadata
 from agent.config import AgentConfig
-
-
-def train_leduc(args):
-    """Train on Leduc Hold'em for fast validation."""
-    print(f"\n{'='*50}")
-    print(f"Training on Leduc Hold'em")
-    print(f"Epochs: {args.epochs} | Hands/epoch: {args.hands}")
-    print(f"{'='*50}\n")
-
-    config = TrainingConfig(
-        embed_dim=args.embed_dim,
-        opponent_embed_dim=args.embed_dim,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        lr=args.lr,
-        hands_per_epoch=args.hands,
-        log_interval=args.log_interval,
-    )
-    trainer = LeducSelfPlayTrainer(config=config, seed=args.seed)
-
-    checkpoint_mgr = CheckpointManager(args.checkpoint_dir)
-
-    # Train
-    metrics = trainer.train(num_epochs=args.epochs)
-
-    # Save final checkpoint
-    avg_reward = metrics['epoch_reward'][-1] if metrics['epoch_reward'] else 0.0
-    avg_loss = metrics['epoch_loss'][-1] if metrics['epoch_loss'] else 0.0
-
-    metadata = CheckpointMetadata(
-        version=f"leduc_v{args.epochs:04d}",
-        created_at=datetime.now().isoformat(),
-        epoch=args.epochs,
-        stage="Leduc Self-Play",
-        total_hands=args.epochs * args.hands,
-        avg_reward=avg_reward,
-        loss=avg_loss,
-        test_count=168,
-    )
-    checkpoint_mgr.save(
-        trainer.policy, trainer.opponent_encoder,
-        trainer.optimizer, metadata,
-    )
-    checkpoint_mgr.save_best(
-        trainer.policy, trainer.opponent_encoder,
-        trainer.optimizer, metadata,
-    )
-
-    best_reward = max(metrics['epoch_reward']) if metrics['epoch_reward'] else 0.0
-    print(f"\nTraining complete. Best reward: {best_reward:+.4f}")
-    print(f"Checkpoint saved to: {args.checkpoint_dir}/latest")
-
-
-def train_curriculum(args):
-    """Train with full curriculum."""
-    print(f"\n{'='*50}")
-    print(f"Curriculum Training")
-    print(f"Max epochs: {args.epochs} | Hands/epoch: {args.hands}")
-    print(f"{'='*50}\n")
-
-    config = CurriculumConfig(
-        embed_dim=args.embed_dim,
-        opponent_embed_dim=args.embed_dim,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        lr=args.lr,
-        hands_per_epoch=args.hands,
-        log_interval=args.log_interval,
-        checkpoint_interval=args.save_interval,
-    )
-
-    trainer = CurriculumTrainer(config=config, seed=args.seed)
-    metrics = trainer.train(max_epochs=args.epochs)
-
-    print(f"\nTraining complete.")
-    print(f"Final stage: {metrics.current_stage}")
-    print(f"Stage transitions: {metrics.stage_transitions}")
-    if metrics.epoch_rewards:
-        print(f"Final reward: {metrics.epoch_rewards[-1]:+.4f}")
 
 
 def train_nlhe(args):
@@ -163,7 +82,7 @@ def train_nlhe(args):
         frozen_update_interval=args.save_interval,
         remove_clip=args.remove_clip,
         kl_beta=args.kl_beta,
-        use_personalities=not args.no_personality,
+
     )
 
     
@@ -243,11 +162,6 @@ def train_nlhe(args):
 def main():
     parser = argparse.ArgumentParser(description='Train poker AI')
 
-    # Game selection
-    parser.add_argument('--game', choices=['leduc', 'nlhe'], default='leduc',
-                        help='Game to train on (default: leduc)')
-    parser.add_argument('--curriculum', action='store_true',
-                        help='Use curriculum training (Leduc only)')
 
     # Training params
     parser.add_argument('--epochs', type=int, default=100,
@@ -307,8 +221,7 @@ def main():
                         help='Max simultaneous games per sub-batch (default: 500, lower to save memory)')
     parser.add_argument('--num-workers', type=int, default=0,
                         help='Number of parallel Gym environments (default: 0 = sequential engine)')
-    parser.add_argument('--no-personality', action='store_true',
-                        help='Disable personality overlays on frozen opponents during training')
+
     parser.add_argument('--reset-hand-encoder', action='store_true',
                         help='One-time migration: load checkpoint with strict=False to fresh-init '
                              'HandHistoryEncoder (GRU→Transformer). Skip pool load. Use once, then resume normally.')
@@ -328,12 +241,7 @@ def main():
     if args.threads > 0:
         torch.set_num_threads(args.threads)
 
-    if args.curriculum:
-        train_curriculum(args)
-    elif args.game == 'nlhe':
-        train_nlhe(args)
-    else:
-        train_leduc(args)
+    train_nlhe(args)
 
 
 if __name__ == '__main__':

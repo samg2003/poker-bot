@@ -113,7 +113,6 @@ def _serialize_snapshot(snap: TimelineSnapshot):
                 "is_all_in": p.is_all_in,
                 "is_folded": p.is_folded,
                 "hole_cards": list(p.hole_cards) if p.hole_cards else [],
-                "personality": seat_info.personality_name,
                 "is_human": seat_info.is_human,
             })
         else:
@@ -127,7 +126,6 @@ def _serialize_snapshot(snap: TimelineSnapshot):
                 "is_all_in": False,
                 "is_folded": True,
                 "hole_cards": [],
-                "personality": "",
                 "is_human": False,
             })
 

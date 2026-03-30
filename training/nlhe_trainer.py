@@ -34,11 +34,6 @@ from model.opponent_encoder import OpponentEncoder
 from model.policy_network import PolicyNetwork, OPP_GAME_STATE_DIM, PROFILE_DIM, MAX_HAND_ACTIONS
 from model.stat_tracker import StatTracker, HandRecord, NUM_STAT_FEATURES
 from model.nlhe_encoder import NLHEEncoder
-from search.search import SearchEngine, SearchConfig
-from training.personality import (
-    SituationalPersonality, PersonalityModifier,
-    sample_table_personalities, detect_situations,
-)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -77,81 +72,6 @@ class Experience(NamedTuple):
     street_idx: int = 0              # 0=preflop, 1=flop, 2=turn, 3=river
 
 
-def _mp_play_chunk(args):
-    """Top-level worker function for multiprocessing.Pool.
-    
-    Plays a chunk of hands completely independently — no per-decision IPC.
-    Returns (serialized_experiences, total_reward).
-    """
-    num_hands, seed, epoch, total_epochs = args
-    global _mp_worker_trainer
-
-    t = _mp_worker_trainer
-    t.rng = random.Random(seed)
-    torch.manual_seed(seed)
-    t.current_epoch = epoch
-    t.total_epochs = total_epochs
-    t._hand_counter = seed * 100000
-    t.config.hands_per_epoch = num_hands
-    t.config.batch_chunk_size = min(500, num_hands)
-
-    exps, reward = t._run_batched_epoch()
-
-    # Serialize tensors to numpy for fast IPC
-    serialized = []
-    for exp in exps:
-        d = exp._asdict()
-        for k, v in d.items():
-            if isinstance(v, torch.Tensor):
-                d[k] = v.detach().cpu().numpy()
-        serialized.append(d)
-
-    return serialized, reward
-
-
-# Global for Pool workers — set by _mp_init_worker
-_mp_worker_trainer = None
-
-
-def _mp_init_worker(config_dict, policy_np, opp_enc_np, pool_recent_np, pool_archive_np):
-    """Pool initializer: runs ONCE per worker process. Sets up trainer with model weights."""
-    global _mp_worker_trainer
-    import os
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['MKL_NUM_THREADS'] = '1'
-    torch.set_num_threads(1)
-    try:
-        torch.set_num_interop_threads(1)
-    except RuntimeError:
-        pass
-
-    def _np_to_sd(npd):
-        return {k: torch.from_numpy(v.copy()) for k, v in npd.items()}
-
-    policy_sd = _np_to_sd(policy_np)
-    opp_enc_sd = _np_to_sd(opp_enc_np)
-
-    config = NLHETrainingConfig(**config_dict)
-    config.device = 'cpu'
-    config.num_workers = 0
-    config.verbose = False
-
-    trainer = NLHESelfPlayTrainer(config)
-    trainer.policy.load_state_dict(policy_sd)
-    trainer.policy.eval()
-    trainer.opponent_encoder.load_state_dict(opp_enc_sd)
-    trainer.opponent_encoder.eval()
-    trainer._frozen_template.load_state_dict(policy_sd)
-    trainer._frozen_template.eval()
-    trainer.frozen_opponent_encoder.load_state_dict(opp_enc_sd)
-    trainer.frozen_opponent_encoder.eval()
-    trainer.opponent_pool_recent = [_np_to_sd(sd) for sd in pool_recent_np]
-    trainer.opponent_pool_archive = [_np_to_sd(sd) for sd in pool_archive_np]
-    trainer._frozen_models = {}
-
-    _mp_worker_trainer = trainer
-
-
 # ─────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────
@@ -184,7 +104,7 @@ class NLHETrainingConfig:
     gae_lambda: float = 0.95     # GAE lambda parameter
     ppo_clip: float = 0.2
     ppo_epochs: int = 4
-    mini_batch_size: int = 256         # mini-batch size for PPO updates
+    mini_batch_size: int = 64          # mini-batch size for PPO updates
     entropy_coef: float = 0.005   # was 0.05 — reduced 10x to not drown out policy gradient
     entropy_coef_end: float = 0.001
     value_coef: float = 0.5
@@ -227,8 +147,7 @@ class NLHETrainingConfig:
     remove_clip: bool = False     # Use KL Penalty instead of hard clipping
     kl_beta: float = 1.0          # Coefficient for KL penalty when clip is removed
 
-    # Personality system
-    use_personalities: bool = True  # Set to False to disable personality overlays on frozen opponents
+
 
 
 @dataclass
@@ -238,9 +157,7 @@ class TableState:
     stat_tracker: StatTracker = field(default_factory=StatTracker)
     hands_since_reset: int = 0
     next_reset_at: int = 50
-    hands_since_personality_reset: int = 0
-    next_personality_reset_at: int = 50
-    table_personalities: List[Optional['SituationalPersonality']] = field(default_factory=list)
+
     seat_pool_idx: Dict[int, int] = field(default_factory=dict)
     opp_embed_cache: Dict[int, torch.Tensor] = field(default_factory=dict)
 
@@ -297,22 +214,9 @@ class NLHESelfPlayTrainer:
         # ── Hand counter for unique hand IDs ──────────────────
         self._hand_counter = 0
 
-        # ── Search engine ─────────────────────────────────────
-        if self.config.search_fraction > 0:
-            self.search_engine = SearchEngine(
-                policy=self.policy,
-                opponent_encoder=self.opponent_encoder,
-                config=SearchConfig(num_iterations=self.config.search_iterations),
-            )
-        else:
-            self.search_engine = None
-
         # ── Metrics ───────────────────────────────────────────
         self.epoch_rewards: List[float] = []
         self.epoch_losses: List[float] = []
-        
-        # ── Vectorized Environments ───────────────────────────
-        self.envs = None
 
     @staticmethod
     def _resolve_device(device_str: str) -> torch.device:
@@ -358,17 +262,8 @@ class NLHESelfPlayTrainer:
         self._sync_workers()
 
     def _sync_workers(self):
-        """Send latest target state dicts to the isolated CPU workers."""
-        if self.envs is not None:
-            p_sd = {k: v.cpu() for k, v in self.policy.state_dict().items()}
-            e_sd = {k: v.cpu() for k, v in self.opponent_encoder.state_dict().items()}
-            f_sds = [{k: v.cpu() for k, v in fm.state_dict().items()} for fm in self._frozen_models.values()]
-            self.envs.call('update_weights', p_sd, e_sd, f_sds)
-        # Invalidate multiprocess pool so it recreates with fresh weights
-        if hasattr(self, '_mp_pool') and self._mp_pool is not None:
-            self._mp_pool.terminate()
-            self._mp_pool.join()
-            self._mp_pool = None
+        """Placeholder for future worker sync."""
+        pass
 
     def _get_combined_pool(self) -> List[dict]:
         """Get combined pool (recent + archive) as a single list."""
@@ -620,34 +515,17 @@ class NLHESelfPlayTrainer:
             return torch.zeros(1, 1, OPP_GAME_STATE_DIM, device=self.device)
         return torch.stack(opp_states).unsqueeze(0).to(self.device)
 
-    def _get_personality_gto_fraction(self) -> float:
-        """Graduated personality curriculum schedule."""
-        epoch = self.current_epoch
-        if epoch < 20:
-            return 1.0  # 100% GTO until epoch 20
-        return 0.6      # 60% GTO / 40% Personalities after epoch 20
-
     def _maybe_reset_histories(self, table: TableState):
-        """Periodically reset opponent histories and personalities (simulate new table)."""
+        """Periodically reset opponent histories (simulate new table)."""
         table.hands_since_reset += 1
-        table.hands_since_personality_reset += 1
 
-        # Hard reset: total flush of histories and stats (e.g. 300-500 hands)
+        # Hard reset: total flush of histories and stats
         if table.hands_since_reset >= table.next_reset_at:
             table.action_histories.clear()
             table.stat_tracker.reset()
             table.hands_since_reset = 0
             table.next_reset_at = self.rng.randint(*self.config.history_reset_interval)
-            # Reshuffle personalities and per-seat weights when we "sit down at a new table"
-            table.table_personalities = []
             table.seat_pool_idx = {}
-            table.hands_since_personality_reset = 0
-
-        # Soft reset: flush personalities only (keep histories for OpponentEncoder to adapt)
-        elif table.hands_since_personality_reset >= table.next_personality_reset_at:
-            table.table_personalities = []
-            table.seat_pool_idx = {}
-            table.hands_since_personality_reset = 0
 
     # ─────────────────────────────────────────────────────────
     # State encoding
@@ -817,19 +695,7 @@ class NLHESelfPlayTrainer:
                 else:
                     table.seat_pool_idx[pid] = 0
 
-        # Table-level personality
-        if not self.config.use_personalities:
-            # Personalities disabled — all opponents play straight (no modifier)
-            if len(table.table_personalities) != num_p:
-                table.table_personalities = [None] * num_p
-        elif len(table.table_personalities) != num_p:
-            if self.current_epoch < 20 or self.rng.random() < 0.33:
-                gto_frac = 1.0
-            else:
-                gto_frac = 0.60
-            table.table_personalities = sample_table_personalities(
-                num_p, gto_fraction=gto_frac, rng=self.rng
-            )
+
 
         hand_records = [HandRecord() for _ in range(num_p)]
         epsilon = self._get_epsilon()
@@ -959,28 +825,6 @@ class NLHESelfPlayTrainer:
                     hero_effective_stack_bb = max(min(hero_stack_bb, max_opp), 1.5)
 
                 raw_probs = probs.clone()
-                if self.search_engine is not None and self.rng.random() < self.config.search_fraction:
-                    street_map = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
-                    cur_street = street_map.get(game_state.street, 0)
-                    pot_bb = game_state.pot / game_state.big_blind
-                    if self.search_engine.should_search(probs, pot_bb, cur_street):
-                        search_stacks = [pp.stack for pp in game_state.players]
-                        search_actions, search_probs = self.search_engine.search(
-                            pot=game_state.pot, stacks=search_stacks, board=list(game_state.board),
-                            street=cur_street, hero=pid,
-                            opp_embed=opp_embed_tensor.clone().cpu() if opp_embed_tensor is not None else None,
-                            opp_stats=opp_stats.clone().cpu(),
-                            own_stats=own_stats.clone().cpu(),
-                        )
-                        refined = torch.zeros(NUM_ACTION_TYPES, device=self.device)
-                        for sa, sp in zip(search_actions, search_probs):
-                            if sa == 'check': refined[ActionIndex.CHECK] += sp
-                            elif sa == 'fold': refined[ActionIndex.FOLD] += sp
-                            elif sa == 'call': refined[ActionIndex.CALL] += sp
-                            elif sa.startswith('raise_') or sa == 'allin': refined[ActionIndex.RAISE] += sp
-                        if refined.sum() > 0:
-                            refined = refined / refined.sum()
-                            probs = 0.7 * refined + 0.3 * probs.to(self.device)
 
                 action_mask_cpu = encoded['action_mask'].squeeze(0).cpu()
                 legal_indices = action_mask_cpu.nonzero(as_tuple=True)[0].tolist()
@@ -1058,51 +902,11 @@ class NLHESelfPlayTrainer:
 
             else:
                 # ── OPPONENT ──
-                personality = None
-                is_facing_raise = game_state.current_bet > 0 and p.bet_this_street < game_state.current_bet
-                if pid < len(table.table_personalities):
-                    personality = table.table_personalities[pid]
-                    if personality is not None:
-                        street_map_sit = {Street.PREFLOP: 0, Street.FLOP: 1, Street.TURN: 2, Street.RIVER: 3}
-                        situations = detect_situations(
-                            street=street_map_sit.get(game_state.street, 0),
-                            board_cards=list(game_state.board) if game_state.board else None,
-                            stack_bb=p.stack / max(game_state.big_blind, 1),
-                            is_facing_raise=is_facing_raise,
-                        )
-                        c1, c2 = p.hole_cards
-                        r1, r2 = c1 // 4, c2 // 4
-                        if game_state.street == Street.PREFLOP:
-                            if r1 == r2: hand_strength = 0.55 + r1 * 0.035
-                            elif max(r1, r2) >= 10: hand_strength = 0.45 + max(r1, r2) * 0.02
-                            elif (c1 % 4) == (c2 % 4): hand_strength = 0.3
-                            else: hand_strength = 0.15 + max(r1, r2) * 0.01
-                        else:
-                            paired_board = any(r1 == (bc // 4) or r2 == (bc // 4) for bc in game_state.board if bc >= 0)
-                            if paired_board: hand_strength = 0.65 + max(r1, r2) * 0.02
-                            elif max(r1, r2) >= 10: hand_strength = 0.4
-                            else: hand_strength = 0.2
-
-                        probs = personality.apply(
-                            probs, 
-                            situations, 
-                            hand_strength=hand_strength, 
-                            is_facing_raise=is_facing_raise,
-                            opponent_stats=table.stat_tracker.get_stats(0).to(probs.device)
-                        )
-
                 dist = Categorical(probs)
                 action_idx = dist.sample().item()
                 sizing_idx = 0
                 if action_idx == ActionIndex.RAISE and sum(sizing_probs) > 0:
                     sizing_tensor = torch.tensor(sizing_probs, dtype=torch.float32)
-                    if personality is not None:
-                        sizing_tensor = personality.apply_sizing(
-                            sizing_tensor, 
-                            situations, 
-                            hand_strength=hand_strength,
-                            opponent_stats=table.stat_tracker.get_stats(0)
-                        )
                     s_dist = Categorical(sizing_tensor)
                     sizing_idx = s_dist.sample().item()
 
@@ -1435,7 +1239,7 @@ class NLHESelfPlayTrainer:
 
                     # Phase 5+6: Batch hand action sequences & profiles
                     batch_ha_seq = torch.cat([s.get('hand_action_seq', torch.zeros(1, MAX_HAND_ACTIONS, ACTION_FEATURE_DIM)) for s in sub_states], dim=0).to(self.device)
-                    batch_ha_len = torch.cat([s.get('hand_action_len', torch.ones(1, dtype=torch.long)) for s in sub_states], dim=0).to(self.device)
+                    batch_ha_len = torch.cat([s.get('hand_action_len', torch.ones(1, dtype=torch.long)) for s in sub_states], dim=0)
                     batch_actor_prof = torch.cat([s.get('actor_profiles_seq', torch.zeros(1, MAX_HAND_ACTIONS, PROFILE_DIM)) for s in sub_states], dim=0).to(self.device)
                     
                     batch_hero_prof = torch.stack([s.get('hero_profile', torch.zeros(PROFILE_DIM)) for s in sub_states], dim=0).to(self.device)
@@ -1482,9 +1286,6 @@ class NLHESelfPlayTrainer:
                         total_reward += reward
                         total_finished += 1
                         del pending[game_idx]
-                        if self.config.verbose and total_finished % 100 == 0:
-                            elapsed = time.time() - epoch_start
-                            print(f"      [{total_finished}/{num_hands} hands, {elapsed:.0f}s]", flush=True)
 
         return all_exp, total_reward
 
@@ -1682,7 +1483,7 @@ class NLHESelfPlayTrainer:
         opp_gs = data['opp_gs'][idx].to(self.device)
         opp_masks = data['opp_masks'][idx].to(self.device)
         hand_action_seqs = data['hand_action_seqs'][idx].to(self.device)
-        hand_action_lens = data['hand_action_lens'][idx].to(self.device)
+        hand_action_lens = data['hand_action_lens'][idx]
         actor_profiles_seqs = data['actor_profiles_seqs'][idx].to(self.device)
         hero_profiles = data['hero_profiles'][idx].to(self.device)
         opp_profiles = data['opp_profiles'][idx].to(self.device)
@@ -1780,196 +1581,10 @@ class NLHESelfPlayTrainer:
         )
         
         loss.backward()
-
         
         return loss.item(), action_loss.item(), sizing_loss.item(), value_loss.item()
 
-    # ──────────────────────────────────────────────────────────
-    # Multiprocess parallel hand simulation
-    # ──────────────────────────────────────────────────────────
 
-    def _run_multiprocess_epoch(self) -> Tuple[List[Experience], float]:
-        """Parallel hand simulation using multiprocessing.Pool with fork.
-        
-        Each worker plays a chunk of hands COMPLETELY independently
-        (no per-decision IPC). Returns aggregated experiences for PPO.
-        """
-        import multiprocessing as mp
-
-        num_workers = self.config.num_workers
-        hands_total = self.config.hands_per_epoch
-        hands_per_worker = hands_total // num_workers
-        remainder = hands_total % num_workers
-
-        # Create or recreate persistent pool
-        if not hasattr(self, '_mp_pool') or self._mp_pool is None:
-            def _sd_to_np(sd):
-                return {k: v.cpu().numpy() for k, v in sd.items()}
-
-            policy_np = _sd_to_np(self.policy.state_dict())
-            opp_enc_np = _sd_to_np(self.opponent_encoder.state_dict())
-            pool_recent_np = [_sd_to_np(sd) for sd in self.opponent_pool_recent]
-            pool_archive_np = [_sd_to_np(sd) for sd in self.opponent_pool_archive]
-            config_dict = {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
-
-            # Set thread limits BEFORE spawn so children inherit them
-            import os
-            old_omp = os.environ.get('OMP_NUM_THREADS')
-            os.environ['OMP_NUM_THREADS'] = '1'
-            os.environ['MKL_NUM_THREADS'] = '1'
-            os.environ['OPENBLAS_NUM_THREADS'] = '1'
-
-            ctx = mp.get_context('spawn')  # spawn avoids fork's PyTorch lock inheritance deadlock
-            self._mp_pool = ctx.Pool(
-                num_workers,
-                initializer=_mp_init_worker,
-                initargs=(config_dict, policy_np, opp_enc_np, pool_recent_np, pool_archive_np),
-            )
-
-            # Restore parent's thread count for PPO phase
-            if old_omp is not None:
-                os.environ['OMP_NUM_THREADS'] = old_omp
-            else:
-                os.environ.pop('OMP_NUM_THREADS', None)
-                os.environ.pop('MKL_NUM_THREADS', None)
-                os.environ.pop('OPENBLAS_NUM_THREADS', None)
-
-            if self.config.verbose:
-                print(f"      [MP] Created pool with {num_workers} workers (1 thread each)", flush=True)
-
-        # Lightweight args per worker — NO state dicts (those are in the initializer)
-        args_list = []
-        for i in range(num_workers):
-            n = hands_per_worker + (1 if i < remainder else 0)
-            if n == 0:
-                continue
-            args_list.append((
-                n,
-                self.config.seed + i + self.current_epoch * num_workers,
-                self.current_epoch, self.total_epochs,
-            ))
-
-        results = self._mp_pool.map(_mp_play_chunk, args_list)
-
-        # Reconstruct Experience objects from serialized dicts
-        all_exp: List[Experience] = []
-        total_reward = 0.0
-        for serialized_exps, reward in results:
-            for d in serialized_exps:
-                for k, v in d.items():
-                    if isinstance(v, np.ndarray):
-                        d[k] = torch.from_numpy(v)
-                all_exp.append(Experience(**d))
-            total_reward += reward
-
-        if self.config.verbose:
-            print(f"      [MP] {len(all_exp)} experiences from {len(args_list)} workers", flush=True)
-
-        return all_exp, total_reward
-
-    def _run_vectorized_epoch(self) -> Tuple[List[List[Experience]], float]:
-        """Runs highly parallelized simulation via gym.vector.AsyncVectorEnv."""
-        if self.envs is None:
-            import gymnasium as gym
-            from engine.gym_env import PokerGymEnv
-            
-            def make_env():
-                return PokerGymEnv(
-                    config_dict=self.config.__dict__,
-                    policy_state_dict={k: v.cpu() for k,v in self.policy.state_dict().items()},
-                    opp_enc_state_dict={k: v.cpu() for k,v in self.opponent_encoder.state_dict().items()},
-                    frozen_pool_states=[{k: v.cpu() for k,v in fm.state_dict().items()} for fm in self._frozen_models.values()]
-                )
-            import sys
-            _ctx = 'fork' if sys.platform == 'linux' else 'spawn'  # fork=instant on Linux, spawn needed on macOS
-            self.envs = gym.vector.AsyncVectorEnv([make_env for _ in range(self.config.num_workers)], context=_ctx)
-
-
-        all_exp = []
-        total_reward = 0.0
-        finished_hands = 0
-        
-        obs, _ = self.envs.reset()
-        
-        while finished_hands < self.config.hands_per_epoch:
-            # 1. Batch format tensors directly onto GPU
-            batch_hole = torch.tensor(obs['hole_cards'], device=self.device)
-            batch_comm = torch.tensor(obs['community_cards'], device=self.device)
-            batch_num = torch.tensor(obs['numeric_features'], device=self.device)
-            batch_opp_stats = torch.tensor(obs['opponent_stats'], device=self.device)
-            batch_own = torch.tensor(obs['own_stats'], device=self.device)
-            batch_opp_gs = torch.tensor(obs['opponent_game_state'], device=self.device)
-            batch_ha_seq = torch.tensor(obs['hand_action_seq'], device=self.device)
-            batch_ha_len = torch.tensor(obs['hand_action_len'], device=self.device).squeeze(1)
-            batch_actor_prof = torch.tensor(obs['actor_profiles_seq'], device=self.device)
-            batch_hero_prof = torch.tensor(obs['hero_profile'], device=self.device)
-            batch_opp_profiles = torch.tensor(obs['opponent_profiles'], device=self.device)
-            batch_mask = torch.tensor(obs['action_mask'], device=self.device).to(torch.bool)
-            batch_s_mask = torch.tensor(obs['sizing_mask'], device=self.device).to(torch.bool)
-            batch_opp_embed = torch.tensor(obs['opponent_embeddings'], device=self.device)
-            
-            with torch.inference_mode():
-                embed_sums = batch_opp_embed.sum(dim=-1)
-                batch_opp_mask = (embed_sums == 0)
-
-                output = self.policy(
-                    hole_cards=batch_hole, community_cards=batch_comm, numeric_features=batch_num,
-                    opponent_embeddings=batch_opp_embed, opponent_stats=batch_opp_stats, own_stats=batch_own,
-                    opponent_game_state=batch_opp_gs,
-                    action_mask=batch_mask, sizing_mask=batch_s_mask, opponent_mask=batch_opp_mask,
-                    hand_action_seq=batch_ha_seq, hand_action_len=batch_ha_len,
-                    actor_profiles_seq=batch_actor_prof,
-                    hero_profile=batch_hero_prof,
-                    opponent_profiles=batch_opp_profiles,
-                )
-                
-            probs = output.action_type_probs.cpu().numpy()
-            values = output.value.cpu().numpy() if hasattr(output, 'value') else np.zeros((self.config.num_workers, 1))
-            sizing_probs = torch.softmax(output.bet_size_logits, dim=-1).cpu().numpy()
-            
-            # Action construction for Gym: fake indices since action generation happens natively
-            actions_raw = np.zeros((self.config.num_workers, 2), dtype=np.int64)
-
-            action_dict = {
-                'action': actions_raw,
-                'probs': probs,
-                'value': values,
-                'sizing_probs': sizing_probs,
-            }
-            
-            next_obs, rewards, dones, truncated, infos = self.envs.step(action_dict)
-            obs = next_obs
-            
-            if True in dones:
-                exps_lists = infos.get('experiences', [])
-                valid_flags = infos.get('_experiences', [True] * self.config.num_workers)
-                
-                # `infos` is a dict of lists in recent Gym versions, or numpy arrays
-                if not isinstance(exps_lists, (list, tuple, np.ndarray)):
-                    exps_lists = [exps_lists]
-                if not isinstance(valid_flags, (list, tuple, np.ndarray)):
-                    valid_flags = [valid_flags]
-
-                for w_idx in range(self.config.num_workers):
-                    # Check if this specific worker finished and returned experiences
-                    if dones[w_idx] and w_idx < len(valid_flags) and valid_flags[w_idx]:
-                        exps_dicts = exps_lists[w_idx]
-                        if exps_dicts:
-                            exps = []
-                            for d in exps_dicts:
-                                for k, v in d.items():
-                                    if isinstance(v, np.ndarray):
-                                        d[k] = torch.tensor(v)
-                                exps.append(Experience(**d))
-                            all_exp.extend(exps)
-                            total_reward += exps[-1].reward if exps else 0.0
-                            finished_hands += 1
-                            if self.config.verbose and finished_hands % 100 == 0:
-                                print(f"      [{finished_hands}/{self.config.hands_per_epoch} hands]", flush=True)
-                            if finished_hands >= self.config.hands_per_epoch:
-                                break
-
-        return all_exp, total_reward
 
     # ─────────────────────────────────────────────────────────
     # Training loop
@@ -2012,12 +1627,9 @@ class NLHESelfPlayTrainer:
                     print(f"    [Frozen sync] Pool: {len(self.opponent_pool_recent)} recent + {len(self.opponent_pool_archive)} archive = {pool_total}")
 
             # Batched simulation: all hands run as generators with batched GPU calls
-            sim_start = time.time()
-            if self.config.num_workers > 0:
-                all_exp, total_reward = self._run_multiprocess_epoch()
-            else:
-                all_exp, total_reward = self._run_batched_epoch()
-            sim_time = time.time() - sim_start
+            if self.config.num_workers > 0 and epoch == start_epoch:
+                print("    [Warning] --num-workers > 0 ignored (vectorized env removed), using batched epoch")
+            all_exp, total_reward = self._run_batched_epoch()
 
             avg_reward = total_reward / self.config.hands_per_epoch
 
@@ -2025,14 +1637,11 @@ class NLHESelfPlayTrainer:
             action_pcts = self._count_action_distribution(all_exp)
 
             # Pre-compute GAE and batch tensors ONCE
-            pre_start = time.time()
             self.policy.train()
             self.opponent_encoder.train()
             ppo_data = self._precompute_ppo_data(all_exp)
-            pre_time = time.time() - pre_start
 
             # Mini-batch PPO update
-            ppo_start = time.time()
             total_loss = 0.0
             total_action_loss = 0.0
             total_sizing_loss = 0.0
@@ -2063,7 +1672,6 @@ class NLHESelfPlayTrainer:
             avg_a = total_action_loss / max(num_updates, 1)
             avg_s = total_sizing_loss / max(num_updates, 1)
             avg_v = total_value_loss / max(num_updates, 1)
-            ppo_time = time.time() - ppo_start
 
             # Free experience memory and flush device cache
             del all_exp
@@ -2090,8 +1698,6 @@ class NLHESelfPlayTrainer:
                     f"F/Ch/Ca/R/AI: {action_pcts['fold']:.0f}/{action_pcts['check']:.0f}/{action_pcts['call']:.0f}/{action_pcts['raise']:.0f}/{action_pcts['allin']:.0f}% "
                     f"DAI:{deep_ai:.0f}%"
                 )
-                if self.config.verbose:
-                    print(f"    ⏱ sim={sim_time:.1f}s pre={pre_time:.1f}s ppo={ppo_time:.1f}s ({num_updates} steps)", flush=True)
 
             if epoch_callback:
                 epoch_callback(self, epoch + 1, metrics)

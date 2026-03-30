@@ -10,7 +10,6 @@ from model.policy_network import PolicyNetwork
 from model.opponent_encoder import OpponentEncoder
 from model.stat_tracker import StatTracker, NUM_STAT_FEATURES, HandRecord
 from model.action_space import ActionIndex, NUM_ACTION_TYPES, encode_action
-from training.personality import SituationalPersonality, PersonalityModifier, detect_situations
 
 # ─── Bot name pool ───
 BOT_NAMES = [
@@ -25,8 +24,6 @@ class SeatInfo:
     occupied: bool = False
     is_human: bool = False
     name: str = ""
-    personality: Optional[SituationalPersonality] = None
-    personality_name: str = "Bot"
     stack: float = 100.0
     hands_remaining: int = 30      # How many more hands before leaving
     uid: int = 0                    # Unique ID for stat tracking
@@ -84,42 +81,15 @@ class GameManager:
 
     # ─────────────────────────────────────────────────────────
     # Lobby Management
-    # ─────────────────────────────────────────────────────────
     def _seat_human(self):
         s = self.seats[self.human_seat]
         s.occupied = True
         s.is_human = True
         s.name = "Hero"
-        s.personality = None
-        s.personality_name = "Human"
         s.stack = 100.0
         s.hands_remaining = 999999
         s.uid = 0
         self.total_buyin = 100.0
-
-    def _random_personality(self) -> tuple:
-        roll = self.rng.random()
-        if roll < 0.90:
-            base = PersonalityModifier.gto()
-            return SituationalPersonality(base=base), "GTO"
-        elif roll < 0.92:
-            base = PersonalityModifier.tag()
-            return SituationalPersonality(base=base), "TAG"
-        elif roll < 0.94:
-            base = PersonalityModifier.nit()
-            return SituationalPersonality(base=base), "Nit"
-        elif roll < 0.96:
-            base = PersonalityModifier.lag()
-            return SituationalPersonality(base=base), "LAG"
-        elif roll < 0.97:
-            base = PersonalityModifier.maniac()
-            return SituationalPersonality(base=base), "Maniac"
-        elif roll < 0.985:
-            base = PersonalityModifier.calling_station()
-            return SituationalPersonality(base=base), "Station"
-        else:
-            base = PersonalityModifier.fish()
-            return SituationalPersonality(base=base), "Fish"
 
     def _random_buyin(self) -> float:
         """Most players buy in at 100bb, some short-stack, rare deep-stack."""
@@ -127,26 +97,20 @@ class GameManager:
         if roll < 0.65:
             return 100.0
         elif roll < 0.80:
-            # Short stack: 30-60bb
             return round(self.rng.uniform(30, 60), 1)
         elif roll < 0.92:
-            # Medium: 60-100bb
             return round(self.rng.uniform(60, 100), 1)
         else:
-            # Deep stack: 150-250bb
             return round(self.rng.uniform(150, 250), 1)
 
     def _seat_bot(self, seat_idx: int):
         """Seat a new bot at the given index."""
         s = self.seats[seat_idx]
-        personality, pname = self._random_personality()
         name = self.rng.choice(BOT_NAMES)
         
         s.occupied = True
         s.is_human = False
         s.name = name
-        s.personality = personality
-        s.personality_name = pname
         s.stack = self._random_buyin()
         s.hands_remaining = max(8, int(self.rng.gauss(30, 12)))
         s.uid = self._next_uid
@@ -159,8 +123,6 @@ class GameManager:
         s.occupied = False
         s.is_human = False
         s.name = ""
-        s.personality = None
-        s.personality_name = ""
         s.stack = 0
         s.hands_remaining = 0
         s.uid = 0
@@ -429,47 +391,7 @@ class GameManager:
         sizing_probs = torch.softmax(sizing_logits, dim=-1).tolist()
         ev = out.value[0, 0].item()
 
-        # Apply personality for bots
-        if seat_info.personality is not None:
-            situations = detect_situations(
-                street=street_map.get(self.game_state.street, 0),
-                is_facing_raise=(self.game_state.current_bet > 0
-                                 and p.bet_this_street < self.game_state.current_bet),
-            )
-            # Approximate hand strength
-            c1, c2 = p.hole_cards
-            r1, r2 = c1 // 4, c2 // 4
-            if self.game_state.street == Street.PREFLOP:
-                if r1 == r2:
-                    hs = 0.55 + r1 * 0.035
-                elif max(r1, r2) >= 10:
-                    hs = 0.45 + max(r1, r2) * 0.02
-                elif (c1 % 4) == (c2 % 4):
-                    hs = 0.3
-                else:
-                    hs = 0.15 + max(r1, r2) * 0.01
-            else:
-                paired_board = any(r1 == (bc // 4) or r2 == (bc // 4)
-                                   for bc in self.game_state.board if bc >= 0)
-                if paired_board:
-                    hs = 0.65 + max(r1, r2) * 0.02
-                elif max(r1, r2) >= 10:
-                    hs = 0.4
-                else:
-                    hs = 0.2
-            probs_tensor = seat_info.personality.apply(
-                torch.tensor(probs), situations,
-                hand_strength=hs,
-                is_facing_raise=(self.game_state.current_bet > 0
-                                 and p.bet_this_street < self.game_state.current_bet),
-            )
-            probs = probs_tensor.tolist()
-            
-            sizing_tensor = seat_info.personality.apply_sizing(
-                torch.tensor(sizing_probs), situations,
-                hand_strength=hs
-            )
-            sizing_probs = sizing_tensor.tolist()
+
 
         import math
         action_evs = {}
@@ -711,7 +633,6 @@ class GameManager:
                 'seat_idx': i,
                 'occupied': s.occupied,
                 'name': s.name,
-                'personality': s.personality_name,
                 'stack': s.stack,
                 'is_human': s.is_human,
             })

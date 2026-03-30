@@ -22,7 +22,6 @@ import torch.nn as nn
 
 from model.policy_network import PolicyNetwork
 from model.opponent_encoder import OpponentEncoder
-from search.range_estimator import RangeEstimator
 from agent.config import AgentConfig
 
 
@@ -82,7 +81,6 @@ class CheckpointManager:
         optimizer: torch.optim.Optimizer,
         metadata: CheckpointMetadata,
         tag: str = 'latest',
-        range_estimator: Optional[RangeEstimator] = None,
     ) -> Path:
         """
         Save a checkpoint.
@@ -93,7 +91,6 @@ class CheckpointManager:
             optimizer: optimizer state
             metadata: training metadata
             tag: 'latest', 'best', or version string (e.g., 'v001')
-            range_estimator: optional range estimator
 
         Returns:
             Path to the saved checkpoint directory.
@@ -106,8 +103,7 @@ class CheckpointManager:
         torch.save(opponent_encoder.state_dict(), save_dir / 'opponent_encoder.pt')
         torch.save(optimizer.state_dict(), save_dir / 'optimizer.pt')
 
-        if range_estimator is not None:
-            torch.save(range_estimator.state_dict(), save_dir / 'range_estimator.pt')
+
 
         # Save metadata
         with open(save_dir / 'metadata.json', 'w') as f:
@@ -133,7 +129,6 @@ class CheckpointManager:
         opponent_encoder: OpponentEncoder,
         optimizer: Optional[torch.optim.Optimizer] = None,
         tag: str = 'latest',
-        range_estimator: Optional[RangeEstimator] = None,
         device: str = 'cpu',
         strict: bool = True,
     ) -> CheckpointMetadata:
@@ -145,7 +140,6 @@ class CheckpointManager:
             opponent_encoder: opponent encoder (weights loaded in-place)
             optimizer: optional optimizer (for resumed training)
             tag: which checkpoint to load
-            range_estimator: optional range estimator
             device: target device
 
         Returns:
@@ -170,10 +164,7 @@ class CheckpointManager:
                 torch.load(load_dir / 'optimizer.pt', map_location=device, weights_only=True)
             )
 
-        if range_estimator and (load_dir / 'range_estimator.pt').exists():
-            range_estimator.load_state_dict(
-                torch.load(load_dir / 'range_estimator.pt', map_location=device, weights_only=True)
-            )
+
 
         with open(load_dir / 'metadata.json') as f:
             metadata = CheckpointMetadata.from_dict(json.load(f))

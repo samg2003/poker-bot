@@ -22,8 +22,6 @@ from model.policy_network import PolicyNetwork
 from model.opponent_encoder import OpponentEncoder
 from model.stat_tracker import StatTracker, HandRecord, NUM_STAT_FEATURES
 from model.action_space import ActionIndex, NUM_ACTION_TYPES, encode_action, ACTION_FEATURE_DIM
-from search.search import SearchEngine, SearchConfig
-from search.range_estimator import RangeEstimator
 from agent.config import AgentConfig
 
 
@@ -50,12 +48,10 @@ class PokerAgent:
         self,
         policy: PolicyNetwork,
         opponent_encoder: OpponentEncoder,
-        search_engine: Optional[SearchEngine] = None,
         config: Optional[AgentConfig] = None,
     ):
         self.policy = policy
         self.opponent_encoder = opponent_encoder
-        self.search_engine = search_engine
         self.config = config or AgentConfig()
 
         # Per-opponent tracking
@@ -81,16 +77,8 @@ class PokerAgent:
             num_cross_attn_heads=config.num_heads,
             num_cross_attn_layers=config.num_layers,
         )
-        search = SearchEngine(
-            policy=policy,
-            opponent_encoder=opponent_encoder,
-            config=SearchConfig(
-                min_pot_bb=config.search_min_pot_bb,
-                entropy_threshold=config.search_entropy_threshold,
-            ),
-        )
 
-        return cls(policy, opponent_encoder, search, config)
+        return cls(policy, opponent_encoder, config)
 
     def observe_action(
         self,
@@ -204,13 +192,6 @@ class PokerAgent:
         action_probs = output.action_type_probs[0]
         value = output.value[0, 0].item()
         sizing_probs = torch.softmax(output.bet_size_logits[0], dim=-1).tolist()
-        used_search = False
-
-        # System 2: search for complex spots
-        if self.search_engine and self.config.enable_search:
-            if self.search_engine.should_search(action_probs, pot_bb, street):
-                # TODO: integrate full search with real game state
-                used_search = True
 
         # Sample action
         dist = Categorical(action_probs)

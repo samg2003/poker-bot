@@ -31,6 +31,7 @@ wandb/
 *.pt
 *.pth
 *.onnx
+*.prof
 
 # Pytest
 .pytest_cache/
