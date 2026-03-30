@@ -92,9 +92,16 @@ def _mp_play_chunk(args):
     except RuntimeError:
         pass
 
-    (config_dict, policy_sd, opp_enc_sd,
-     pool_recent, pool_archive,
+    (config_dict, policy_np, opp_enc_np,
+     pool_recent_np, pool_archive_np,
      num_hands, seed, epoch, total_epochs) = args
+
+    # Convert numpy state dicts back to torch tensors
+    def _np_to_sd(npd):
+        return {k: torch.from_numpy(v) for k, v in npd.items()}
+
+    policy_sd = _np_to_sd(policy_np)
+    opp_enc_sd = _np_to_sd(opp_enc_np)
 
     config = NLHETrainingConfig(**config_dict)
     config.device = 'cpu'
@@ -120,8 +127,8 @@ def _mp_play_chunk(args):
     trainer._frozen_template.eval()
     trainer.frozen_opponent_encoder.load_state_dict(opp_enc_sd)
     trainer.frozen_opponent_encoder.eval()
-    trainer.opponent_pool_recent = pool_recent
-    trainer.opponent_pool_archive = pool_archive
+    trainer.opponent_pool_recent = [_np_to_sd(sd) for sd in pool_recent_np]
+    trainer.opponent_pool_archive = [_np_to_sd(sd) for sd in pool_archive_np]
     trainer._frozen_models = {}  # Rebuilt lazily by _run_batched_epoch
 
     exps, reward = trainer._run_batched_epoch()
@@ -1781,9 +1788,14 @@ class NLHESelfPlayTrainer:
         hands_per_worker = hands_total // num_workers
         remainder = hands_total % num_workers
 
-        # Snapshot model state dicts for workers
-        policy_sd = {k: v.cpu() for k, v in self.policy.state_dict().items()}
-        opp_enc_sd = {k: v.cpu() for k, v in self.opponent_encoder.state_dict().items()}
+        # Snapshot model state dicts as NUMPY (avoids torch pickle using file descriptors)
+        def _sd_to_np(sd):
+            return {k: v.cpu().numpy() for k, v in sd.items()}
+
+        policy_np = _sd_to_np(self.policy.state_dict())
+        opp_enc_np = _sd_to_np(self.opponent_encoder.state_dict())
+        pool_recent_np = [_sd_to_np(sd) for sd in self.opponent_pool_recent]
+        pool_archive_np = [_sd_to_np(sd) for sd in self.opponent_pool_archive]
 
         # Build args for each worker
         args_list = []
@@ -1793,8 +1805,8 @@ class NLHESelfPlayTrainer:
                 continue
             args_list.append((
                 {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')},
-                policy_sd, opp_enc_sd,
-                self.opponent_pool_recent, self.opponent_pool_archive,
+                policy_np, opp_enc_np,
+                pool_recent_np, pool_archive_np,
                 n,
                 self.config.seed + i + self.current_epoch * num_workers,
                 self.current_epoch, self.total_epochs,
