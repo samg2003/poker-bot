@@ -25,7 +25,10 @@ class PokerGymEnv(gym.Env):
         # Restrict THIS worker to 1 thread — must be called after fork since
         # the env var set before torch loads has no effect on already-init'd OpenMP.
         torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
+        try:
+            torch.set_num_interop_threads(1)  # only works before parallel work; safe to ignore
+        except RuntimeError:
+            pass
         
         self.config = NLHETrainingConfig(**config_dict)
         self.config.device = 'cpu'

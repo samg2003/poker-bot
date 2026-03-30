@@ -31,3 +31,6 @@ gymnasium>=1.2.3
 
 # Check if workers are spawning, wait 30s then run:
 # watch -n2 'ps aux | grep python | grep -v grep | wc -l'
+
+# Confirm nothing is running
+# pgrep -f train.py
